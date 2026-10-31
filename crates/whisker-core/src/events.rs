@@ -24,6 +24,10 @@ pub enum ClientEvent {
         reply_to: Option<OwnedEventId>,
         media: Option<Box<Media>>,
     },
+    /// A room event (join, leave, rename, …) as a notice line.
+    Notice { account: AccountId, item: Box<crate::timeline::HistoryItem>, room_id: OwnedRoomId },
+    /// Someone's read receipt in a room moved.
+    Receipts { account: AccountId, room_id: OwnedRoomId },
     /// A message was edited; `body` is its new text.
     Edited { account: AccountId, room_id: OwnedRoomId, target: OwnedEventId, body: String },
     /// A message was deleted.

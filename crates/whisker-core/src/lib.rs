@@ -6,6 +6,7 @@ pub mod accounts;
 pub mod anoncat;
 pub mod events;
 pub mod moderation;
+pub mod notices;
 pub mod profile;
 pub mod rooms;
 pub mod stores;

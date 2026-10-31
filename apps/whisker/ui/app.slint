@@ -1,4 +1,4 @@
-import { ListView, ScrollView, Palette, TextEdit, Switch } from "std-widgets.slint";
+import { ListView, ScrollView, Palette, TextEdit, Switch, ComboBox } from "std-widgets.slint";
 import { Theme, Prefs, Avatar, Btn, IconBtn, Input, Pill } from "theme.slint";
 import { SettingsPage, AccountForm, AgentForm, NavItem } from "settings.slint";
 
@@ -44,6 +44,14 @@ export struct PublicItem {
     joined: bool,
 }
 
+// Someone whose read receipt is on a message.
+export struct Reader {
+    name: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+}
+
 // One line of a message: 0 text, 1 quote, 2 code, 3 heading, 4 blank.
 export struct Block {
     kind: int,
@@ -53,6 +61,8 @@ export struct Block {
 
 export struct MessageItem {
     id: string,
+    // A room event ("Alice joined"), drawn as a small grey line.
+    notice: bool,
     sender: string,
     name: string,
     body: string,
@@ -78,6 +88,9 @@ export struct MessageItem {
     picture-width: length,
     picture-height: length,
     links: [string],
+    // People who have read up to here (at most 5), and how many more.
+    readers: [Reader],
+    more-readers: int,
 }
 
 export struct MemberItem {
@@ -257,7 +270,16 @@ component MessageRow inherits Rectangle {
                 Text { text: root.item.day; font-size: 11px; font-weight: 700; color: Theme.muted; }
                 Rectangle { height: 1px; y: 8px; background: Theme.border; horizontal-stretch: 1; }
             }
-            HorizontalLayout {
+            if root.item.notice: HorizontalLayout {
+                padding-left: 64px;
+                padding-right: 16px;
+                padding-top: 3px;
+                padding-bottom: 3px;
+                spacing: 8px;
+                Text { text: root.item.body; font-size: 12px; color: Theme.muted; wrap: word-wrap; horizontal-stretch: 1; }
+                if area.has-hover: Text { text: root.item.time; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
+            }
+            if !root.item.notice: HorizontalLayout {
                 padding-left: 16px;
                 padding-right: 16px;
                 padding-top: root.item.first ? 10px : 1px;
@@ -333,6 +355,15 @@ component MessageRow inherits Rectangle {
                     if root.item.media == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } }
                     if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
                 }
+            }
+            // Read receipts: who has read up to here.
+            if root.item.readers.length > 0: HorizontalLayout {
+                alignment: end;
+                padding-right: 16px;
+                padding-bottom: 2px;
+                spacing: 2px;
+                for r in root.item.readers: Avatar { initial: r.initial; hue: r.hue; image: r.avatar; size: 16px; }
+                if root.item.more-readers > 0: Text { text: "+" + root.item.more-readers; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
             }
         }
     }
@@ -538,12 +569,20 @@ component LoginDialog inherits Overlay {
     in property <bool> busy;
     in property <bool> agent;
     in-out property <bool> register;
+    // Suggested servers, then "Other server…" last.
+    in property <[string]> servers;
+    property <int> pick: 0;
+    property <bool> custom: root.pick >= root.servers.length - 1;
+    property <string> hs-text;
+    property <string> pw2-text;
+    property <string> token-text;
+    property <string> server: root.custom ? root.hs-text : root.servers[root.pick];
     // server, user, password, tags, proxy, is-ai, register, token
     callback login(string, string, string, string, string, bool, bool, string);
-    property <bool> mismatch: root.register && pw2.text != "" && pw.text != pw2.text;
+    property <bool> mismatch: root.register && root.pw2-text != "" && pw.text != root.pw2-text;
     function go() {
-        if root.register && pw.text != pw2.text { return; }
-        root.login(hs.text, user.text, pw.text, tags.text, proxy.text, root.agent, root.register, token.text);
+        if root.register && pw.text != root.pw2-text { return; }
+        root.login(root.server, user.text, pw.text, tags.text, proxy.text, root.agent, root.register, root.register ? root.token-text : "");
     }
     Text { text: root.agent ? "Add an AI account" : "Add an account"; font-size: 18px; font-weight: 800; color: Theme.text; }
     HorizontalLayout {
@@ -555,11 +594,20 @@ component LoginDialog inherits Overlay {
         text: root.register ? "Create the Matrix account the AI will use. You'll set up its model next." : "Sign in to the Matrix account the AI will use. You'll set up its model next.";
         wrap: word-wrap; color: Theme.muted; font-size: 12px;
     }
-    hs := Input { placeholder: "Server, e.g. anoncat.org"; }
+    Text { text: "Server"; font-size: 12px; color: Theme.muted; }
+    ComboBox {
+        model: root.servers;
+        current-index <=> root.pick;
+    }
+    if root.custom: Input { text <=> root.hs-text; placeholder: "Server address, e.g. matrix.org"; }
     user := Input { placeholder: root.register ? "Pick a username" : "Username"; }
+    if !root.custom && user.text != "": Text {
+        text: "Your address: @" + user.text + ":" + root.server;
+        font-size: 11px; color: Theme.muted; wrap: char-wrap;
+    }
     pw := Input { placeholder: root.register ? "Pick a password" : "Password"; password: true; accepted => { root.go(); } }
-    pw2 := Input { visible: root.register; height: root.register ? 38px : 0; placeholder: "Repeat password"; password: true; accepted => { root.go(); } }
-    token := Input { visible: root.register; height: root.register ? 38px : 0; placeholder: "Registration token (if you have one)"; }
+    if root.register: Input { text <=> root.pw2-text; placeholder: "Repeat password"; password: true; accepted => { root.go(); } }
+    if root.register: Input { text <=> root.token-text; placeholder: "Registration token (if you have one)"; }
     tags := Input { placeholder: "Tags (optional), e.g. alt, work"; }
     proxy := Input { placeholder: "Proxy (optional), e.g. socks5h://127.0.0.1:9050"; }
     if root.mismatch: Text { text: "The passwords don't match."; color: Theme.danger; }
@@ -613,6 +661,8 @@ export component AppWindow inherits Window {
     in property <bool> current-invite;
     in property <string> invite-from;
     in property <bool> has-older;
+    // Suggested servers for sign-in / sign-up, then "Other server…".
+    in property <[string]> login-servers;
     in property <bool> can-moderate;
 
     // Composer
@@ -724,6 +774,7 @@ export component AppWindow inherits Window {
         root.profile-requested(user);
     }
     callback set-rich-text(bool);
+    callback set-show-events(bool);
 
     function apply-theme() {
         Palette.color-scheme = root.theme == 0 ? ColorScheme.dark : root.theme == 1 ? ColorScheme.light : ColorScheme.unknown;
@@ -1384,6 +1435,7 @@ export component AppWindow inherits Window {
         set-theme(t) => { root.set-theme(t); }
         set-auto-lock(i) => { root.set-auto-lock(i); }
         set-rich-text(b) => { root.set-rich-text(b); }
+        set-show-events(b) => { root.set-show-events(b); }
         save-account(f) => { root.activity(); root.save-account(f); }
         profile-edit(a, id, v) => { root.activity(); root.profile-edit(a, id, v); }
         recover(k) => { root.activity(); root.recover(k); }
@@ -1402,6 +1454,7 @@ export component AppWindow inherits Window {
         error: root.login-error;
         busy: root.busy;
         agent: root.login-agent;
+        servers: root.login-servers;
         login(hs, u, p, t, px, ag, reg, tok) => { root.login(hs, u, p, t, px, ag, reg, tok); }
         dismiss => { root.show-login = false; }
     }

@@ -10,7 +10,9 @@ operating system and the **Wisp** browser.
 
 ## Features
 
-- **Sign in or create accounts.** Sign-up works on servers that allow open registration or
+- **Sign in or create accounts.** Pick a suggested server (anoncat.gleeze.com) and type
+  just your username, or choose *Other server…* and enter any server; a full address like
+  `@you:matrix.org` works too. Sign-up works on servers that allow open registration or
   hand out registration tokens; servers that need an email or captcha say so.
 - **Many accounts, signed in at once.** Switch between any account on any server with
   one click. Each account syncs in the background, so nothing goes stale.
@@ -45,6 +47,12 @@ operating system and the **Wisp** browser.
   pin it to the top (saved as a favourite, so other apps see it), mark it read, copy its
   address or leave it. Opening a room clears its unread badge using a *private* read
   receipt, so the server's counter resets without telling anyone you read it.
+- **Read receipts.** Small avatars under a message show who has read up to there (from
+  their public receipts; people who use private receipts, like you, don't appear).
+- **Room events.** Settings → *Show room events* adds joins, leaves, invites, kicks, bans,
+  renames, description, picture and permission changes as grey lines in the timeline.
+- **Instant sending.** Your message appears at once (dimmed, "Sending…") and settles when
+  the server confirms it; if sending fails, the text goes back in the message box.
 - **Public rooms** (the **#** button): search your server's or any other server's room
   directory, or join by address like `#room:matrix.org`. If your server won't fetch another
   server's directory, Whisker asks that server directly (anonymously, but it sees your IP

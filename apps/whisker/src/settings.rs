@@ -44,6 +44,9 @@ pub struct AppSettings {
     /// Show bold/italic/clickable links instead of drag-selectable text.
     #[serde(default)]
     pub rich_text: bool,
+    /// Show joins, leaves, renames and other room events in the timeline.
+    #[serde(default)]
+    pub show_events: bool,
 }
 
 impl AppSettings {

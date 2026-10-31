@@ -22,6 +22,8 @@ export global Theme {
 export global Prefs {
     // Rich (styled, clickable links) vs plain drag-selectable message text.
     in-out property <bool> rich-text: false;
+    // Joins, leaves, renames and other room events in the timeline.
+    in-out property <bool> show-events: false;
 }
 
 export component Avatar inherits Rectangle {

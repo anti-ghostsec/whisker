@@ -532,10 +532,31 @@ impl Ctl {
 
     /// Builds display rows for a room's cached messages.
     async fn rows(&self, key: &RoomKey) -> Vec<MsgRow> {
-        let me: Option<OwnedUserId> = self.mgr.client(key.0).await.and_then(|c| c.user_id().map(ToOwned::to_owned));
+        let client = self.mgr.client(key.0).await;
+        let me: Option<OwnedUserId> = client.as_ref().and_then(|c| c.user_id().map(ToOwned::to_owned));
+        let marks = match client.and_then(|c| c.get_room(&key.1)) {
+            Some(room) => timeline::read_marks(&room).await,
+            None => Vec::new(),
+        };
+        let show_events = self.settings.lock().unwrap().show_events;
         let st = self.st.lock().unwrap();
-        let msgs = st.messages.get(key).cloned().unwrap_or_default();
+        let mut msgs = st.messages.get(key).cloned().unwrap_or_default();
+        if !show_events {
+            msgs.retain(|m| !m.notice);
+        }
         let by_id: HashMap<&OwnedEventId, &HistoryItem> = msgs.iter().map(|m| (&m.event_id, m)).collect();
+        // Each reader goes on the message they read up to, or (if that one
+        // isn't shown, e.g. a hidden room event) the last one before it.
+        let mut readers: HashMap<usize, Vec<(String, Option<OwnedMxcUri>)>> = HashMap::new();
+        for mark in &marks {
+            let at = msgs.iter().position(|m| m.event_id == mark.event_id).or_else(|| {
+                let ts = mark.ts?;
+                msgs.iter().rposition(|m| m.ts <= ts)
+            });
+            if let Some(i) = at {
+                readers.entry(i).or_default().push((mark.name.clone().unwrap_or_else(|| mark.user.localpart().to_owned()), mark.avatar.clone()));
+            }
+        }
         msgs.iter()
             .enumerate()
             .map(|(i, m)| {
@@ -546,7 +567,7 @@ impl Ctl {
                 };
                 let first = !day.is_empty()
                     || m.reply_to.is_some()
-                    || prev.is_none_or(|p| p.sender != m.sender || i64::from(m.ts.get()) - i64::from(p.ts.get()) > 5 * 60 * 1000);
+                    || prev.is_none_or(|p| p.notice || p.sender != m.sender || i64::from(m.ts.get()) - i64::from(p.ts.get()) > 5 * 60 * 1000);
                 let reply = m.reply_to.as_ref().map(|r| match by_id.get(r) {
                     Some(o) => (o.sender_label().to_owned(), o.body.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned()),
                     None => ("↪".to_owned(), "an earlier message".to_owned()),
@@ -557,6 +578,7 @@ impl Ctl {
                     first,
                     day,
                     reply,
+                    readers: readers.remove(&i).unwrap_or_default(),
                     item: m.clone(),
                 }
             })
@@ -572,7 +594,7 @@ impl Ctl {
             return;
         };
         let rows = self.rows(&key).await;
-        self.fetch_avatars(key.0, rows.iter().filter_map(|r| r.item.sender_avatar.clone()));
+        self.fetch_avatars(key.0, rows.iter().filter_map(|r| r.item.sender_avatar.clone()).chain(rows.iter().flat_map(|r| r.readers.iter().filter_map(|x| x.1.clone()))));
         let items: Vec<HistoryItem> = rows.iter().map(|r| r.item.clone()).collect();
         self.fetch_pictures(&key, &items);
         let (px, older) = (self.avatars.clone(), self.st.lock().unwrap().older.get(&key).cloned().flatten().is_some());
@@ -1273,6 +1295,7 @@ impl Ctl {
             reply_to: reply_to.clone(),
             media: None,
             edited: false,
+            notice: false,
         };
         self.merge(&key, vec![item]);
         self.ui(|u| u.set_stick_bottom(true));
@@ -1624,6 +1647,18 @@ impl Ctl {
         }
     }
 
+    fn set_show_events(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.show_events = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_show_events(on);
+        }
+        let c = self.clone();
+        self.spawn(async move { c.show_messages().await });
+    }
+
     fn set_rich_text(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.rich_text = on;
@@ -1650,6 +1685,7 @@ impl Ctl {
     #[allow(clippy::too_many_arguments)]
     async fn login(&self, hs: String, user: String, pass: String, tags: String, proxy: String, agent: bool, register: bool, token: String) {
         let Some(vault) = self.st.lock().unwrap().active_vault.clone() else { return };
+        let (hs, user) = split_login(&hs, &user);
         self.ui(|u| {
             u.set_busy(true);
             u.set_login_error(s(""));
@@ -2018,7 +2054,7 @@ impl Ctl {
                 }
                 ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, .. } => {
                     let key = (account, room_id);
-                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false };
+                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false };
                     // Only keep live messages for rooms we've opened; others load on open.
                     let opened = self.st.lock().unwrap().older.contains_key(&key);
                     if opened {
@@ -2032,6 +2068,21 @@ impl Ctl {
                     }
                     if selected(account) {
                         self.schedule_rooms();
+                    }
+                }
+                ClientEvent::Notice { account, room_id, item } => {
+                    let key = (account, room_id);
+                    if self.st.lock().unwrap().older.contains_key(&key) {
+                        self.merge(&key, vec![*item]);
+                        if self.current().as_ref() == Some(&key) && self.settings.lock().unwrap().show_events {
+                            self.append_last(&key).await;
+                        }
+                    }
+                }
+                ClientEvent::Receipts { account, room_id } => {
+                    if self.current().as_ref() == Some(&(account, room_id)) {
+                        let c = self.clone();
+                        self.spawn(async move { c.show_messages().await });
                     }
                 }
                 ClientEvent::Edited { account, room_id, target, body } => {
@@ -2072,6 +2123,19 @@ fn tidy_error(message: &str) -> String {
     m
 }
 
+/// Servers offered first when signing in or creating an account.
+const SUGGESTED_SERVERS: &[&str] = &["anoncat.gleeze.com"];
+
+/// A full address typed as the username (`@name:server`) picks its own
+/// server; otherwise the username's `@` is dropped and `hs` is used.
+fn split_login(hs: &str, user: &str) -> (String, String) {
+    let user = user.trim();
+    match user.strip_prefix('@').unwrap_or(user).split_once(':') {
+        Some((name, server)) if !server.is_empty() => (server.to_owned(), name.to_owned()),
+        _ => (hs.trim().to_owned(), user.trim_start_matches('@').to_owned()),
+    }
+}
+
 pub fn run(data_dir: PathBuf) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let ui = AppWindow::new()?;
@@ -2084,6 +2148,9 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.set_auto_lock(prefs.auto_lock_index());
     ui.set_encryption_summary(ENCRYPTION_SUMMARY.into());
     ui.global::<Prefs>().set_rich_text(prefs.rich_text);
+    ui.global::<Prefs>().set_show_events(prefs.show_events);
+    let servers: Vec<SharedString> = SUGGESTED_SERVERS.iter().map(s).chain([s("Other server…")]).collect();
+    ui.set_login_servers(slint::ModelRc::new(slint::VecModel::from(servers)));
     ui::RICH.set(prefs.rich_text);
 
     let ctl = Ctl {
@@ -2184,6 +2251,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     }
     {
         let c = ctl.clone();
+        ui.on_set_show_events(move |b| c.set_show_events(b));
+    }
+    {
+        let c = ctl.clone();
         ui.on_activity(move || c.touch());
     }
 
@@ -2208,3 +2279,16 @@ fn android_main(app: slint::android::AndroidApp) {
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::split_login;
+
+    #[test]
+    fn login_names() {
+        assert_eq!(split_login("anoncat.gleeze.com", "nully"), ("anoncat.gleeze.com".into(), "nully".into()));
+        assert_eq!(split_login("anoncat.gleeze.com", " @nully "), ("anoncat.gleeze.com".into(), "nully".into()));
+        assert_eq!(split_login("anoncat.gleeze.com", "@bob:matrix.org"), ("matrix.org".into(), "bob".into()));
+        assert_eq!(split_login("", "bob:example.com"), ("example.com".into(), "bob".into()));
+    }
+}

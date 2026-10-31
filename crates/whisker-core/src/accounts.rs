@@ -545,6 +545,14 @@ impl AccountManager {
                 }
             }
         });
+        let tx = self.events.clone();
+        client.add_event_handler(move |_: matrix_sdk::ruma::events::receipt::SyncReceiptEvent, room: Room| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(ClientEvent::Receipts { account, room_id: room.room_id().to_owned() });
+            }
+        });
+
         // Messages we can't decrypt (yet) still show up, labelled.
         let (tx, latest) = (self.events.clone(), self.latest.clone());
         client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
@@ -567,11 +575,23 @@ impl AccountManager {
             // `sync_with_callback` only returns on an error; back off and keep going.
             let mut delay = 1u64;
             loop {
-                let tx2 = tx.clone();
+                let (tx2, c2) = (tx.clone(), sync_client.clone());
                 let res = sync_client
-                    .sync_with_callback(settings.clone(), move |_| {
-                        let tx = tx2.clone();
+                    .sync_with_callback(settings.clone(), move |resp| {
+                        let (tx, c) = (tx2.clone(), c2.clone());
                         async move {
+                            // Room events that just happened (in the timeline, not the
+                            // room's full state) become notices: "Alice joined".
+                            for (room_id, update) in &resp.rooms.joined {
+                                let Some(room) = c.get_room(room_id) else { continue };
+                                let mut profiles = HashMap::new();
+                                for ev in &update.timeline.events {
+                                    let Ok(matrix_sdk::ruma::events::AnySyncTimelineEvent::State(st)) = ev.raw().deserialize() else { continue };
+                                    if let Some(item) = timeline::notice_item(&room, &st, &mut profiles).await {
+                                        let _ = tx.send(ClientEvent::Notice { account, room_id: room_id.clone(), item: Box::new(item) });
+                                    }
+                                }
+                            }
                             let _ = tx.send(ClientEvent::Synced { account });
                             LoopCtrl::Continue
                         }
@@ -955,6 +975,7 @@ async fn publish(
         reply_to: reply_to.clone(),
         media: media.clone(),
         edited: false,
+        notice: false,
     };
     {
         let mut l = latest.lock().unwrap();
@@ -1043,7 +1064,7 @@ impl AccountManager {
     }
 
     pub fn note_history(&self, account: AccountId, room: &OwnedRoomId, items: &[HistoryItem]) {
-        if let Some(last) = items.last() {
+        if let Some(last) = items.iter().rev().find(|i| !i.notice) {
             let mut l = self.latest.lock().unwrap();
             let key = (account, room.clone());
             if l.get(&key).is_none_or(|old| old.ts <= last.ts) {

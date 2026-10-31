@@ -142,6 +142,7 @@ component NavRow inherits Rectangle {
 component GeneralPage inherits VerticalLayout {
     in-out property <int> theme;
     callback set-rich-text(bool);
+    callback set-show-events(bool);
     in-out property <int> auto-lock;
     in property <string> encryption-summary;
     callback set-theme(int);
@@ -175,6 +176,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.rich-text;
                 toggled => { root.set-rich-text(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Show room events"; color: Theme.text; }
+                Text {
+                    text: "Joins, leaves, invites, kicks and bans, name, description and picture changes, permission changes and the like, as small grey lines between messages.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.show-events;
+                toggled => { root.set-show-events(self.checked); }
             }
         }
     }
@@ -453,6 +470,7 @@ export component SettingsPage inherits Rectangle {
     callback set-theme(int);
     callback set-auto-lock(int);
     callback set-rich-text(bool);
+    callback set-show-events(bool);
     callback save-account(AccountForm);
     callback profile-edit(string, string, string);
     callback recover(string);
@@ -530,6 +548,7 @@ export component SettingsPage inherits Rectangle {
                             set-theme(t) => { root.set-theme(t); }
                             set-auto-lock(i) => { root.set-auto-lock(i); }
                             set-rich-text(b) => { root.set-rich-text(b); }
+                            set-show-events(b) => { root.set-show-events(b); }
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }
                             unlock-hidden(p) => { root.unlock-hidden(p); }
                             create-hidden(p) => { root.create-hidden(p); }

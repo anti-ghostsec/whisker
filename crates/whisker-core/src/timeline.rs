@@ -10,7 +10,7 @@ use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::room::message::{
     AddMentions, MessageType, Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
 };
-use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
+use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
 use matrix_sdk::ruma::{
     EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, UInt, UserId,
 };
@@ -70,6 +70,8 @@ pub struct HistoryItem {
     pub reply_to: Option<OwnedEventId>,
     pub media: Option<Media>,
     pub edited: bool,
+    /// A room event (join, rename, …) described in `body`, not a message.
+    pub notice: bool,
 }
 
 impl HistoryItem {
@@ -225,6 +227,45 @@ pub async fn member_profile(room: &Room, user: &UserId) -> (Option<String>, Opti
     }
 }
 
+/// How far someone has read in a room (their public read receipt).
+#[derive(Debug, Clone)]
+pub struct ReadMark {
+    pub user: OwnedUserId,
+    pub name: Option<String>,
+    pub avatar: Option<OwnedMxcUri>,
+    pub event_id: OwnedEventId,
+    pub ts: Option<MilliSecondsSinceUnixEpoch>,
+}
+
+/// Everyone else's latest read receipt in `room`, from the local store (no
+/// network). Private receipts aren't shared, so those readers don't show.
+pub async fn read_marks(room: &Room) -> Vec<ReadMark> {
+    use matrix_sdk::ruma::events::receipt::{ReceiptThread, ReceiptType};
+    let me = room.own_user_id();
+    let Ok(members) = room.members_no_sync(matrix_sdk::RoomMemberships::JOIN).await else { return Vec::new() };
+    let mut out = Vec::new();
+    for m in members.iter().filter(|m| m.user_id() != me).take(300) {
+        let mut best: Option<(OwnedEventId, matrix_sdk::ruma::events::receipt::Receipt)> = None;
+        for thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
+            if let Ok(Some(r)) = room.load_user_receipt(ReceiptType::Read, &thread, m.user_id()).await
+                && best.as_ref().is_none_or(|b| b.1.ts < r.1.ts)
+            {
+                best = Some(r);
+            }
+        }
+        if let Some((event_id, receipt)) = best {
+            out.push(ReadMark {
+                user: m.user_id().to_owned(),
+                name: m.display_name().map(str::to_owned),
+                avatar: m.avatar_url().map(ToOwned::to_owned),
+                event_id,
+                ts: receipt.ts,
+            });
+        }
+    }
+    out
+}
+
 /// A page of history, oldest first, and the token for the page before it.
 pub struct Page {
     pub items: Vec<HistoryItem>,
@@ -233,7 +274,34 @@ pub struct Page {
 
 /// Messages before `from` (or the newest ones when `from` is `None`). Edits
 /// are applied and deleted messages left out.
+///
+/// Room events (joins, renames, …) come back as notices. Pages holding no
+/// messages are skipped over (up to a few requests), and `older` is `None`
+/// once the start of the room (or of what we may see) is reached, so
+/// "load older" only shows when there is something to load.
 pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Page> {
+    let mut out = Vec::new();
+    let mut from = from;
+    for _ in 0..5 {
+        let (mut items, older) = history_page(room, from.clone(), limit).await?;
+        items.append(&mut out);
+        out = items;
+        let more = older.is_some() && older != from;
+        from = older;
+        if !more {
+            from = None;
+            break;
+        }
+        if out.iter().filter(|i| !i.notice).count() >= (limit as usize / 2).max(1) {
+            break;
+        }
+    }
+    Ok(Page { items: out, older: from })
+}
+
+/// One `/messages` request: its items, oldest first, and the token for the
+/// page before (`None` at the start of the room).
+async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(Vec<HistoryItem>, Option<String>)> {
     let mut opts = MessagesOptions::backward();
     opts.limit = UInt::from(limit);
     opts.from = from;
@@ -241,9 +309,20 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
     let mut out = Vec::new();
     let mut edits: HashMap<OwnedEventId, String> = HashMap::new();
     let mut profiles: HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)> = HashMap::new();
+    let mut at_start = msgs.chunk.is_empty();
     // Newest first: an edit is seen before the message it changes.
     for ev in &msgs.chunk {
-        let Ok(AnySyncTimelineEvent::MessageLike(m)) = ev.raw().deserialize() else { continue };
+        let m = match ev.raw().deserialize() {
+            Ok(AnySyncTimelineEvent::MessageLike(m)) => m,
+            Ok(AnySyncTimelineEvent::State(st)) => {
+                at_start |= matches!(st, AnySyncStateEvent::RoomCreate(_));
+                if let Some(item) = notice_item(room, &st, &mut profiles).await {
+                    out.push(item);
+                }
+                continue;
+            }
+            _ => continue,
+        };
         let (event_id, sender, ts, parsed) = match m {
             AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)) => {
                 (m.event_id, m.sender, m.origin_server_ts, parse(&m.content))
@@ -278,10 +357,48 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
             ts,
             reply_to,
             media,
+            notice: false,
         });
     }
     out.reverse();
-    Ok(Page { items: out, older: msgs.end })
+    Ok((out, if at_start { None } else { msgs.end }))
+}
+
+/// A room event as a timeline notice ("Alice joined"), if it's worth one.
+pub async fn notice_item(
+    room: &Room,
+    ev: &AnySyncStateEvent,
+    profiles: &mut HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)>,
+) -> Option<HistoryItem> {
+    let mut users = vec![ev.sender().to_owned()];
+    if let Ok(target) = OwnedUserId::try_from(ev.state_key()) {
+        users.push(target);
+    }
+    for u in &users {
+        if !profiles.contains_key(u) {
+            profiles.insert(u.clone(), member_profile(room, u).await);
+        }
+    }
+    let body = crate::notices::describe(ev, |id| {
+        users
+            .iter()
+            .find(|u| u.as_str() == id)
+            .and_then(|u| profiles.get(u).and_then(|p| p.0.clone()))
+            .unwrap_or_else(|| id.trim_start_matches('@').split(':').next().unwrap_or(id).to_owned())
+    })?;
+    let (sender_name, sender_avatar) = profiles.get(ev.sender()).cloned().unwrap_or_default();
+    Some(HistoryItem {
+        event_id: ev.event_id().to_owned(),
+        sender: ev.sender().to_owned(),
+        sender_name,
+        sender_avatar,
+        body,
+        ts: ev.origin_server_ts(),
+        reply_to: None,
+        media: None,
+        edited: false,
+        notice: true,
+    })
 }
 
 /// Downloads media (decrypting it if needed). With `thumb`, asks the server

@@ -5,7 +5,7 @@
 //! scrolling smooth and stops the scroll position jumping.
 
 use crate::format::{self, Kind};
-use crate::{AccountItem, AppWindow, Block, MessageItem, RoomItem};
+use crate::{AccountItem, AppWindow, Block, MessageItem, Reader, RoomItem};
 use matrix_sdk::ruma::OwnedMxcUri;
 use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use std::cell::RefCell;
@@ -134,6 +134,8 @@ pub struct MsgRow {
     pub day: String,
     pub reply: Option<(String, String)>,
     pub picture: Option<Pixels>,
+    /// People whose read receipt lands on this message: (name, avatar).
+    pub readers: Vec<(String, Option<OwnedMxcUri>)>,
 }
 
 pub fn human_size(n: u64) -> String {
@@ -178,11 +180,23 @@ impl Models {
         let (reply_name, reply_text) = r.reply.clone().unwrap_or_default();
         MessageItem {
             id: s(r.item.event_id.as_str()),
+            notice: r.item.notice,
             sender: s(r.item.sender.as_str()),
             name: s(&name),
             body: s(&r.item.body),
             blocks: blocks(&r.item.body),
             links: ModelRc::new(VecModel::from(format::links(&r.item.body).iter().map(s).collect::<Vec<_>>())),
+            readers: ModelRc::new(VecModel::from(
+                r.readers
+                    .iter()
+                    .take(5)
+                    .map(|(name, avatar)| {
+                        let (initial, hue) = initial_hue(name);
+                        Reader { name: s(name), initial, hue, avatar: self.avatar(avatar, pixels) }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            more_readers: r.readers.len().saturating_sub(5) as i32,
             mine: r.mine,
             time: if local { s("Sending…") } else { s(crate::fmt_time(r.item.ts)) },
             initial,

@@ -323,26 +323,6 @@ pub fn is_me(client: &Client, user: &UserId) -> bool {
     client.user_id() == Some(user)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalizes_servers() {
-        assert_eq!(normalize_server("https://Matrix.org/"), Some("matrix.org".into()));
-        assert_eq!(normalize_server("@me:tchncs.de"), Some("tchncs.de".into()));
-        assert_eq!(normalize_server("#room:envs.net"), Some("envs.net".into()));
-        assert_eq!(normalize_server("  "), None);
-        assert_eq!(normalize_server("127.0.0.1:8008"), Some("127.0.0.1:8008".into()));
-    }
-
-    #[test]
-    fn parses_users() {
-        assert_eq!(parse_users("@a:x.org, @b:y.org").unwrap().len(), 2);
-        assert!(parse_users("bob").is_err());
-    }
-}
-
 /// Accepts an invitation. If the plain join fails (the server picks which
 /// remote server to join through, and that one may hand back an incomplete
 /// room history), retries naming other servers to join through: the
@@ -384,4 +364,24 @@ pub async fn accept_invite(room: &Room) -> Result<()> {
         );
     }
     Err(err.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_servers() {
+        assert_eq!(normalize_server("https://Matrix.org/"), Some("matrix.org".into()));
+        assert_eq!(normalize_server("@me:tchncs.de"), Some("tchncs.de".into()));
+        assert_eq!(normalize_server("#room:envs.net"), Some("envs.net".into()));
+        assert_eq!(normalize_server("  "), None);
+        assert_eq!(normalize_server("127.0.0.1:8008"), Some("127.0.0.1:8008".into()));
+    }
+
+    #[test]
+    fn parses_users() {
+        assert_eq!(parse_users("@a:x.org, @b:y.org").unwrap().len(), 2);
+        assert!(parse_users("bob").is_err());
+    }
 }

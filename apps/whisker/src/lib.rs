@@ -789,12 +789,12 @@ impl Ctl {
             },
             "accept" => {
                 self.status("Joining…");
-                match room.join().await {
+                match whisker_core::rooms::accept_invite(&room).await {
                     Ok(()) => {
                         self.status("");
                         self.select_room(room_id.to_string()).await;
                     }
-                    Err(e) => self.status(format!("Couldn't join: {e}")),
+                    Err(e) => self.status(format!("Couldn't join: {e:#}")),
                 }
             }
             "read" => self.mark_read(&key).await,

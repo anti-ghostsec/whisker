@@ -109,3 +109,58 @@ async fn creates_encrypted_private_room() {
     }).await.unwrap();
     assert_eq!(room.room_id(), "!new:localhost");
 }
+
+/// An invite whose plain join fails the way a homeserver does when the
+/// server it joined through sent an incomplete room history.
+async fn broken_invite(server: &MatrixMockServer, client: &matrix_sdk::Client) -> matrix_sdk::Room {
+    use matrix_sdk::ruma::events::AnyStrippedStateEvent;
+    use matrix_sdk::ruma::serde::Raw;
+    let id = room_id!("!kitchen:hell.example");
+    let stripped = |v: serde_json::Value| -> Raw<AnyStrippedStateEvent> { serde_json::from_value(v).unwrap() };
+    let room = server
+        .sync_room(
+            client,
+            matrix_sdk_test::InvitedRoomBuilder::new(id)
+                .add_state_event(stripped(json!({"type": "m.room.member", "state_key": "@bob:other.example", "sender": "@bob:other.example", "content": {"membership": "join"}})))
+                .add_state_event(stripped(json!({"type": "m.room.member", "state_key": "@example:localhost", "sender": "@bob:other.example", "content": {"membership": "invite"}}))),
+        )
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/join$"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "errcode": "M_NOT_FOUND", "error": "M_NOT_FOUND: auth event $cW6x: Not found in database"
+        })))
+        .mount(server.server())
+        .await;
+    room
+}
+
+#[tokio::test]
+async fn invite_join_retries_through_other_servers() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room = broken_invite(&server, &client).await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/v3/join/.*kitchen"))
+        .and(query_param("via", "other.example"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "room_id": "!kitchen:hell.example" })))
+        .mount(server.server())
+        .await;
+    whisker_core::rooms::accept_invite(&room).await.unwrap();
+}
+
+#[tokio::test]
+async fn invite_join_explains_a_server_failure() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room = broken_invite(&server, &client).await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/v3/join/.*kitchen"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "errcode": "M_NOT_FOUND", "error": "M_NOT_FOUND: auth event $cW6x: Not found in database"
+        })))
+        .mount(server.server())
+        .await;
+    let err = whisker_core::rooms::accept_invite(&room).await.unwrap_err().to_string();
+    assert!(err.contains("problem on your server") && err.contains("other.example") && err.contains("hell.example"), "{err}");
+}

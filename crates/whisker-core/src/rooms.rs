@@ -342,3 +342,46 @@ mod tests {
         assert!(parse_users("bob").is_err());
     }
 }
+
+/// Accepts an invitation. If the plain join fails (the server picks which
+/// remote server to join through, and that one may hand back an incomplete
+/// room history), retries naming other servers to join through: the
+/// inviter's, the room's own and those of members we know of.
+pub async fn accept_invite(room: &Room) -> Result<()> {
+    let first = match room.join().await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let own = room.own_user_id().server_name().to_owned();
+    let mut via: Vec<matrix_sdk::ruma::OwnedServerName> = Vec::new();
+    if let Ok(invite) = room.invite_details().await {
+        via.push(invite.inviter_id.server_name().to_owned());
+    }
+    if let Some(s) = room.room_id().server_name() {
+        via.push(s.to_owned());
+    }
+    if let Ok(members) = room.members_no_sync(RoomMemberships::JOIN).await {
+        via.extend(members.iter().map(|m| m.user_id().server_name().to_owned()));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    via.retain(|s| *s != own && seen.insert(s.clone()));
+    via.truncate(5);
+    let err = if via.is_empty() {
+        first
+    } else {
+        match room.client().join_room_by_id_or_alias(room.room_id().into(), &via).await {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        }
+    };
+    let msg = err.to_string();
+    if msg.contains("auth event") || msg.contains("M_NOT_FOUND") {
+        bail!(
+            "Your homeserver couldn't join: it failed to process the room's history from the other servers \
+             (tried {}). This is a problem on your server, not in Whisker; other apps on this account will \
+             hit it too. Server said: {msg}",
+            if via.is_empty() { "its default".to_owned() } else { via.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ") }
+        );
+    }
+    Err(err.into())
+}

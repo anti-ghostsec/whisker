@@ -36,7 +36,11 @@ pub fn to_form(account: AccountId, name: &str, cfg: Option<&AgentConfig>) -> Age
             max_tokens: 1024,
             g_reply: true,
             min_level: 50,
-            history: 30,
+            history: 40,
+            summarize: true,
+            context_tokens: 6000,
+            yield_secs: 8,
+            max_rapid: 4,
             cooldown: 2,
             max_steps: 6,
             system_prompt: default_prompt().into(),
@@ -69,6 +73,13 @@ pub fn to_form(account: AccountId, name: &str, cfg: Option<&AgentConfig>) -> Age
         system_prompt: c.system_prompt.as_str().into(),
         rooms: join(c.rooms.iter().map(|r| r.as_str())),
         history: c.history.min(200) as i32,
+        summarize: c.summarize,
+        summary_model: c.summary_model.as_str().into(),
+        context_tokens: c.context_tokens.min(200_000) as i32,
+        yield_secs: c.yield_secs.min(600) as i32,
+        max_rapid: c.max_rapid_replies.min(50) as i32,
+        venice_system_prompt: c.venice_system_prompt,
+        venice_web_search: c.venice_web_search,
         cooldown: c.cooldown_secs.min(3600) as i32,
         max_steps: c.max_steps.min(20) as i32,
         g_reply: has(Permission::Reply),
@@ -141,7 +152,14 @@ pub fn from_form(account: AccountId, f: &AgentForm, old: Option<&AgentConfig>, d
     };
     cfg.system_prompt = if f.system_prompt.trim().is_empty() { default_prompt() } else { f.system_prompt.to_string() };
     cfg.rooms = rooms(&f.rooms)?;
-    cfg.history = f.history.max(1) as usize;
+    cfg.history = f.history.max(2) as usize;
+    cfg.summarize = f.summarize;
+    cfg.summary_model = f.summary_model.trim().to_owned();
+    cfg.context_tokens = f.context_tokens.max(500) as usize;
+    cfg.yield_secs = f.yield_secs.max(1) as u64;
+    cfg.max_rapid_replies = f.max_rapid.max(1) as u32;
+    cfg.venice_system_prompt = f.venice_system_prompt;
+    cfg.venice_web_search = f.venice_web_search;
     cfg.cooldown_secs = f.cooldown.max(0) as u64;
     cfg.max_steps = f.max_steps.max(1) as usize;
 

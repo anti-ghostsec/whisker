@@ -84,6 +84,7 @@ fn service_name(url: &reqwest::Url) -> String {
         ("api.together.xyz", "Together"),
         ("api.anthropic.com", "Anthropic"),
         ("api.perplexity.ai", "Perplexity"),
+        ("api.venice.ai", "Venice"),
     ];
     if let Some((_, n)) = known.iter().find(|(h, _)| host.ends_with(h)) {
         return (*n).to_owned();
@@ -217,6 +218,7 @@ mod tests {
     fn names_services() {
         let u = |s: &str| reqwest::Url::parse(s).unwrap();
         assert_eq!(service_name(&u("https://openrouter.ai/api/v1")), "OpenRouter");
+        assert_eq!(service_name(&u("https://api.venice.ai/api/v1")), "Venice");
         assert_eq!(service_name(&u("http://127.0.0.1:8080")), "Local server");
         assert_eq!(service_name(&u("https://ai.example.com")), "ai.example.com");
     }

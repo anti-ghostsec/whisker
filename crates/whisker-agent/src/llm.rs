@@ -33,10 +33,20 @@ pub struct Turn {
     pub refused: bool,
 }
 
+/// Venice-only switches. Both off unless the owner turns them on: Venice's
+/// own system prompt would sit beside ours, and web search would send chat
+/// messages on to a third-party search engine.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Venice {
+    pub system_prompt: bool,
+    pub web_search: bool,
+}
+
 pub struct Llm {
     api: ApiConfig,
     max_tokens: u32,
     extra: Map<String, Value>,
+    venice: Venice,
     http: reqwest::Client,
     /// Format and endpoint, detected on first use if the config has none.
     resolved: OnceCell<(ApiFormat, String)>,
@@ -45,7 +55,17 @@ pub struct Llm {
 impl Llm {
     pub fn new(api: ApiConfig, max_tokens: u32, extra: Map<String, Value>) -> Result<Self> {
         let http = reqwest::Client::builder().timeout(Duration::from_secs(300)).build()?;
-        Ok(Self { api, max_tokens, extra, http, resolved: OnceCell::new() })
+        Ok(Self { api, max_tokens, extra, http, resolved: OnceCell::new(), venice: Venice::default() })
+    }
+
+    pub fn with_venice(mut self, venice: Venice) -> Self {
+        self.venice = venice;
+        self
+    }
+
+    fn is_venice(&self, endpoint: &str) -> bool {
+        self.api.service == "Venice"
+            || reqwest::Url::parse(endpoint).ok().and_then(|u| u.host_str().map(|h| h == "venice.ai" || h.ends_with(".venice.ai"))).unwrap_or(false)
     }
 
     async fn resolve(&self) -> Result<&(ApiFormat, String)> {
@@ -60,7 +80,10 @@ impl Llm {
             .await
     }
 
-    pub async fn turn(&self, system: &str, messages: &[Value], tools: &[ToolDef]) -> Result<Turn> {
+    /// One model call. `system` comes in parts (the app's contract first,
+    /// then the agent's persona), sent as separate system blocks where the
+    /// API has them, so a persona can't run into or bury the contract.
+    pub async fn turn(&self, system: &[&str], messages: &[Value], tools: &[ToolDef]) -> Result<Turn> {
         if self.api.model.trim().is_empty() {
             bail!("no model chosen for this AI");
         }
@@ -74,7 +97,7 @@ impl Llm {
     /// Sends one tiny request and returns the reply, to check the settings work.
     pub async fn test(&self) -> Result<String> {
         let t = self
-            .turn("You are being tested. Reply with one short friendly sentence.", &[json!({"role": "user", "content": "Hello!"})], &[])
+            .turn(&["You are being tested. Reply with one short friendly sentence."], &[json!({"role": "user", "content": "Hello!"})], &[])
             .await?;
         if t.refused {
             bail!("the model declined to answer");
@@ -90,7 +113,8 @@ impl Llm {
         }
     }
 
-    async fn anthropic(&self, endpoint: &str, system: &str, messages: &[Value], tools: &[ToolDef]) -> Result<Turn> {
+    async fn anthropic(&self, endpoint: &str, system: &[&str], messages: &[Value], tools: &[ToolDef]) -> Result<Turn> {
+        let system: Vec<Value> = system.iter().filter(|s| !s.trim().is_empty()).map(|s| json!({ "type": "text", "text": s })).collect();
         let mut body = json!({
             "model": self.api.model,
             "max_tokens": self.max_tokens,
@@ -131,7 +155,9 @@ impl Llm {
         Ok(Turn { assistant: json!({ "role": "assistant", "content": content }), text, calls, refused: stop == "refusal" })
     }
 
-    async fn openai(&self, endpoint: &str, system: &str, messages: &[Value], tools: &[ToolDef]) -> Result<Turn> {
+    async fn openai(&self, endpoint: &str, system: &[&str], messages: &[Value], tools: &[ToolDef]) -> Result<Turn> {
+        // Many OpenAI-style servers accept only one system message.
+        let system = system.iter().filter(|s| !s.trim().is_empty()).copied().collect::<Vec<_>>().join("\n\n");
         let mut msgs = vec![json!({ "role": "system", "content": system })];
         msgs.extend(to_openai(messages));
         let mut body = json!({ "model": self.api.model, "messages": msgs, "max_tokens": self.max_tokens });
@@ -142,6 +168,16 @@ impl Llm {
                 .collect();
         }
         self.merge_extra(&mut body);
+        if self.is_venice(endpoint) {
+            // Safe defaults first; anything set in the advanced JSON still wins.
+            let mut vp = serde_json::Map::new();
+            vp.insert("include_venice_system_prompt".into(), json!(self.venice.system_prompt));
+            vp.insert("enable_web_search".into(), json!(if self.venice.web_search { "auto" } else { "off" }));
+            if let Some(Value::Object(own)) = body.get("venice_parameters") {
+                vp.extend(own.clone());
+            }
+            body["venice_parameters"] = Value::Object(vp);
+        }
         let key = self.api.api_key.clone().filter(|k| !k.is_empty());
         let resp: Value = send_with_retry(|b: &Value| {
             let mut req = self.http.post(endpoint).json(b);

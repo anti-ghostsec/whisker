@@ -28,8 +28,18 @@ operating system and the **Wisp** browser.
   port), so a server can't link your alts by IP address.
 - **AI accounts.** Each AI signs in as its own Matrix account, separate from yours, with its
   own settings page. Paste the address of any AI API (OpenRouter, Groq, Mistral, DeepSeek,
-  Gemini, OpenAI, LM Studio, llama.cpp, vLLM, Ollama, or any Anthropic-style API). Whisker
-  works out what kind of API it is, lists its models, and has a Test button.
+  Gemini, OpenAI, Venice, LM Studio, llama.cpp, vLLM, Ollama, or any Anthropic-style API).
+  Whisker works out what kind of API it is, lists its models, and has a Test button. With
+  Venice, its own system prompt and web search are always sent as *off* (web search would
+  pass chat messages to a third-party search engine) unless you switch them on for that AI.
+- **AI memory.** Each AI remembers the last messages of every room word for word (40 by
+  default, saved in the vault so restarts don't wipe it) and folds older ones into a
+  running summary, made by the chat model or a cheaper one you name. The prompt stays
+  within a token budget (newest messages first, each capped at 2 KiB).
+- **No bot loops.** An AI never answers your other AI accounts or `m.notice` messages
+  (Matrix's marker for bot output), and after a few replies in quick succession it waits
+  for a pause, so two bots in one room can't talk to each other forever. It answers a
+  mention only when its name or address appears as a whole word.
 - **Admin controls.** In the composer, type `/kick`, `/ban`, `/unban`, `/invite`, `/redact`,
   `/op @user 50` or `/deop`. The AI uses the same actions.
 - **Server plugins.** If the homeserver runs hot-loaded WASM plugins (anoncat), Whisker

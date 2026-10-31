@@ -1976,7 +1976,7 @@ impl Ctl {
         self.ui(|u| u.set_test_status(s("Asking the model…")));
         let msg = match self.agent_config(&f).await {
             Err(e) => format!("✗ {e:#}"),
-            Ok((_, _, cfg)) => match Llm::new(cfg.api, cfg.max_tokens.min(300), cfg.extra_params) {
+            Ok((_, _, cfg)) => match Llm::new(cfg.api.clone(), cfg.max_tokens.min(300), cfg.extra_params.clone()).map(|l| l.with_venice(cfg.venice())) {
                 Err(e) => format!("✗ {e:#}"),
                 Ok(llm) => match llm.test().await {
                     Ok(reply) => format!("✓ It works. The model said: “{}”", reply.trim()),

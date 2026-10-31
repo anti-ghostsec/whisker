@@ -5,6 +5,7 @@
 pub mod api;
 pub mod config;
 pub mod llm;
+pub mod memory;
 pub mod permissions;
 pub mod runner;
 pub mod tools;

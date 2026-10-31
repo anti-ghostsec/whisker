@@ -34,15 +34,39 @@ pub struct AgentConfig {
     pub rooms: BTreeSet<OwnedRoomId>,
     #[serde(default)]
     pub permissions: Permissions,
-    /// Recent messages per room kept (in memory only) as context.
+    /// Messages per room kept word for word as context (saved in the vault).
+    /// Older ones are folded into a running summary.
     #[serde(default = "default_history")]
     pub history: usize,
+    /// Keep a running summary of what scrolled out of `history`.
+    #[serde(default = "yes")]
+    pub summarize: bool,
+    /// Model for summaries (same API); empty uses the chat model. A cheap one is fine.
+    #[serde(default)]
+    pub summary_model: String,
+    /// Rough prompt budget for summary plus transcript, in tokens.
+    #[serde(default = "default_context")]
+    pub context_tokens: usize,
+    /// Ping-pong guard: replies that come within this many seconds of the
+    /// agent's previous reply in a room count as a rapid exchange…
+    #[serde(default = "default_yield")]
+    pub yield_secs: u64,
+    /// …and after this many in a row the agent waits for a pause.
+    #[serde(default = "default_rapid")]
+    pub max_rapid_replies: u32,
     /// Tool-use round trips allowed per message before giving up.
     #[serde(default = "default_steps")]
     pub max_steps: usize,
     /// Minimum seconds between replies in one room.
     #[serde(default = "default_cooldown")]
     pub cooldown_secs: u64,
+    /// Venice only: also use Venice's own system prompt (off by default).
+    #[serde(default)]
+    pub venice_system_prompt: bool,
+    /// Venice only: let the model search the web. Off by default: it sends
+    /// chat messages on to a third-party search engine.
+    #[serde(default)]
+    pub venice_web_search: bool,
     /// Room where every moderation action is logged. Recommended.
     #[serde(default)]
     pub audit_room: Option<OwnedRoomId>,
@@ -64,7 +88,16 @@ fn yes() -> bool {
     true
 }
 fn default_history() -> usize {
-    30
+    40
+}
+fn default_context() -> usize {
+    6000
+}
+fn default_yield() -> u64 {
+    8
+}
+fn default_rapid() -> u32 {
+    4
 }
 fn default_steps() -> usize {
     6
@@ -80,6 +113,10 @@ pub fn default_prompt() -> String {
 }
 
 impl AgentConfig {
+    pub fn venice(&self) -> crate::llm::Venice {
+        crate::llm::Venice { system_prompt: self.venice_system_prompt, web_search: self.venice_web_search }
+    }
+
     pub fn new(account: AccountId, api: ApiConfig) -> Self {
         let mut c: Self = serde_json::from_value(serde_json::json!({ "account": account, "api": {"url": ""} }))
             .expect("defaults are valid");

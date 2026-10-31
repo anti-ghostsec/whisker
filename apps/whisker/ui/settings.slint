@@ -43,8 +43,15 @@ export struct AgentForm {
     system-prompt: string,
     rooms: string,
     history: int,
+    summarize: bool,
+    summary-model: string,
+    context-tokens: int,
     cooldown: int,
     max-steps: int,
+    yield-secs: int,
+    max-rapid: int,
+    venice-system-prompt: bool,
+    venice-web-search: bool,
     g-reply: bool,
     g-redact: bool,
     g-kick: bool,
@@ -330,6 +337,13 @@ component AgentPage inherits VerticalLayout {
     property <string> a-prompt: agent.system-prompt;
     property <string> a-rooms: agent.rooms;
     property <int> a-history: agent.history;
+    property <bool> a-summarize: agent.summarize;
+    property <string> a-summary-model: agent.summary-model;
+    property <int> a-context: agent.context-tokens;
+    property <int> a-yield: agent.yield-secs;
+    property <int> a-rapid: agent.max-rapid;
+    property <bool> a-venice-prompt: agent.venice-system-prompt;
+    property <bool> a-venice-search: agent.venice-web-search;
     property <int> a-cooldown: agent.cooldown;
     property <int> a-steps: agent.max-steps;
     property <bool> a-reply: agent.g-reply;
@@ -352,7 +366,9 @@ component AgentPage inherits VerticalLayout {
             url: root.a-url, api-key-set: root.agent.api-key-set, api-key: root.a-key, model: root.a-model,
             service: root.agent.service, max-tokens: root.a-max-tokens, extra-json: root.a-extra,
             trigger: root.a-trigger, system-prompt: root.a-prompt, rooms: root.a-rooms, history: root.a-history,
-            cooldown: root.a-cooldown, max-steps: root.a-steps,
+            summarize: root.a-summarize, summary-model: root.a-summary-model, context-tokens: root.a-context,
+            cooldown: root.a-cooldown, max-steps: root.a-steps, yield-secs: root.a-yield, max-rapid: root.a-rapid,
+            venice-system-prompt: root.a-venice-prompt, venice-web-search: root.a-venice-search,
             g-reply: root.a-reply, g-redact: root.a-redact, g-kick: root.a-kick, g-ban: root.a-ban,
             g-unban: root.a-unban, g-invite: root.a-invite, g-power: root.a-power,
             commanders: root.a-commanders, min-level: root.a-min-level, autonomous: root.a-autonomous,
@@ -395,6 +411,12 @@ component AgentPage inherits VerticalLayout {
             Input { text <=> root.a-model; placeholder: "e.g. meta-llama/llama-3.3-70b-instruct"; }
         }
         Number { text: "Longest reply (tokens)"; minimum: 64; maximum: 32000; value <=> root.a-max-tokens; }
+        Text {
+            text: "Venice only (api.venice.ai). Both stay off unless you turn them on.";
+            font-size: 11px; color: Theme.muted; wrap: word-wrap;
+        }
+        Toggle { text: "Venice: add Venice's own system prompt"; checked <=> root.a-venice-prompt; }
+        Toggle { text: "Venice: web search (sends chat messages to a third-party search engine)"; checked <=> root.a-venice-search; }
         Field {
             label: "Extra request settings (JSON, optional)";
             hint: "Merged into every request, for whatever this API supports, e.g. {\"temperature\": 0.7}";
@@ -410,9 +432,24 @@ component AgentPage inherits VerticalLayout {
             ComboBox { model: ["When mentioned, and in DMs", "Reads every message", "Only in DMs"]; current-index <=> root.a-trigger; }
         }
         Field { label: "Only in these rooms"; hint: "Room ids, comma separated. Empty means every room it's in."; Input { text <=> root.a-rooms; placeholder: "All rooms"; } }
-        Number { text: "Messages of context"; hint: "Recent messages it sees (kept in memory only)."; minimum: 1; maximum: 200; value <=> root.a-history; }
         Number { text: "Seconds between replies"; hint: "Per room, to stop it flooding."; minimum: 0; maximum: 3600; value <=> root.a-cooldown; }
-        Number { text: "Actions per message"; hint: "How many tool steps it may take before answering."; minimum: 1; maximum: 20; value <=> root.a-steps; }
+        Number { text: "Actions per message"; hint: "How many tool steps it may take before answering. If it runs out mid-action, it posts nothing."; minimum: 1; maximum: 20; value <=> root.a-steps; }
+    }
+
+    Card {
+        title: "Memory";
+        subtitle: "What it remembers of each room, saved in this vault so restarts don't wipe it.";
+        Number { text: "Messages kept word for word"; hint: "Per room. Older ones are folded into the summary (or dropped)."; minimum: 2; maximum: 200; value <=> root.a-history; }
+        Toggle { text: "Summarise older messages"; checked <=> root.a-summarize; }
+        Field { label: "Model for summaries"; hint: "Same API. Leave empty to use the chat model; a cheaper one works well."; Input { text <=> root.a-summary-model; placeholder: "Same as the chat model"; } }
+        Number { text: "Prompt budget (tokens)"; hint: "Roughly how much summary and transcript it sends each time; newest messages win."; minimum: 500; maximum: 200000; value <=> root.a-context; }
+    }
+
+    Card {
+        title: "Bot loops";
+        subtitle: "It never answers your other AI accounts or bot notices. Against other bots, it drops out of rapid back-and-forth until the room goes quiet.";
+        Number { text: "Quiet gap (seconds)"; hint: "Messages closer together than this count as a rapid exchange."; minimum: 1; maximum: 600; value <=> root.a-yield; }
+        Number { text: "Rapid replies before waiting"; hint: "How many quick replies in a row before it waits for a quiet gap."; minimum: 1; maximum: 50; value <=> root.a-rapid; }
     }
 
     Card {

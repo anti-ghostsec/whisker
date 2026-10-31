@@ -21,6 +21,8 @@ pub enum ClientEvent {
         origin_server_ts: MilliSecondsSinceUnixEpoch,
         /// False for undecryptable messages and media labels: the AI ignores those.
         is_text: bool,
+        /// An `m.notice`: by Matrix convention bot output, which bots never answer.
+        is_notice: bool,
         reply_to: Option<OwnedEventId>,
         media: Option<Box<Media>>,
     },

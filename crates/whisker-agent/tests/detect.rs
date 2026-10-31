@@ -3,7 +3,7 @@
 
 use serde_json::json;
 use whisker_agent::{ApiConfig, ApiFormat, Llm, detect};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -79,4 +79,36 @@ async fn adapts_to_max_completion_tokens() {
         endpoint: format!("{}/v1/chat/completions", s.uri()), ..Default::default()
     };
     assert_eq!(Llm::new(api, 100, Default::default()).unwrap().test().await.unwrap(), "ok");
+}
+
+#[tokio::test]
+async fn venice_gets_private_defaults() {
+    let server = MockServer::start().await;
+    // Venice's own system prompt and web search stay off unless asked for.
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "venice_parameters": { "include_venice_system_prompt": false, "enable_web_search": "off" } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "choices": [{ "message": { "content": "ciao" }, "finish_reason": "stop" }] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = ApiConfig {
+        url: server.uri(),
+        model: "venice-uncensored".into(),
+        format: ApiFormat::OpenAiChat,
+        endpoint: format!("{}/api/v1/chat/completions", server.uri()),
+        service: "Venice".into(),
+        ..Default::default()
+    };
+    assert_eq!(Llm::new(api.clone(), 50, Default::default()).unwrap().test().await.unwrap(), "ciao");
+
+    // Turned on in settings, web search is "auto".
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "venice_parameters": { "include_venice_system_prompt": true, "enable_web_search": "auto" } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "choices": [{ "message": { "content": "si" }, "finish_reason": "stop" }] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let llm = Llm::new(api, 50, Default::default()).unwrap().with_venice(whisker_agent::llm::Venice { system_prompt: true, web_search: true });
+    assert_eq!(llm.test().await.unwrap(), "si");
 }

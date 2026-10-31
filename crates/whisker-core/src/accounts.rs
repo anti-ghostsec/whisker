@@ -516,7 +516,8 @@ impl AccountManager {
                         let _ = tx.send(ClientEvent::Edited { account, room_id: room.room_id().to_owned(), target, body });
                     }
                     timeline::Parsed::New { body, is_text, reply_to, media } => {
-                        let m = Msg { body, is_text, reply_to, media };
+                        let is_notice = matches!(ev.content.msgtype, matrix_sdk::ruma::events::room::message::MessageType::Notice(_));
+                        let m = Msg { body, is_text, is_notice, reply_to, media };
                         publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
                     }
                 }
@@ -558,7 +559,7 @@ impl AccountManager {
         client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
             let (tx, latest) = (tx.clone(), latest.clone());
             async move {
-                let m = Msg { body: timeline::UNDECRYPTABLE.into(), is_text: false, reply_to: None, media: None };
+                let m = Msg { body: timeline::UNDECRYPTABLE.into(), is_text: false, is_notice: false, reply_to: None, media: None };
                 publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
             }
         });
@@ -948,6 +949,7 @@ impl AccountManager {
 struct Msg {
     body: String,
     is_text: bool,
+    is_notice: bool,
     reply_to: Option<matrix_sdk::ruma::OwnedEventId>,
     media: Option<timeline::Media>,
 }
@@ -963,7 +965,7 @@ async fn publish(
     msg: Msg,
     ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch,
 ) {
-    let Msg { body, is_text, reply_to, media } = msg;
+    let Msg { body, is_text, is_notice, reply_to, media } = msg;
     let (sender_name, sender_avatar) = timeline::member_profile(room, sender).await;
     let item = HistoryItem {
         event_id: event_id.clone(),
@@ -994,6 +996,7 @@ async fn publish(
         body,
         origin_server_ts: ts,
         is_text,
+        is_notice,
         reply_to,
         media: media.map(Box::new),
     });

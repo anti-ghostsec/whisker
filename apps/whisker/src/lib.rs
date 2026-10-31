@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 
 mod agent_form;
+mod emoji;
 mod format;
 mod settings;
 mod ui;
@@ -29,6 +30,8 @@ const PAGE: u32 = 50;
 const AVATAR_PX: u32 = 96;
 
 type RoomKey = (AccountId, OwnedRoomId);
+/// A character card and its PNG picture (if it came in one).
+type CardAndPicture = (whisker_agent::card::Card, Option<Vec<u8>>);
 
 #[derive(Default)]
 struct State {
@@ -41,12 +44,19 @@ struct State {
     messages: HashMap<RoomKey, Vec<HistoryItem>>,
     /// Pagination token for older history, per room (None: reached the start).
     older: HashMap<RoomKey, Option<String>>,
+    /// Emoji reactions seen in each opened room.
+    reactions: HashMap<RoomKey, Vec<timeline::Reaction>>,
+    /// The message the "Forward to…" dialog is for.
+    forwarding: Option<(RoomKey, OwnedEventId)>,
     /// Running agents, by the account they speak as.
     agents: HashMap<AccountId, JoinHandle<()>>,
     last_activity: Option<Instant>,
     refresh_pending: bool,
     synced: HashSet<AccountId>,
     detected: HashMap<AccountId, Detected>,
+    /// Character cards imported (or removed: `None`) on an AI's settings
+    /// page but not saved yet, with their PNG picture.
+    pending_cards: HashMap<AccountId, Option<CardAndPicture>>,
     reply_to: Option<OwnedEventId>,
     editing: Option<OwnedEventId>,
     /// Decoded image previews, by event.
@@ -541,10 +551,30 @@ impl Ctl {
         let show_events = self.settings.lock().unwrap().show_events;
         let st = self.st.lock().unwrap();
         let mut msgs = st.messages.get(key).cloned().unwrap_or_default();
+        drop_repeat_joins(&mut msgs);
         if !show_events {
             msgs.retain(|m| !m.notice);
         }
         let by_id: HashMap<&OwnedEventId, &HistoryItem> = msgs.iter().map(|m| (&m.event_id, m)).collect();
+        let names: HashMap<&OwnedUserId, &str> = msgs.iter().map(|m| (&m.sender, m.sender_label())).collect();
+        // Reactions per message: each emoji once, in the order first used.
+        let mut reactions: HashMap<&OwnedEventId, Vec<(String, usize, bool, String)>> = HashMap::new();
+        let mut counted = HashSet::new();
+        for r in st.reactions.get(key).map(Vec::as_slice).unwrap_or_default() {
+            if !counted.insert((&r.target, &r.key, &r.sender)) {
+                continue;
+            }
+            let list = reactions.entry(&r.target).or_default();
+            let who = names.get(&r.sender).map(|n| n.to_string()).unwrap_or_else(|| r.sender.localpart().to_owned());
+            match list.iter_mut().find(|x| x.0 == r.key) {
+                Some(x) => {
+                    x.1 += 1;
+                    x.2 |= me.as_ref() == Some(&r.sender);
+                    x.3 = format!("{}, {who}", x.3);
+                }
+                None => list.push((r.key.clone(), 1, me.as_ref() == Some(&r.sender), who)),
+            }
+        }
         // Each reader goes on the message they read up to, or (if that one
         // isn't shown, e.g. a hidden room event) the last one before it.
         let mut readers: HashMap<usize, Vec<(String, Option<OwnedMxcUri>)>> = HashMap::new();
@@ -579,6 +609,7 @@ impl Ctl {
                     day,
                     reply,
                     readers: readers.remove(&i).unwrap_or_default(),
+                    reactions: reactions.remove(&m.event_id).unwrap_or_default(),
                     item: m.clone(),
                 }
             })
@@ -647,14 +678,28 @@ impl Ctl {
         });
     }
 
-    fn merge(&self, key: &RoomKey, items: Vec<HistoryItem>) {
+    /// Adds messages to a room's cache; returns how many were new.
+    fn merge(&self, key: &RoomKey, items: Vec<HistoryItem>) -> usize {
         let mut st = self.st.lock().unwrap();
         let list = st.messages.entry(key.clone()).or_default();
         let known: HashSet<_> = list.iter().map(|m| m.event_id.clone()).collect();
+        let before = list.len();
         list.extend(items.into_iter().filter(|m| !known.contains(&m.event_id)));
+        let added = list.len() - before;
         list.sort_by_key(|m| m.ts);
         if list.len() > KEEP_PER_ROOM {
             list.drain(..list.len() - KEEP_PER_ROOM);
+        }
+        added
+    }
+
+    fn merge_reactions(&self, key: &RoomKey, new: Vec<timeline::Reaction>) {
+        let mut st = self.st.lock().unwrap();
+        let list = st.reactions.entry(key.clone()).or_default();
+        for r in new {
+            if !list.iter().any(|x| x.event_id == r.event_id) {
+                list.push(r);
+            }
         }
     }
 
@@ -678,7 +723,9 @@ impl Ctl {
             u.set_public_rooms(ModelRc::default());
             u.set_exploring(false);
         });
-        self.refresh_accounts().await;
+        // The room list first: that's what the click was for.
+        self.refresh_rooms().await;
+        self.refresh_accounts_only().await;
     }
 
     fn cycle_tag(&self, current: String) {
@@ -746,20 +793,21 @@ impl Ctl {
             st.reply_to = None;
             st.editing = None;
         }
+        self.ui(move |u| {
+            u.set_loading_history(true);
+            u.set_reply_to(s(""));
+            u.set_editing(s(""));
+            u.set_stick_bottom(true);
+        });
+        // What we already have goes up first; the rest follows.
+        self.show_messages().await;
         // Can our account kick/ban/delete others' messages here?
         let can_moderate = match (room.power_levels().await, client.user_id()) {
             (Ok(pl), Some(me)) => pl.user_can_kick(me) || pl.user_can_ban(me) || pl.user_can_redact_event_of_other(me),
             _ => false,
         };
-        self.ui(move |u| {
-            u.set_loading_history(true);
-            u.set_can_moderate(can_moderate);
-            u.set_reply_to(s(""));
-            u.set_editing(s(""));
-            u.set_stick_bottom(true);
-        });
+        self.ui(move |u| u.set_can_moderate(can_moderate));
         self.refresh_rooms().await;
-        self.show_messages().await;
 
         let fetched = self.st.lock().unwrap().older.contains_key(&key);
         if !fetched {
@@ -767,6 +815,7 @@ impl Ctl {
                 Ok(page) => {
                     self.mgr.note_history(account, &room_id, &page.items);
                     self.merge(&key, page.items);
+                    self.merge_reactions(&key, page.reactions);
                     self.st.lock().unwrap().older.insert(key.clone(), page.older);
                     if self.current().as_ref() == Some(&key) {
                         self.show_messages().await;
@@ -973,6 +1022,24 @@ impl Ctl {
         let Ok(aid) = id.parse::<AccountId>() else { return };
         let Some(client) = self.mgr.client(aid).await else { return };
         let r = match action.as_str() {
+            "make-ai" | "make-human" => {
+                let ai = action == "make-ai";
+                if !ai && let Some(h) = self.st.lock().unwrap().agents.remove(&aid) {
+                    h.abort();
+                }
+                match self.mgr.set_kind(aid, if ai { AccountKind::Agent } else { AccountKind::Human }).await {
+                    Ok(()) if ai => {
+                        self.open_settings(format!("ai:{aid}")).await;
+                        self.settings_msg("Now pick the AI's API and model, then turn it on.");
+                    }
+                    Ok(()) => {
+                        self.open_settings(format!("account:{aid}")).await;
+                        self.settings_msg("This account is a normal account again.");
+                    }
+                    Err(e) => self.settings_msg(format!("{e:#}")),
+                }
+                return;
+            }
             "name" => whisker_core::rooms::set_display_name(&client, &value).await,
             "remove-avatar" => whisker_core::rooms::set_avatar(&client, None).await,
             "verify-self" => {
@@ -1129,6 +1196,7 @@ impl Ctl {
                 history: s(&d.history),
                 members: s(format!("{} members", d.members)),
                 can_edit: d.can_edit,
+                can_set_avatar: d.can_set_avatar,
                 can_invite: d.can_invite,
             });
             let pins: Vec<PinnedItem> = pinned.iter().map(|(w, t)| PinnedItem { who: s(w), text: s(t) }).collect();
@@ -1185,6 +1253,40 @@ impl Ctl {
         self.ui(move |u| u.set_room_info_status(s(m)));
     }
 
+    /// "change" picks a picture for the open room's icon; "remove" clears it.
+    async fn room_avatar(&self, action: String) {
+        let Some((_, room)) = self.current_room().await else { return };
+        let r = match action.as_str() {
+            "remove" => whisker_core::rooms::set_room_avatar(&room, None).await,
+            #[cfg(not(target_os = "android"))]
+            "change" => {
+                let picked = tokio::task::spawn_blocking(|| {
+                    rfd::FileDialog::new().set_title("Choose a room picture").add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"]).pick_file()
+                })
+                .await
+                .ok()
+                .flatten();
+                let Some(path) = picked else { return };
+                self.ui(|u| u.set_room_info_status(s("Uploading picture…")));
+                whisker_core::rooms::set_room_avatar(&room, Some(&path)).await
+            }
+            #[cfg(target_os = "android")]
+            "change" => Err(anyhow::anyhow!("changing room pictures isn't available on Android yet")),
+            _ => return,
+        };
+        match r {
+            Ok(()) => {
+                self.open_room_info().await;
+                self.ui(|u| u.set_room_info_status(s("Picture updated.")));
+                self.schedule_rooms();
+            }
+            Err(e) => {
+                let m = format!("Couldn't change the picture: {e:#}");
+                self.ui(move |u| u.set_room_info_status(s(m)));
+            }
+        }
+    }
+
     async fn room_edit(&self, name: String, topic: String) {
         let Some((_, room)) = self.current_room().await else { return };
         match whisker_core::rooms::edit(&room, &name, &topic).await {
@@ -1239,8 +1341,10 @@ impl Ctl {
         self.ui(|u| u.set_loading_history(true));
         match timeline::history(&room, Some(token), PAGE).await {
             Ok(page) => {
-                self.merge(&key, page.items);
-                self.st.lock().unwrap().older.insert(key.clone(), page.older);
+                let added = self.merge(&key, page.items);
+                self.merge_reactions(&key, page.reactions);
+                // Nothing new came back: there's nothing older to show.
+                self.st.lock().unwrap().older.insert(key.clone(), if added == 0 { None } else { page.older });
                 self.show_messages().await;
             }
             Err(e) => self.status(format!("Couldn't load older messages: {e}")),
@@ -1296,6 +1400,7 @@ impl Ctl {
             media: None,
             edited: false,
             notice: false,
+            member: None,
         };
         self.merge(&key, vec![item]);
         self.ui(|u| u.set_stick_bottom(true));
@@ -1433,8 +1538,122 @@ impl Ctl {
             "profile" => self.open_profile(&key, m.sender.clone()).await,
             "save" => self.save_media(&key, m).await,
             "view" => self.view_image(&key, m).await,
+            "forward" => self.open_forward(key, m.event_id).await,
+            a if a.starts_with("react:") => self.toggle_reaction(&key, &room, &m.event_id, &a[6..]).await,
             _ => {}
         }
+    }
+
+    /// Adds our `emoji` reaction to a message, or takes it back if it's there.
+    async fn toggle_reaction(&self, key: &RoomKey, room: &matrix_sdk::Room, target: &OwnedEventId, emoji: &str) {
+        let me = room.own_user_id().to_owned();
+        let ours = self.st.lock().unwrap().reactions.get(key).and_then(|l| l.iter().find(|r| &r.target == target && r.key == emoji && r.sender == me).map(|r| r.event_id.clone()));
+        match ours {
+            Some(id) => {
+                if let Some(l) = self.st.lock().unwrap().reactions.get_mut(key) {
+                    l.retain(|r| r.event_id != id);
+                }
+                self.update_message(key, target);
+                if !id.as_str().starts_with(timeline::LOCAL_ECHO)
+                    && let Err(e) = room.redact(&id, None, None).await
+                {
+                    self.status(format!("Couldn't remove the reaction: {e}"));
+                }
+            }
+            None => {
+                // Show it straight away; swap in the real id once sent.
+                let Ok(local) = OwnedEventId::try_from(format!("{}{}", timeline::LOCAL_ECHO, &whisker_core::vault::random_secret()[..12])) else { return };
+                let r = timeline::Reaction { event_id: local, target: target.clone(), key: emoji.to_owned(), sender: me };
+                self.merge_reactions(key, vec![r.clone()]);
+                self.update_message(key, target);
+                let sent = timeline::react(room, target, emoji).await;
+                let mut st = self.st.lock().unwrap();
+                let list = st.reactions.entry(key.clone()).or_default();
+                match sent {
+                    Ok(id) => {
+                        if list.iter().any(|x| x.event_id == id) {
+                            list.retain(|x| x.event_id != r.event_id);
+                        } else if let Some(x) = list.iter_mut().find(|x| x.event_id == r.event_id) {
+                            x.event_id = id;
+                        }
+                    }
+                    Err(e) => {
+                        list.retain(|x| x.event_id != r.event_id);
+                        drop(st);
+                        self.status(format!("Couldn't react: {e:#}"));
+                    }
+                }
+                self.update_message(key, target);
+            }
+        }
+    }
+
+    /// Opens "Forward to…" for a message, listing the account's rooms.
+    async fn open_forward(&self, key: RoomKey, event_id: OwnedEventId) {
+        self.st.lock().unwrap().forwarding = Some((key, event_id));
+        self.ui(|u| {
+            u.set_forward_query(s(""));
+            u.set_forward_status(s(""));
+            u.set_forward_open(true);
+        });
+        self.forward_search(String::new()).await;
+    }
+
+    async fn forward_search(&self, q: String) {
+        let Some(((account, _), _)) = self.st.lock().unwrap().forwarding.clone() else { return };
+        let q = q.to_lowercase();
+        let rooms: Vec<_> = self.mgr.rooms(account).await.into_iter().filter(|r| !r.invite && (q.is_empty() || r.name.to_lowercase().contains(&q))).collect();
+        self.fetch_avatars(account, rooms.iter().filter_map(|r| r.avatar.clone()));
+        let px = self.avatars.clone();
+        self.ui(move |_| {
+            ui::with(|m| {
+                let items: Vec<ForwardItem> = rooms
+                    .iter()
+                    .map(|r| {
+                        let (initial, hue) = initial_hue(&r.name);
+                        ForwardItem { id: s(r.room_id.as_str()), name: s(&r.name), initial, hue, avatar: m.avatar(&r.avatar, &px), sent: false }
+                    })
+                    .collect();
+                m.forward.set_vec(items);
+            });
+        });
+    }
+
+    async fn forward_to(&self, target: String) {
+        let Some(((account, from_id), event_id)) = self.st.lock().unwrap().forwarding.clone() else { return };
+        let Some(client) = self.mgr.client(account).await else { return };
+        let (Some(from), Some(to)) = (client.get_room(&from_id), OwnedRoomId::try_from(target.as_str()).ok().and_then(|id| client.get_room(&id))) else { return };
+        // An edited text message goes as its newest text.
+        let edited = self.find(&(account, from_id.clone()), event_id.as_str()).filter(|m| m.edited && m.media.is_none()).map(|m| m.body);
+        let mark = |sent: bool, id: String| {
+            move |_: &AppWindow| {
+                ui::with(|m| {
+                    if let Some(i) = (0..m.forward.row_count()).find(|&i| m.forward.row_data(i).is_some_and(|r| r.id == id.as_str())) {
+                        let mut r = m.forward.row_data(i).unwrap();
+                        r.sent = sent;
+                        m.forward.set_row_data(i, r);
+                    }
+                });
+            }
+        };
+        self.ui(mark(true, target.clone()));
+        match timeline::forward(&from, &event_id, &to, edited.as_deref()).await {
+            Ok(_) => {
+                let name = timeline::room_name(&to).await;
+                self.ui(move |u| u.set_forward_status(s(format!("Forwarded to {name}."))));
+            }
+            Err(e) => {
+                let m = format!("Couldn't forward: {e:#}");
+                self.ui(mark(false, target));
+                self.ui(move |u| u.set_forward_status(s(m)));
+            }
+        }
+    }
+
+    /// The emoji picker's grid for `q`, eight to a row.
+    fn emoji_search(&self, q: String) {
+        let found = emoji::search(&q);
+        self.ui(move |u| u.set_emoji_rows(emoji_rows(&found)));
     }
 
     async fn save_media(&self, key: &RoomKey, m: HistoryItem) {
@@ -1467,7 +1686,9 @@ impl Ctl {
 
     async fn view_image(&self, key: &RoomKey, m: HistoryItem) {
         let Some(media) = m.media else { return };
-        self.ui(|u| {
+        let id = m.event_id.to_string();
+        self.ui(move |u| {
+            u.set_viewer_id(s(id));
             u.set_viewer_image(Image::default());
             u.set_viewer_open(true);
         });
@@ -1778,6 +1999,10 @@ impl Ctl {
             let cfgs = agents_in(&self.mgr, &a.vault).await;
             let cfg = cfgs.iter().find(|c| c.account == aid);
             agent = agent_form::to_form(aid, &a.display_name, cfg);
+            // Opening the page again drops an import that wasn't saved.
+            self.st.lock().unwrap().pending_cards.remove(&aid);
+            let png = self.card_picture(&a.vault, aid).await;
+            self.show_card_picture(png);
             if let Some(d) = self.st.lock().unwrap().detected.get(&aid) {
                 models = d.models.iter().map(s).collect();
                 detect = format!("✓ {} · {} models", d.service, d.models.len());
@@ -1936,8 +2161,15 @@ impl Ctl {
         let id: AccountId = f.account.parse()?;
         let vault = self.vault_of(id).await.ok_or_else(|| anyhow::anyhow!("that account is locked"))?;
         let old = agents_in(&self.mgr, &vault).await.into_iter().find(|c| c.account == id);
-        let detected = self.st.lock().unwrap().detected.get(&id).cloned();
-        let cfg = agent_form::from_form(id, f, old.as_ref(), detected.as_ref())?;
+        let (detected, pending) = {
+            let st = self.st.lock().unwrap();
+            (st.detected.get(&id).cloned(), st.pending_cards.get(&id).cloned())
+        };
+        let base = match &pending {
+            Some(p) => p.as_ref().map(|(c, _)| c.clone()),
+            None => old.as_ref().and_then(|o| o.card.clone()),
+        };
+        let cfg = agent_form::from_form(id, f, old.as_ref(), detected.as_ref(), base.as_ref())?;
         Ok((id, vault, cfg))
     }
 
@@ -1951,6 +2183,14 @@ impl Ctl {
         cfgs.push(cfg.clone());
         if let Err(e) = save_agents(&self.mgr, &vault, &cfgs).await {
             return self.settings_msg(format!("{e:#}"));
+        }
+        // A newly imported (or removed) card's picture.
+        let pending = self.st.lock().unwrap().pending_cards.remove(&id);
+        if let Some(p) = pending {
+            let text = p.and_then(|(_, png)| png).map(|b| whisker_agent::card::encode_base64(&b)).unwrap_or_default();
+            if let Err(e) = self.mgr.set_extra(&vault, &whisker_agent::card::picture_key(id), &text).await {
+                tracing::warn!("couldn't save the card picture: {e:#}");
+            }
         }
         if let Some(h) = self.st.lock().unwrap().agents.remove(&id) {
             h.abort();
@@ -1970,6 +2210,115 @@ impl Ctl {
         let name = f.name.to_string();
         let form = agent_form::to_form(id, &name, Some(&cfg));
         self.ui(move |u| u.set_agent_form(form));
+    }
+
+    /// The saved picture of `account`'s character card.
+    async fn card_picture(&self, vault: &str, account: AccountId) -> Option<Vec<u8>> {
+        let text: String = self.mgr.extra(vault, &whisker_agent::card::picture_key(account)).await?;
+        whisker_agent::card::decode_base64(&text).ok().filter(|b| !b.is_empty())
+    }
+
+    fn show_card_picture(&self, png: Option<Vec<u8>>) {
+        let px = png.and_then(|b| decode(&b, 512, 512, false));
+        self.ui(move |u| u.set_card_picture(px.map(Image::from_rgba8).unwrap_or_default()));
+    }
+
+    /// Character card buttons on an AI's page: "import", "export-json",
+    /// "export-png", "remove" and "use-profile" (the card's name and
+    /// picture for the AI's account).
+    async fn card_action(&self, action: String, f: AgentForm) {
+        let Ok(id) = f.account.parse::<AccountId>() else { return };
+        let Some(vault) = self.vault_of(id).await else { return self.settings_msg("That account is locked.") };
+        let saved = agents_in(&self.mgr, &vault).await.into_iter().find(|c| c.account == id);
+        let pending = self.st.lock().unwrap().pending_cards.get(&id).cloned();
+        // The card and picture as they stand: imported, else saved.
+        let (base, png) = match pending {
+            Some(p) => p.map(|(c, png)| (Some(c), png)).unwrap_or_default(),
+            None => (saved.as_ref().and_then(|c| c.card.clone()), self.card_picture(&vault, id).await),
+        };
+        match action.as_str() {
+            "import" => {
+                let Some(bytes) = pick_file("Import a character card", &[("Character cards", &["png", "json"])]).await else { return };
+                match whisker_agent::card::import(&bytes) {
+                    Ok(imp) => {
+                        let msg = format!(
+                            "Imported {}{}. Check it below, then press Save.",
+                            imp.card.name,
+                            if imp.png.is_some() { " with its picture" } else { "" }
+                        );
+                        let form = f.clone().with_card(Some(&imp.card));
+                        self.show_card_picture(imp.png.clone());
+                        self.st.lock().unwrap().pending_cards.insert(id, Some((imp.card, imp.png)));
+                        self.ui(move |u| u.set_agent_form(form));
+                        self.settings_msg(msg);
+                    }
+                    Err(e) => self.settings_msg(format!("Couldn't import that card: {e:#}")),
+                }
+            }
+            "remove" => {
+                self.st.lock().unwrap().pending_cards.insert(id, None);
+                let form = f.clone().with_card(None);
+                self.show_card_picture(None);
+                self.ui(move |u| u.set_agent_form(form));
+                self.settings_msg("Card removed. Press Save to keep it that way.");
+            }
+            "export-json" | "export-png" => {
+                let card = match agent_form::card_from_form(&f, base.as_ref()) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => return self.settings_msg("There's no card to export."),
+                    Err(e) => return self.settings_msg(format!("{e:#}")),
+                };
+                let png_out = action == "export-png";
+                let bytes = if png_out {
+                    // Cards travel inside a picture: the card's own, or one picked now.
+                    let picture = match png {
+                        Some(p) => p,
+                        None => {
+                            let Some(raw) = pick_file("Choose a picture for the card", &[("Images", &["png", "jpg", "jpeg", "webp", "gif"])]).await else { return };
+                            match to_png(&raw) {
+                                Some(p) => p,
+                                None => return self.settings_msg("Couldn't read that picture."),
+                            }
+                        }
+                    };
+                    match card.to_png(&picture) {
+                        Ok(b) => b,
+                        Err(e) => return self.settings_msg(format!("Couldn't export: {e:#}")),
+                    }
+                } else {
+                    serde_json::to_vec_pretty(&card.to_v3()).expect("cards serialize")
+                };
+                let name = format!("{}.{}", safe_file_name(&card.name), if png_out { "png" } else { "json" });
+                let Some(path) = save_file_as("Export character card", name).await else { return };
+                self.settings_msg(match tokio::fs::write(&path, bytes).await {
+                    Ok(()) => format!("Exported to {}", path.display()),
+                    Err(e) => format!("Couldn't export: {e}"),
+                });
+            }
+            "use-profile" => {
+                let Some(client) = self.mgr.client(id).await else { return };
+                let name = f.card_name.trim().to_owned();
+                if name.is_empty() {
+                    return self.settings_msg("The character needs a name first.");
+                }
+                self.settings_msg("Updating the AI's profile…");
+                let mut r = whisker_core::rooms::set_display_name(&client, &name).await;
+                if r.is_ok()
+                    && let Some(p) = png
+                {
+                    r = whisker_core::rooms::set_avatar_data(&client, p).await;
+                }
+                match r {
+                    Ok(()) => {
+                        self.mgr.refresh_profile(id).await;
+                        self.refresh_accounts().await;
+                        self.settings_msg(format!("The AI's account is now called {name}."));
+                    }
+                    Err(e) => self.settings_msg(format!("Couldn't update the profile: {e:#}")),
+                }
+            }
+            _ => {}
+        }
     }
 
     async fn test_agent(&self, f: AgentForm) {
@@ -2054,7 +2403,7 @@ impl Ctl {
                 }
                 ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, .. } => {
                     let key = (account, room_id);
-                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false };
+                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None };
                     // Only keep live messages for rooms we've opened; others load on open.
                     let opened = self.st.lock().unwrap().older.contains_key(&key);
                     if opened {
@@ -2098,7 +2447,29 @@ impl Ctl {
                         self.update_message(&key, &target);
                     }
                 }
-                ClientEvent::Redacted { account, room_id, target } => self.remove_message(&(account, room_id), &target),
+                ClientEvent::Reaction { account, room_id, reaction } => {
+                    let key = (account, room_id);
+                    if self.st.lock().unwrap().older.contains_key(&key) {
+                        let target = reaction.target.clone();
+                        self.merge_reactions(&key, vec![reaction]);
+                        self.update_message(&key, &target);
+                    }
+                }
+                ClientEvent::Redacted { account, room_id, target } => {
+                    let key = (account, room_id);
+                    // A taken-back reaction, or a deleted message.
+                    let unreacted = {
+                        let mut st = self.st.lock().unwrap();
+                        let list = st.reactions.entry(key.clone()).or_default();
+                        let hit = list.iter().find(|r| r.event_id == target).map(|r| r.target.clone());
+                        list.retain(|r| r.event_id != target);
+                        hit
+                    };
+                    match unreacted {
+                        Some(message) => self.update_message(&key, &message),
+                        None => self.remove_message(&key, &target),
+                    }
+                }
                 ClientEvent::Verification { account, user, flow_id, state } => {
                     let c = self.clone();
                     self.spawn(async move { c.on_verification(account, user, flow_id, state).await });
@@ -2107,6 +2478,83 @@ impl Ctl {
             }
         }
     }
+}
+
+/// Leaves out "X joined" lines for people already in the room. Some servers
+/// don't say what a member event replaced, so every name or picture change
+/// would otherwise read as another join.
+fn drop_repeat_joins(msgs: &mut Vec<HistoryItem>) {
+    let mut joined: HashMap<OwnedUserId, bool> = HashMap::new();
+    msgs.retain(|m| match &m.member {
+        Some(c) => {
+            let repeat = c.guessed && joined.get(&c.user) == Some(&true);
+            joined.insert(c.user.clone(), c.joined);
+            !repeat
+        }
+        None => {
+            if !m.notice {
+                joined.entry(m.sender.clone()).or_insert(true);
+            }
+            true
+        }
+    });
+}
+
+/// Reads a file the user picks (desktop only).
+async fn pick_file(title: &'static str, filters: &'static [(&'static str, &'static [&'static str])]) -> Option<Vec<u8>> {
+    #[cfg(not(target_os = "android"))]
+    {
+        let path = tokio::task::spawn_blocking(move || {
+            let mut d = rfd::FileDialog::new().set_title(title);
+            for (name, ext) in filters {
+                d = d.add_filter(*name, ext);
+            }
+            d.pick_file()
+        })
+        .await
+        .ok()
+        .flatten()?;
+        tokio::fs::read(path).await.ok()
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = (title, filters);
+        None
+    }
+}
+
+/// Asks where to save a file (desktop only).
+async fn save_file_as(title: &'static str, name: String) -> Option<PathBuf> {
+    #[cfg(not(target_os = "android"))]
+    {
+        tokio::task::spawn_blocking(move || rfd::FileDialog::new().set_title(title).set_file_name(name).save_file()).await.ok().flatten()
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = (title, name);
+        None
+    }
+}
+
+/// Any picture, as PNG bytes.
+fn to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
+/// A name usable as a file name everywhere.
+fn safe_file_name(name: &str) -> String {
+    let n: String = name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
+    let n = n.trim();
+    if n.is_empty() { "character".into() } else { n.chars().take(60).collect() }
+}
+
+/// Emoji in rows of eight, for the picker grid.
+fn emoji_rows(list: &[&str]) -> ModelRc<EmojiRow> {
+    let rows: Vec<EmojiRow> = list.chunks(8).map(|c| EmojiRow { items: ModelRc::new(VecModel::from(c.iter().map(s).collect::<Vec<_>>())) }).collect();
+    ModelRc::new(VecModel::from(rows))
 }
 
 /// Background errors, shortened for the status line: network errors quote
@@ -2196,9 +2644,36 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_open_room_info, open_room_info);
     on!(on_room_invite, |users| room_invite);
     on!(on_room_edit, |n, t| room_edit);
+    on!(on_room_avatar, |a| room_avatar);
+    on!(on_forward_search, |q| forward_search);
+    on!(on_forward_to, |id| forward_to);
+    {
+        let c = ctl.clone();
+        ui.on_emoji_search(move |q| c.emoji_search(q.to_string()));
+    }
+    ui.set_emoji_rows(emoji_rows(&emoji::search("")));
+    ui.set_quick_reactions(ModelRc::new(VecModel::from(emoji::QUICK.iter().map(s).collect::<Vec<_>>())));
     on!(on_create_room, |n, t, public, alias, enc, inv| create_room);
     on!(on_login, |hs, u, p, t, px, ag, reg, tok| login);
-    on!(on_account_menu, |a, id| account_menu);
+    {
+        // A dragged account moves in the rail at once; the saved order follows.
+        let c = ctl.clone();
+        ui.on_account_menu(move |a, id| {
+            if let Some(n) = a.strip_prefix("move:").and_then(|n| n.parse::<i64>().ok()) {
+                ui::with(|m| {
+                    let Some(i) = (0..m.accounts.row_count()).find(|&i| m.accounts.row_data(i).is_some_and(|r| r.id == id)) else { return };
+                    let to = (i as i64 + n).clamp(0, m.accounts.row_count() as i64 - 1) as usize;
+                    if to != i {
+                        let row = m.accounts.remove(i);
+                        m.accounts.insert(to, row);
+                    }
+                });
+            }
+            let c2 = c.clone();
+            let (a, id) = (a.to_string(), id.to_string());
+            c.spawn(async move { c2.account_menu(a, id).await });
+        });
+    }
     on!(on_room_menu, |a, id| room_menu);
     on!(on_explore_search, |srv, q| explore_search);
     on!(on_explore_join, |t| explore_join);
@@ -2217,6 +2692,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_logout, |id| logout);
     on!(on_save_agent, |f| save_agent);
     on!(on_test_agent, |f| test_agent);
+    on!(on_card_action, |a, f| card_action);
     on!(on_change_passphrase, |o, n| change_passphrase);
     on!(on_attach, attach);
     on!(on_load_older, load_older);
@@ -2282,7 +2758,37 @@ fn android_main(app: slint::android::AndroidApp) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_login;
+    use super::*;
+
+    #[test]
+    fn repeated_joins_are_dropped() {
+        use whisker_core::timeline::MemberChange;
+        let item = |id: &str, who: &str, member: Option<(bool, bool)>| HistoryItem {
+            event_id: OwnedEventId::try_from(format!("${id}")).unwrap(),
+            sender: OwnedUserId::try_from(format!("@{who}:x")).unwrap(),
+            sender_name: None,
+            sender_avatar: None,
+            body: id.into(),
+            ts: MilliSecondsSinceUnixEpoch::now(),
+            reply_to: None,
+            media: None,
+            edited: false,
+            notice: member.is_some(),
+            member: member.map(|(joined, guessed)| MemberChange { user: OwnedUserId::try_from(format!("@{who}:x")).unwrap(), joined, guessed }),
+        };
+        let mut msgs = vec![
+            item("join1", "nully", Some((true, true))),
+            item("join2", "nully", Some((true, true))),
+            item("hi", "bob", None),
+            item("bobjoin", "bob", Some((true, true))),
+            item("left", "nully", Some((false, false))),
+            item("join3", "nully", Some((true, true))),
+            item("join4", "nully", Some((true, false))),
+        ];
+        drop_repeat_joins(&mut msgs);
+        let left: Vec<&str> = msgs.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(left, ["join1", "hi", "left", "join3", "join4"]);
+    }
 
     #[test]
     fn login_names() {

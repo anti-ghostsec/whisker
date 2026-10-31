@@ -32,6 +32,8 @@ pub enum ClientEvent {
     Receipts { account: AccountId, room_id: OwnedRoomId },
     /// A message was edited; `body` is its new text.
     Edited { account: AccountId, room_id: OwnedRoomId, target: OwnedEventId, body: String },
+    /// Someone reacted to a message with an emoji.
+    Reaction { account: AccountId, room_id: OwnedRoomId, reaction: crate::timeline::Reaction },
     /// A message was deleted.
     Redacted { account: AccountId, room_id: OwnedRoomId, target: OwnedEventId },
     /// A verification started, moved on or ended.

@@ -1,6 +1,6 @@
 //! Room lists, message history, media and sending, in plain types the UI can show.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use matrix_sdk::attachment::AttachmentConfig;
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
 use matrix_sdk::room::MessagesOptions;
@@ -10,7 +10,8 @@ use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::room::message::{
     AddMentions, MessageType, Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
 };
-use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
+use matrix_sdk::ruma::events::room::member::MembershipState;
+use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent, SyncStateEvent};
 use matrix_sdk::ruma::{
     EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, UInt, UserId,
 };
@@ -72,6 +73,18 @@ pub struct HistoryItem {
     pub edited: bool,
     /// A room event (join, rename, …) described in `body`, not a message.
     pub notice: bool,
+    /// For join/leave notices: whose membership changed and how.
+    pub member: Option<MemberChange>,
+}
+
+/// Someone's membership after a room event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberChange {
+    pub user: OwnedUserId,
+    pub joined: bool,
+    /// Shown as "joined" only because the server didn't say what came
+    /// before: it may just be a name or picture change by someone already in.
+    pub guessed: bool,
 }
 
 impl HistoryItem {
@@ -269,7 +282,19 @@ pub async fn read_marks(room: &Room) -> Vec<ReadMark> {
 /// A page of history, oldest first, and the token for the page before it.
 pub struct Page {
     pub items: Vec<HistoryItem>,
+    /// Emoji reactions seen on this page (to messages on it or elsewhere).
+    pub reactions: Vec<Reaction>,
     pub older: Option<String>,
+}
+
+/// One person's emoji reaction to a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reaction {
+    /// The reaction event itself (redacting it takes the reaction back).
+    pub event_id: OwnedEventId,
+    pub target: OwnedEventId,
+    pub key: String,
+    pub sender: OwnedUserId,
 }
 
 /// Messages before `from` (or the newest ones when `from` is `None`). Edits
@@ -281,9 +306,11 @@ pub struct Page {
 /// "load older" only shows when there is something to load.
 pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Page> {
     let mut out = Vec::new();
+    let mut reactions = Vec::new();
     let mut from = from;
     for _ in 0..5 {
-        let (mut items, older) = history_page(room, from.clone(), limit).await?;
+        let (mut items, mut r, older) = history_page(room, from.clone(), limit).await?;
+        reactions.append(&mut r);
         items.append(&mut out);
         out = items;
         let more = older.is_some() && older != from;
@@ -296,12 +323,12 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
             break;
         }
     }
-    Ok(Page { items: out, older: from })
+    Ok(Page { items: out, reactions, older: from })
 }
 
 /// One `/messages` request: its items, oldest first, and the token for the
 /// page before (`None` at the start of the room).
-async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(Vec<HistoryItem>, Option<String>)> {
+async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(Vec<HistoryItem>, Vec<Reaction>, Option<String>)> {
     let mut opts = MessagesOptions::backward();
     opts.limit = UInt::from(limit);
     opts.from = from;
@@ -309,7 +336,10 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     let mut out = Vec::new();
     let mut edits: HashMap<OwnedEventId, String> = HashMap::new();
     let mut profiles: HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)> = HashMap::new();
-    let mut at_start = msgs.chunk.is_empty();
+    // A short page means the server had nothing more to give: either the
+    // start of the room or the start of what we're allowed to see.
+    let mut at_start = msgs.chunk.len() < limit as usize || msgs.end.is_none();
+    let mut reactions = Vec::new();
     // Newest first: an edit is seen before the message it changes.
     for ev in &msgs.chunk {
         let m = match ev.raw().deserialize() {
@@ -324,6 +354,10 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             _ => continue,
         };
         let (event_id, sender, ts, parsed) = match m {
+            AnySyncMessageLikeEvent::Reaction(SyncMessageLikeEvent::Original(r)) => {
+                reactions.push(Reaction { event_id: r.event_id, target: r.content.relates_to.event_id, key: r.content.relates_to.key, sender: r.sender });
+                continue;
+            }
             AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)) => {
                 (m.event_id, m.sender, m.origin_server_ts, parse(&m.content))
             }
@@ -358,10 +392,11 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             reply_to,
             media,
             notice: false,
+            member: None,
         });
     }
     out.reverse();
-    Ok((out, if at_start { None } else { msgs.end }))
+    Ok((out, reactions, if at_start { None } else { msgs.end }))
 }
 
 /// A room event as a timeline notice ("Alice joined"), if it's worth one.
@@ -387,6 +422,14 @@ pub async fn notice_item(
             .unwrap_or_else(|| id.trim_start_matches('@').split(':').next().unwrap_or(id).to_owned())
     })?;
     let (sender_name, sender_avatar) = profiles.get(ev.sender()).cloned().unwrap_or_default();
+    let member = match ev {
+        AnySyncStateEvent::RoomMember(SyncStateEvent::Original(e)) => Some(MemberChange {
+            user: e.state_key.clone(),
+            joined: e.content.membership == MembershipState::Join,
+            guessed: e.content.membership == MembershipState::Join && e.prev_content().is_none(),
+        }),
+        _ => None,
+    };
     Some(HistoryItem {
         event_id: ev.event_id().to_owned(),
         sender: ev.sender().to_owned(),
@@ -398,6 +441,7 @@ pub async fn notice_item(
         media: None,
         edited: false,
         notice: true,
+        member,
     })
 }
 
@@ -448,6 +492,44 @@ pub async fn edit_text(room: &Room, target: &EventId, text: &str) -> Result<()> 
     let content = room.make_edit_event(target, EditedContent::RoomMessage(new)).await.map_err(|e| anyhow!("couldn't edit: {e}"))?;
     room.send(content).await?;
     Ok(())
+}
+
+/// Reacts to a message with `key` (an emoji). Returns the reaction's id.
+pub async fn react(room: &Room, target: &EventId, key: &str) -> Result<OwnedEventId> {
+    use matrix_sdk::ruma::events::reaction::ReactionEventContent;
+    use matrix_sdk::ruma::events::relation::Annotation;
+    let content = ReactionEventContent::new(Annotation::new(target.to_owned(), key.to_owned()));
+    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
+    Ok(room.send(content).with_request_config(config).await?.response.event_id)
+}
+
+/// Posts a copy of a message from `from` into `to`. Media is re-posted as
+/// the same file (no download or upload); replies and mentions are dropped,
+/// and an edited message goes as its newest text.
+pub async fn forward(from: &Room, event_id: &EventId, to: &Room, edited_body: Option<&str>) -> Result<OwnedEventId> {
+    let content = match edited_body {
+        Some(body) => RoomMessageEventContent::text_plain(body),
+        None => {
+            let ev = from.event(event_id, None).await.context("couldn't fetch that message")?;
+            let mut content = match ev.raw().deserialize().context("couldn't read that message")? {
+                AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m))) => m.content,
+                AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(_)) => {
+                    bail!("this message can't be forwarded: this device doesn't have its key")
+                }
+                _ => bail!("only messages can be forwarded"),
+            };
+            let reply = matches!(content.relates_to, Some(Relation::Reply { .. }));
+            content.relates_to = None;
+            content.mentions = None;
+            // A reply carries a quote of what it answers; send just its own text.
+            if let (true, MessageType::Text(t)) = (reply, &content.msgtype) {
+                content = RoomMessageEventContent::text_plain(strip_reply_fallback(&t.body));
+            }
+            content
+        }
+    };
+    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
+    Ok(to.send(content).with_request_config(config).await?.response.event_id)
 }
 
 /// Most bytes we'll upload in one go.

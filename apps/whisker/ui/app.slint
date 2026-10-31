@@ -59,6 +59,29 @@ export struct Block {
     plain: string,
 }
 
+// An emoji reaction under a message: how many, and whether one is ours.
+export struct ReactionChip {
+    key: string,
+    count: int,
+    mine: bool,
+    who: string,
+}
+
+// A room in the "Forward to…" list.
+export struct ForwardItem {
+    id: string,
+    name: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+    sent: bool,
+}
+
+// One row of the emoji picker.
+export struct EmojiRow {
+    items: [string],
+}
+
 export struct MessageItem {
     id: string,
     // A room event ("Alice joined"), drawn as a small grey line.
@@ -91,6 +114,7 @@ export struct MessageItem {
     // People who have read up to here (at most 5), and how many more.
     readers: [Reader],
     more-readers: int,
+    reactions: [ReactionChip],
 }
 
 export struct MemberItem {
@@ -120,6 +144,7 @@ export struct RoomDetails {
     history: string,
     members: string,
     can-edit: bool,
+    can-set-avatar: bool,
     can-invite: bool,
 }
 
@@ -231,20 +256,33 @@ component MessageRow inherits Rectangle {
     in property <MessageItem> item;
     in property <bool> can-moderate;
     in property <string> room-id;
+    in property <[string]> quick-reactions;
     callback action(string, string);
     callback copy(string);
     callback link(string);
+    // Open the emoji picker to react to this message.
+    callback pick-reaction();
 
     background: area.has-hover ? Theme.hover : transparent;
     area := TouchArea {}
 
-    ContextMenuArea {
+    cm := ContextMenuArea {
         Menu {
+            if root.item.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.item.id); } }
+            if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
+            if root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
+            if root.item.media == 1 || root.item.media == 2: MenuSeparator {}
+            Menu {
+                title: "React";
+                for e in root.quick-reactions: MenuItem { title: e; activated => { root.action("react:" + e, root.item.id); } }
+                MenuItem { title: "More emoji…"; activated => { root.pick-reaction(); } }
+            }
             MenuItem { title: "Reply"; activated => { root.action("reply", root.item.id); } }
+            MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
             MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
             MenuItem { title: "Copy text"; activated => { root.copy(root.item.body); } }
             MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
-            if root.item.media > 0: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
+            if root.item.media > 2: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
             for l in root.item.links: MenuItem { title: "Open " + l; activated => { root.link(l); } }
             MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); } }
             if root.item.mine && root.item.media == 0: MenuItem { title: "Edit"; activated => { root.action("edit", root.item.id); } }
@@ -323,7 +361,14 @@ component MessageRow inherits Rectangle {
                         background: Theme.raised;
                         if root.item.picture.width > 0: Image { source: root.item.picture; width: parent.width; height: parent.height; image-fit: cover; }
                         if root.item.picture.width == 0: Text { text: "Loading image…"; color: Theme.muted; font-size: 12px; }
-                        TouchArea { mouse-cursor: pointer; clicked => { root.action("view", root.item.id); } }
+                        // Takes every button, so it opens the menu itself on right-click.
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.action("view", root.item.id); }
+                            pointer-event(e) => {
+                                if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
+                            }
+                        }
                     }
                     if root.item.media > 1: Rectangle {
                         height: 52px;
@@ -350,10 +395,55 @@ component MessageRow inherits Rectangle {
                                 Text { text: root.item.media-info; color: Theme.muted; font-size: 11px; }
                             }
                         }
-                        TouchArea { mouse-cursor: pointer; clicked => { root.action("save", root.item.id); } }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.action("save", root.item.id); }
+                            pointer-event(e) => {
+                                if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
+                            }
+                        }
                     }
                     if root.item.media == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } }
                     if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
+                    if root.item.reactions.length > 0: HorizontalLayout {
+                        alignment: start;
+                        spacing: 4px;
+                        padding-top: 2px;
+                        for r in root.item.reactions: Rectangle {
+                            height: 24px;
+                            width: chip.preferred-width + 14px;
+                            border-radius: 12px;
+                            background: r.mine ? Theme.accent-soft : chip-ta.has-hover ? Theme.hover : Theme.raised;
+                            border-width: 1px;
+                            border-color: r.mine ? Theme.accent : Theme.border;
+                            chip := HorizontalLayout {
+                                x: 7px;
+                                spacing: 4px;
+                                Text { text: r.key; font-size: 13px; vertical-alignment: center; }
+                                Text { text: r.count; font-size: 11px; font-weight: 700; color: r.mine ? Theme.accent : Theme.muted; vertical-alignment: center; }
+                            }
+                            chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("react:" + r.key, root.item.id); } }
+                            // Who reacted, on hover.
+                            if chip-ta.has-hover: Rectangle {
+                                y: -28px;
+                                height: 22px;
+                                width: min(260px, tip.preferred-width + 14px);
+                                border-radius: 6px;
+                                background: Theme.panel;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                tip := Text { text: r.who; font-size: 11px; color: Theme.text; overflow: elide; width: parent.width - 14px; }
+                            }
+                        }
+                        Rectangle {
+                            height: 24px;
+                            width: 30px;
+                            border-radius: 12px;
+                            background: add-ta.has-hover ? Theme.hover : transparent;
+                            Text { text: "+"; font-size: 14px; color: Theme.muted; }
+                            add-ta := TouchArea { mouse-cursor: pointer; clicked => { root.pick-reaction(); } }
+                        }
+                    }
                 }
             }
             // Read receipts: who has read up to here.
@@ -372,13 +462,29 @@ component MessageRow inherits Rectangle {
 component RailAccount inherits Rectangle {
     in property <AccountItem> item;
     in property <bool> selected;
+    // Where this account is in the rail, and the drag going on there
+    // (`drag-from` is -1 when nothing is being dragged).
+    in property <int> index;
+    in property <int> count;
+    in property <int> drag-from: -1;
+    in property <length> drag-dy;
     callback clicked;
     callback menu(string);
+    callback dragging(length);
+    callback dropped(int);
     width: 64px;
     height: 54px;
     // Rows are 54px plus 2px spacing in the rail.
-    property <length> drag-y: ta.pressed && abs(ta.mouse-y - ta.pressed-y) > 8px ? ta.mouse-y - ta.pressed-y : 0;
-    z: root.drag-y != 0 ? 10 : 0;
+    property <length> drag-y: ta.pressed && abs(ta.mouse-y - ta.pressed-y) > 6px ? ta.mouse-y - ta.pressed-y : 0;
+    changed drag-y => { root.dragging(self.drag-y); }
+    // Where the dragged account would land, and whether this one makes room.
+    property <int> target: max(0, min(root.count - 1, root.drag-from + round(root.drag-dy / 56px)));
+    property <length> shift: root.drag-from < 0 || root.drag-from == root.index ? 0
+        : root.drag-from < root.index && root.index <= root.target ? -56px
+        : root.target <= root.index && root.index < root.drag-from ? 56px : 0;
+    animate shift { duration: root.drag-from >= 0 ? 140ms : 0ms; easing: ease-out; }
+    property <bool> lifted: root.drag-y != 0;
+    z: root.lifted ? 10 : 0;
     cm := ContextMenuArea {
         Menu {
             MenuItem { title: "Move up"; activated => { root.menu("up"); } }
@@ -390,35 +496,48 @@ component RailAccount inherits Rectangle {
         }
     }
     Rectangle {
-        x: 0;
-        width: 4px;
-        height: root.selected ? 36px : ta.has-hover ? 16px : 0;
-        y: (parent.height - self.height) / 2;
-        border-radius: 2px;
-        background: Theme.text;
-        animate height { duration: 120ms; }
+        y: root.shift + max(-root.index * 56px, min((root.count - 1 - root.index) * 56px, root.drag-y));
+        Rectangle {
+            x: 0;
+            width: 4px;
+            height: root.selected ? 36px : ta.has-hover && !root.lifted ? 16px : 0;
+            y: (parent.height - self.height) / 2;
+            border-radius: 2px;
+            background: Theme.text;
+            animate height { duration: 120ms; }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 46px;
+            height: 46px;
+            border-radius: 23px;
+            background: root.lifted ? Theme.raised : transparent;
+            drop-shadow-blur: root.lifted ? 10px : 0;
+            drop-shadow-color: #00000070;
+            Avatar {
+                initial: root.item.initial;
+                hue: root.item.hue;
+                image: root.item.avatar;
+                robot: root.item.is-agent && root.item.avatar.width == 0;
+                size: 42px;
+                opacity: root.selected || ta.has-hover || root.lifted ? 1 : 0.8;
+            }
+        }
+        if root.item.unread > 0: Pill { x: 38px; y: 6px; text: root.item.unread > 99 ? "99+" : root.item.unread; strong: true; }
     }
-    Avatar {
-        initial: root.item.initial;
-        hue: root.item.hue;
-        image: root.item.avatar;
-        robot: root.item.is-agent && root.item.avatar.width == 0;
-        size: 42px;
-        y: (parent.height - self.height) / 2 + root.drag-y;
-        opacity: root.selected || ta.has-hover || root.drag-y != 0 ? 1 : 0.8;
-    }
-    if root.item.unread > 0: Pill { x: 38px; y: 6px + root.drag-y; text: root.item.unread > 99 ? "99+" : root.item.unread; strong: true; }
-    // Drag up or down to reorder. The TouchArea takes every button, so it
-    // opens the right-click menu itself (the menu area below never sees it).
+    // Drag up or down to reorder; the others slide aside like tabs. The
+    // TouchArea takes every button, so it opens the right-click menu itself
+    // (the menu area never sees it). It stays put while the picture moves,
+    // so the drag distance is measured from where it started.
     ta := TouchArea {
-        mouse-cursor: root.drag-y != 0 ? MouseCursor.grabbing : MouseCursor.pointer;
-        clicked => { if abs(self.mouse-y - self.pressed-y) <= 8px { root.clicked(); } }
+        mouse-cursor: root.lifted ? MouseCursor.grabbing : MouseCursor.pointer;
+        clicked => { if abs(self.mouse-y - self.pressed-y) <= 6px { root.clicked(); } }
         pointer-event(e) => {
             if e.button == PointerEventButton.right && e.kind == PointerEventKind.down {
                 cm.show({ x: self.mouse-x, y: self.mouse-y });
             } else if e.button == PointerEventButton.left && e.kind == PointerEventKind.up {
-                let steps = round((self.mouse-y - self.pressed-y) / 56px);
-                if abs(self.mouse-y - self.pressed-y) > 8px && steps != 0 { root.menu("move:" + steps); }
+                root.dropped(abs(self.mouse-y - self.pressed-y) > 6px ? root.target - root.index : 0);
             }
         }
     }
@@ -676,6 +795,24 @@ export component AppWindow inherits Window {
     in-out property <string> select-text;
     in-out property <image> viewer-image;
     in-out property <bool> viewer-open;
+    // The message the viewer shows (for Save / Forward).
+    in property <string> viewer-id;
+    // Forward to…
+    in-out property <bool> forward-open;
+    in-out property <string> forward-query;
+    in property <string> forward-status;
+    in property <[ForwardItem]> forward-rooms;
+    callback forward-search(string);
+    callback forward-to(string);
+    // Emoji picker: `emoji-for` is the message to react to, or "" to type into the composer.
+    in-out property <bool> emoji-open;
+    in-out property <string> emoji-for;
+    in property <[EmojiRow]> emoji-rows;
+    in property <[string]> quick-reactions;
+    callback emoji-search(string);
+    // Account being dragged in the rail (-1: none) and how far.
+    property <int> rail-drag-from: -1;
+    property <length> rail-drag-dy;
     in-out property <bool> profile-open;
     in-out property <bool> room-info-open;
     property <bool> panel-open: root.profile-open || root.room-info-open;
@@ -763,6 +900,9 @@ export component AppWindow inherits Window {
     callback open-room-info();
     callback room-invite(string);
     callback room-edit(string, string);
+    callback room-avatar(string);
+    in property <image> card-picture;
+    callback card-action(string, AgentForm);
     callback create-room(string, string, bool, string, bool, string);
 
     // Opens a profile card at once with what we already know; Rust fills in the rest.
@@ -822,10 +962,23 @@ export component AppWindow inherits Window {
                     content-height: rail-list.preferred-height;
                     rail-list := VerticalLayout {
                         spacing: 2px;
-                        for a in root.accounts: RailAccount {
+                        for a[i] in root.accounts: RailAccount {
                             item: a;
+                            index: i;
+                            count: root.accounts.length;
+                            drag-from: root.rail-drag-from;
+                            drag-dy: root.rail-drag-dy;
                             selected: a.id == root.current-account;
-                            clicked => { root.activity(); root.select-account(a.id); root.pane = 1; }
+                            clicked => { root.activity(); root.current-account = a.id; root.select-account(a.id); root.pane = 1; }
+                            dragging(dy) => {
+                                root.rail-drag-from = dy != 0 ? i : -1;
+                                root.rail-drag-dy = dy;
+                            }
+                            dropped(steps) => {
+                                if steps != 0 { root.account-menu("move:" + steps, a.id); }
+                                root.rail-drag-from = -1;
+                                root.rail-drag-dy = 0;
+                            }
                             menu(action) => {
                                 if action == "copy" { root.copy-text(a.user-id); } else { root.account-menu(action, a.id); }
                             }
@@ -919,7 +1072,7 @@ export component AppWindow inherits Window {
                         RoomRow {
                             item: r;
                             selected: r.id == root.current-room && !root.exploring;
-                            clicked => { root.activity(); root.exploring = false; root.select-room(r.id); root.pane = 2; root.stick-bottom = true; }
+                            clicked => { root.activity(); root.exploring = false; root.current-room = r.id; root.select-room(r.id); root.pane = 2; root.stick-bottom = true; }
                             menu(action) => { root.activity(); root.room-menu(action, r.id); }
                         }
                     }
@@ -1089,6 +1242,8 @@ export component AppWindow inherits Window {
                                 item: m;
                                 can-moderate: root.can-moderate;
                                 room-id: root.current-room;
+                                quick-reactions: root.quick-reactions;
+                                pick-reaction => { root.emoji-for = m.id; root.emoji-search(""); root.emoji-open = true; }
                                 action(a, id) => {
                                     root.activity();
                                     if a == "profile" {
@@ -1195,9 +1350,20 @@ export component AppWindow inherits Window {
                         if root.draft == "": Text {
                             x: 14px;
                             y: 10px;
+                            width: parent.width - 28px;
                             text: root.current-room == "" ? "" : "Message " + root.current-room-name + "   (Shift+Enter for a new line)";
+                            overflow: elide;
                             color: Theme.muted;
                             font-size: 14px;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        IconBtn {
+                            icon: "☺";
+                            size: 40px;
+                            active: root.emoji-open && root.emoji-for == "";
+                            clicked => { root.activity(); root.emoji-for = ""; root.emoji-search(""); root.emoji-open = !root.emoji-open; }
                         }
                     }
                     VerticalLayout {
@@ -1326,7 +1492,24 @@ export component AppWindow inherits Window {
                         if !root.profile-open && root.room-info-open: VerticalLayout {
                             alignment: start;
                             spacing: 10px;
-                            HorizontalLayout { alignment: center; Avatar { initial: root.room-details.initial; hue: root.room-details.hue; image: root.room-details.avatar; size: 96px; } }
+                            HorizontalLayout {
+                                alignment: center;
+                                Avatar {
+                                    initial: root.room-details.initial; hue: root.room-details.hue; image: root.room-details.avatar; size: 96px;
+                                    if root.room-details.can-set-avatar: Rectangle {
+                                        border-radius: self.width / 2;
+                                        background: pic-ta.has-hover ? #00000080 : transparent;
+                                        if pic-ta.has-hover: Text { text: "Change"; color: white; font-size: 12px; font-weight: 700; }
+                                        pic-ta := TouchArea { mouse-cursor: pointer; clicked => { root.room-avatar("change"); } }
+                                    }
+                                }
+                            }
+                            if root.room-details.can-set-avatar: HorizontalLayout {
+                                alignment: center;
+                                spacing: 8px;
+                                Btn { text: "Change picture"; clicked => { root.room-avatar("change"); } }
+                                if root.room-details.avatar.width > 0: Btn { text: "Remove"; clicked => { root.room-avatar("remove"); } }
+                            }
                             Text { text: root.room-details.name; font-size: 20px; font-weight: 800; color: Theme.text; horizontal-alignment: center; wrap: char-wrap; }
                             if root.room-details.alias != "": TextInput {
                                 text: root.room-details.alias; read-only: true; horizontal-alignment: center; font-size: 12px; color: Theme.muted; vertical-stretch: 0;
@@ -1445,6 +1628,8 @@ export component AppWindow inherits Window {
         save-agent(f) => { root.activity(); root.save-agent(f); }
         test-agent(f) => { root.activity(); root.test-agent(f); }
         remove-agent => { root.remove-agent(); }
+        card-picture: root.card-picture;
+        card-action(a, f) => { root.activity(); root.card-action(a, f); }
         change-passphrase(o, n) => { root.activity(); root.change-passphrase(o, n); }
         unlock-hidden(p) => { root.unlock-more(p); }
         create-hidden(p) => { root.create-hidden(p); }
@@ -1476,13 +1661,149 @@ export component AppWindow inherits Window {
         background: #000000e0;
         TouchArea { clicked => { root.viewer-open = false; } }
         if root.viewer-image.width == 0: Text { text: "Loading…"; color: white; }
-        Image {
-            source: root.viewer-image;
+        vcm := ContextMenuArea {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
             width: parent.width - 40px;
-            height: parent.height - 40px;
-            image-fit: contain;
+            height: parent.height - 80px;
+            Menu {
+                MenuItem { title: "Save image…"; activated => { root.message-action("save", root.viewer-id); } }
+                MenuItem { title: "Forward…"; activated => { root.viewer-open = false; root.message-action("forward", root.viewer-id); } }
+                MenuItem { title: "Copy link to message"; activated => { root.copy-text("https://matrix.to/#/" + root.current-room + "/" + root.viewer-id); } }
+                MenuSeparator {}
+                MenuItem { title: "Close"; activated => { root.viewer-open = false; } }
+            }
+            Image {
+                source: root.viewer-image;
+                width: parent.width;
+                height: parent.height;
+                image-fit: contain;
+            }
         }
-        Text { x: parent.width - 40px; y: 12px; text: "✕"; color: white; font-size: 22px; }
+        // Save / Forward / Close, top right.
+        HorizontalLayout {
+            x: parent.width - self.preferred-width - 12px;
+            y: 10px;
+            spacing: 6px;
+            for b in [{ icon: "⤓", tip: "save" }, { icon: "↪", tip: "forward" }, { icon: "✕", tip: "close" }]: Rectangle {
+                width: 38px;
+                height: 38px;
+                border-radius: 19px;
+                background: vb.has-hover ? #ffffff30 : #ffffff14;
+                Text { text: b.icon; color: white; font-size: 18px; }
+                vb := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if b.tip == "save" { root.message-action("save", root.viewer-id); }
+                        if b.tip == "forward" { root.viewer-open = false; root.message-action("forward", root.viewer-id); }
+                        if b.tip == "close" { root.viewer-open = false; }
+                    }
+                }
+            }
+        }
+    }
+
+    // Emoji picker, above the composer (typing) or over the chat (reacting).
+    if root.emoji-open: Rectangle {
+        TouchArea { clicked => { root.emoji-open = false; } }
+        Rectangle {
+            width: min(root.width - 24px, 340px);
+            height: min(root.height - 140px, 380px);
+            x: root.width - self.width - 16px;
+            y: root.height - self.height - 76px;
+            border-radius: 12px;
+            background: Theme.panel;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000070;
+            // Clicks on the card stay on the card.
+            TouchArea {}
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text { text: root.emoji-for == "" ? "Emoji" : "React"; font-size: 14px; font-weight: 800; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; }
+                    IconBtn { icon: "✕"; size: 26px; clicked => { root.emoji-open = false; } }
+                }
+                esearch := Input { placeholder: "Search emoji, e.g. cat, heart, thumbs"; edited(t) => { root.emoji-search(t); } }
+                if root.emoji-rows.length == 0: Text { text: "No emoji found."; color: Theme.muted; font-size: 12px; horizontal-alignment: center; }
+                esv := ScrollView {
+                    vertical-stretch: 1;
+                    content-width: self.visible-width;
+                    content-height: egrid.preferred-height;
+                    egrid := VerticalLayout {
+                        width: esv.visible-width;
+                        for row in root.emoji-rows: HorizontalLayout {
+                            alignment: start;
+                            for e in row.items: Rectangle {
+                                width: 38px;
+                                height: 38px;
+                                border-radius: 8px;
+                                background: eta.has-hover ? Theme.hover : transparent;
+                                Text { text: e; font-size: 22px; }
+                                eta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if root.emoji-for == "" {
+                                            root.draft = root.draft + e;
+                                        } else {
+                                            root.message-action("react:" + e, root.emoji-for);
+                                            root.emoji-open = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.forward-open: Overlay {
+        card-width: 440px;
+        dismiss => { root.forward-open = false; }
+        Text { text: "Forward message"; font-size: 18px; font-weight: 800; color: Theme.text; }
+        Input { text <=> root.forward-query; placeholder: "Search rooms"; edited(t) => { root.forward-search(t); } }
+        fsv := ScrollView {
+            height: min(360px, root.height - 260px);
+            content-width: self.visible-width;
+            content-height: flist.preferred-height;
+            flist := VerticalLayout {
+                width: fsv.visible-width;
+                spacing: 2px;
+                if root.forward-rooms.length == 0: Text { text: "No rooms found."; color: Theme.muted; horizontal-alignment: center; }
+                for f in root.forward-rooms: Rectangle {
+                    height: 48px;
+                    border-radius: 8px;
+                    background: fta.has-hover ? Theme.hover : transparent;
+                    fta := TouchArea {}
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        spacing: 10px;
+                        VerticalLayout { alignment: center; Avatar { initial: f.initial; hue: f.hue; image: f.avatar; size: 34px; } }
+                        Text { text: f.name; color: Theme.text; font-weight: 600; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                        VerticalLayout {
+                            alignment: center;
+                            Btn {
+                                text: f.sent ? "Sent" : "Send";
+                                primary: !f.sent;
+                                enabled: !f.sent;
+                                clicked => { root.forward-to(f.id); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if root.forward-status != "": Text { text: root.forward-status; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+        HorizontalLayout {
+            alignment: end;
+            Btn { text: "Done"; primary: true; clicked => { root.forward-open = false; } }
+        }
     }
 
     if root.create-open: Overlay {

@@ -27,6 +27,14 @@ pub struct AgentConfig {
     pub extra_params: serde_json::Map<String, serde_json::Value>,
     #[serde(default = "default_prompt")]
     pub system_prompt: String,
+    /// An imported character card the agent plays (its picture is kept
+    /// separately, see [`crate::card`]). The persona above stays as the base
+    /// a card's system prompt can include with `{{original}}`.
+    #[serde(default)]
+    pub card: Option<crate::card::Card>,
+    /// Post the card's first message when the agent joins a room.
+    #[serde(default = "yes")]
+    pub greet: bool,
     #[serde(default)]
     pub trigger: Trigger,
     /// Rooms the agent works in. Empty means every room it's joined.

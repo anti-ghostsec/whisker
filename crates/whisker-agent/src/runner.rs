@@ -74,6 +74,25 @@ fn prompt(
     out
 }
 
+/// The system blocks after [`OPERATING_NOTES`]: the persona, or the
+/// character card built on top of it, then (with a card) its lorebook
+/// entries for what's being talked about and its after-chat instructions.
+fn persona_parts(cfg: &AgentConfig, lines: &[&Line], event_id: &OwnedEventId, sender: &UserId) -> Vec<String> {
+    let Some(card) = &cfg.card else { return vec![cfg.system_prompt.clone()] };
+    let user = lines.iter().rev().find(|l| &l.event_id == event_id).and_then(|l| l.name.clone()).unwrap_or_else(|| sender.localpart().to_owned());
+    let recent: Vec<&str> = lines.iter().map(|l| l.body.as_str()).collect();
+    let lore = card.lore(&recent, &user);
+    let mut out = vec![card.system(&cfg.system_prompt, &user)];
+    if !lore.is_empty() {
+        out.push(format!("World info for this moment (from the character card):\n{lore}"));
+    }
+    let after = card.fill(card.post_history_instructions.trim(), &user);
+    if !after.is_empty() {
+        out.push(after);
+    }
+    out
+}
+
 pub struct AgentRunner {
     cfg: AgentConfig,
     mgr: AccountManager,
@@ -119,6 +138,10 @@ impl AgentRunner {
             self.memory = self.mgr.extra(v, &memory::vault_key(self.cfg.account)).await.unwrap_or_default();
         }
         let mut names = vec![me.to_string(), me.localpart().to_owned()];
+        // Being called by the character's name counts as a mention.
+        if let Some(c) = &self.cfg.card {
+            names.extend([c.name.clone(), c.nickname.clone()].into_iter().filter(|n| n.trim().chars().count() > 1));
+        }
         if let Ok(Some(n)) = client.account().get_display_name().await {
             names.push(n);
         }
@@ -234,17 +257,32 @@ impl AgentRunner {
         let me = me.to_owned();
         let commanders = self.cfg.permissions.commanders.users.clone();
         let mgr = self.mgr.clone();
+        let greeting = self.cfg.card.clone().filter(|c| self.cfg.greet && !c.first_mes.trim().is_empty());
         client.add_event_handler(move |ev: StrippedRoomMemberEvent, room: Room| {
-            let (me, commanders, mgr) = (me.clone(), commanders.clone(), mgr.clone());
+            let (me, commanders, mgr, greeting) = (me.clone(), commanders.clone(), mgr.clone(), greeting.clone());
             async move {
                 if ev.state_key != me || ev.content.membership != MembershipState::Invite {
                     return;
                 }
                 let own = mgr.accounts().await.iter().any(|a| a.kind == AccountKind::Human && a.user_id == ev.sender.as_str());
-                if (own || commanders.contains(&ev.sender))
-                    && let Err(e) = room.join().await {
-                        tracing::warn!("agent {me} could not join {}: {e}", room.room_id());
+                if !(own || commanders.contains(&ev.sender)) {
+                    return;
+                }
+                if let Err(e) = room.join().await {
+                    tracing::warn!("agent {me} could not join {}: {e}", room.room_id());
+                    return;
+                }
+                // Say hello in character, addressed to whoever invited us.
+                if let Some(card) = greeting {
+                    let who = match room.get_member_no_sync(&ev.sender).await {
+                        Ok(Some(m)) => m.display_name().unwrap_or(ev.sender.localpart()).to_owned(),
+                        _ => ev.sender.localpart().to_owned(),
+                    };
+                    let text = card.fill(&card.first_mes, &who);
+                    if let Err(e) = room.send(RoomMessageEventContent::text_markdown(text.trim())).await {
+                        tracing::warn!("agent {me} could not greet in {}: {e}", room.room_id());
                     }
+                }
             }
         });
     }
@@ -287,7 +325,9 @@ impl AgentRunner {
             user.push_str(" If it needs no response or action, reply with exactly NO_REPLY.");
         }
 
-        let system = [OPERATING_NOTES, self.cfg.system_prompt.as_str()];
+        let parts = persona_parts(&self.cfg, &lines, event_id, sender);
+        let mut system = vec![OPERATING_NOTES];
+        system.extend(parts.iter().map(String::as_str));
         let mut messages = vec![json!({ "role": "user", "content": user })];
         let gate = Gate {
             me,
@@ -451,6 +491,29 @@ mod memory_tests {
     use matrix_sdk::ruma::{owned_event_id, owned_room_id, owned_user_id};
     use wiremock::matchers::{body_string_contains, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn character_card_becomes_the_persona() {
+        let mut cfg = AgentConfig::new(AccountId::new(), ApiConfig::default());
+        cfg.system_prompt = "Keep it short.".into();
+        let (ev, bob) = (owned_event_id!("$q"), owned_user_id!("@bob:x"));
+        let line = Line::new(bob.clone(), Some("Bobby".into()), ev.clone(), "tell me about the lantern");
+        assert_eq!(persona_parts(&cfg, &[&line], &ev, &bob), ["Keep it short."]);
+        cfg.card = Some(
+            crate::card::Card::from_json(json!({"spec": "chara_card_v3", "spec_version": "3.0", "data": {
+                "name": "Rook", "description": "{{char}} guards the gate for {{user}}.",
+                "system_prompt": "{{original}} Never break character.",
+                "post_history_instructions": "Answer {{user}} in one line.",
+                "character_book": {"entries": [{"keys": ["lantern"], "content": "The lantern never goes out.", "enabled": true}]}
+            }}))
+            .unwrap(),
+        );
+        let parts = persona_parts(&cfg, &[&line], &ev, &bob);
+        assert!(parts[0].starts_with("Keep it short. Never break character."), "{}", parts[0]);
+        assert!(parts[0].contains("Rook guards the gate for Bobby."));
+        assert!(parts[1].ends_with("The lantern never goes out."));
+        assert_eq!(parts[2], "Answer Bobby in one line.");
+    }
 
     #[tokio::test]
     async fn overflow_is_summarised_by_the_summary_model() {

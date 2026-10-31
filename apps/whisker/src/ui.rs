@@ -5,7 +5,7 @@
 //! scrolling smooth and stops the scroll position jumping.
 
 use crate::format::{self, Kind};
-use crate::{AccountItem, AppWindow, Block, MessageItem, Reader, RoomItem};
+use crate::{AccountItem, AppWindow, Block, ForwardItem, MessageItem, ReactionChip, Reader, RoomItem};
 use matrix_sdk::ruma::OwnedMxcUri;
 use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use std::cell::RefCell;
@@ -21,7 +21,13 @@ pub struct Models {
     pub accounts: Rc<VecModel<AccountItem>>,
     pub rooms: Rc<VecModel<RoomItem>>,
     pub messages: Rc<VecModel<MessageItem>>,
+    /// Rooms offered by the "Forward to…" dialog.
+    pub forward: Rc<VecModel<ForwardItem>>,
     avatar_images: HashMap<OwnedMxcUri, Image>,
+    /// Built message rows by event id, with a fingerprint of what they were
+    /// built from. Reusing an unchanged row keeps it equal to the one on
+    /// screen, so redrawing a room only touches rows that really changed.
+    built: HashMap<String, (u64, MessageItem)>,
 }
 
 thread_local! {
@@ -34,11 +40,14 @@ pub fn install(w: &AppWindow) {
         accounts: Rc::new(VecModel::default()),
         rooms: Rc::new(VecModel::default()),
         messages: Rc::new(VecModel::default()),
+        forward: Rc::new(VecModel::default()),
         avatar_images: HashMap::new(),
+        built: HashMap::new(),
     };
     w.set_accounts(ModelRc::from(m.accounts.clone()));
     w.set_rooms(ModelRc::from(m.rooms.clone()));
     w.set_messages(ModelRc::from(m.messages.clone()));
+    w.set_forward_rooms(ModelRc::from(m.forward.clone()));
     MODELS.with(|c| *c.borrow_mut() = Some(m));
 }
 
@@ -67,7 +76,9 @@ impl Models {
         self.accounts.set_vec(Vec::new());
         self.rooms.set_vec(Vec::new());
         self.messages.set_vec(Vec::new());
+        self.forward.set_vec(Vec::new());
         self.avatar_images.clear();
+        self.built.clear();
     }
 }
 
@@ -136,6 +147,8 @@ pub struct MsgRow {
     pub picture: Option<Pixels>,
     /// People whose read receipt lands on this message: (name, avatar).
     pub readers: Vec<(String, Option<OwnedMxcUri>)>,
+    /// Emoji reactions: (emoji, how many, one of them is ours, who).
+    pub reactions: Vec<(String, usize, bool, String)>,
 }
 
 pub fn human_size(n: u64) -> String {
@@ -158,7 +171,30 @@ pub fn picture_size(w: Option<u64>, h: Option<u64>, px: Option<&Pixels>) -> (f32
 }
 
 impl Models {
+    /// The row for `r`, reused from last time when nothing about it changed.
     pub fn message(&mut self, r: &MsgRow, pixels: &PixelCache) -> MessageItem {
+        use std::hash::{Hash, Hasher};
+        let loaded = |m: &Option<OwnedMxcUri>| m.as_ref().is_some_and(|m| matches!(pixels.lock().unwrap().get(m), Some(Some(_))));
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", r.item).hash(&mut h);
+        (r.mine, r.first, &r.day, &r.reply, &r.readers, &r.reactions, RICH.get()).hash(&mut h);
+        r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
+        loaded(&r.item.sender_avatar).hash(&mut h);
+        r.readers.iter().map(|x| loaded(&x.1)).collect::<Vec<_>>().hash(&mut h);
+        let sig = h.finish();
+        let id = r.item.event_id.to_string();
+        if let Some((_, item)) = self.built.get(&id).filter(|(old, _)| *old == sig) {
+            return item.clone();
+        }
+        if self.built.len() > 4000 {
+            self.built.clear();
+        }
+        let item = self.build_message(r, pixels);
+        self.built.insert(id, (sig, item.clone()));
+        item
+    }
+
+    fn build_message(&mut self, r: &MsgRow, pixels: &PixelCache) -> MessageItem {
         let name = r.item.sender_label().to_owned();
         let (initial, hue) = initial_hue(&name);
         // Shown before the server has it (see `Ctl::send`).
@@ -197,6 +233,9 @@ impl Models {
                     .collect::<Vec<_>>(),
             )),
             more_readers: r.readers.len().saturating_sub(5) as i32,
+            reactions: ModelRc::new(VecModel::from(
+                r.reactions.iter().map(|(key, n, mine, who)| ReactionChip { key: s(key), count: *n as i32, mine: *mine, who: s(who) }).collect::<Vec<_>>(),
+            )),
             mine: r.mine,
             time: if local { s("Sending…") } else { s(crate::fmt_time(r.item.ts)) },
             initial,

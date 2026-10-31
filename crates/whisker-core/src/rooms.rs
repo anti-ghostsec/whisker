@@ -184,6 +184,8 @@ pub struct RoomDetails {
     pub history: String,
     pub members: u64,
     pub can_edit: bool,
+    /// May change the room's picture.
+    pub can_set_avatar: bool,
     pub can_invite: bool,
     /// Text of pinned messages (where rooms usually keep their rules).
     pub pinned: Vec<(String, String)>,
@@ -191,12 +193,13 @@ pub struct RoomDetails {
 
 pub async fn details(room: &Room) -> RoomDetails {
     let me = room.own_user_id().to_owned();
-    let (can_edit, can_invite) = match room.power_levels().await {
+    let (can_edit, can_set_avatar, can_invite) = match room.power_levels().await {
         Ok(pl) => (
             pl.user_can_send_state(&me, matrix_sdk::ruma::events::StateEventType::RoomTopic),
+            pl.user_can_send_state(&me, matrix_sdk::ruma::events::StateEventType::RoomAvatar),
             pl.user_can_invite(&me),
         ),
-        Err(_) => (false, false),
+        Err(_) => (false, false, false),
     };
     let join_rule = match room.join_rule() {
         Some(JoinRule::Public) => "Anyone can join",
@@ -230,6 +233,7 @@ pub async fn details(room: &Room) -> RoomDetails {
         history: history.into(),
         members: room.joined_members_count(),
         can_edit,
+        can_set_avatar,
         can_invite,
         pinned,
     }
@@ -315,6 +319,35 @@ pub async fn set_avatar(client: &Client, image: Option<&std::path::Path>) -> Res
             client.account().upload_avatar(&mime, data).await?;
         }
         None => client.account().set_avatar_url(None).await?,
+    }
+    Ok(())
+}
+
+/// Makes picture bytes (PNG, JPEG, …) our avatar.
+pub async fn set_avatar_data(client: &Client, data: Vec<u8>) -> Result<()> {
+    let mime = match data.get(..4) {
+        Some([0x89, b'P', b'N', b'G']) => mime_guess::mime::IMAGE_PNG,
+        Some([0xff, 0xd8, ..]) => mime_guess::mime::IMAGE_JPEG,
+        _ => bail!("the picture must be a PNG or JPEG"),
+    };
+    client.account().upload_avatar(&mime, data).await?;
+    Ok(())
+}
+
+/// Uploads a picture and makes it the room's icon; `None` removes it.
+pub async fn set_room_avatar(room: &Room, image: Option<&std::path::Path>) -> Result<()> {
+    match image {
+        Some(p) => {
+            let data = tokio::fs::read(p).await.context("can't read that file")?;
+            let mime = mime_guess::from_path(p).first_or_octet_stream();
+            if mime.type_() != "image" {
+                bail!("pick an image file");
+            }
+            room.upload_avatar(&mime, data, None).await?;
+        }
+        None => {
+            room.remove_avatar().await?;
+        }
     }
     Ok(())
 }

@@ -547,6 +547,14 @@ impl AccountManager {
             }
         });
         let tx = self.events.clone();
+        client.add_event_handler(move |ev: matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent, room: Room| {
+            let tx = tx.clone();
+            async move {
+                let reaction = timeline::Reaction { event_id: ev.event_id, target: ev.content.relates_to.event_id, key: ev.content.relates_to.key, sender: ev.sender };
+                let _ = tx.send(ClientEvent::Reaction { account, room_id: room.room_id().to_owned(), reaction });
+            }
+        });
+        let tx = self.events.clone();
         client.add_event_handler(move |_: matrix_sdk::ruma::events::receipt::SyncReceiptEvent, room: Room| {
             let tx = tx.clone();
             async move {
@@ -879,6 +887,11 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Makes an account an AI's (or a person's) again.
+    pub async fn set_kind(&self, id: AccountId, kind: AccountKind) -> Result<()> {
+        self.mutate_account(id, |r| r.kind = kind).await
+    }
+
     pub async fn set_label(&self, id: AccountId, label: Option<String>) -> Result<()> {
         let label = label.filter(|l| !l.trim().is_empty());
         self.mutate_account(id, |r| r.label = label.clone()).await
@@ -978,6 +991,7 @@ async fn publish(
         media: media.clone(),
         edited: false,
         notice: false,
+        member: None,
     };
     {
         let mut l = latest.lock().unwrap();

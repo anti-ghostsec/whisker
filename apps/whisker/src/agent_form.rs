@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
 use slint::SharedString;
 use std::collections::BTreeSet;
+use whisker_agent::card::Card;
 use whisker_agent::config::default_prompt;
 use whisker_agent::{AgentConfig, ApiConfig, Detected, Permission, Trigger};
 use whisker_core::AccountId;
@@ -44,6 +45,7 @@ pub fn to_form(account: AccountId, name: &str, cfg: Option<&AgentConfig>) -> Age
             cooldown: 2,
             max_steps: 6,
             system_prompt: default_prompt().into(),
+            greet: true,
             ..Default::default()
         };
     };
@@ -95,12 +97,73 @@ pub fn to_form(account: AccountId, name: &str, cfg: Option<&AgentConfig>) -> Age
         max_grant: c.permissions.max_grant_level.clamp(0, 100) as i32,
         protected: join(c.permissions.protected.iter().map(|u| u.as_str())),
         audit_room: c.audit_room.as_ref().map(|r| r.as_str().into()).unwrap_or_default(),
+        greet: c.greet,
+        ..Default::default()
     }
+    .with_card(c.card.as_ref())
+}
+
+/// Lines holding just this separate alternate greetings in the form.
+const GREETING_BREAK: &str = "\n---\n";
+
+impl AgentForm {
+    /// The form showing `card` (or no card).
+    pub fn with_card(mut self, card: Option<&Card>) -> Self {
+        self.has_card = card.is_some();
+        let Some(c) = card else { return self };
+        self.card_name = c.name.as_str().into();
+        self.card_nickname = c.nickname.as_str().into();
+        self.card_description = c.description.as_str().into();
+        self.card_personality = c.personality.as_str().into();
+        self.card_scenario = c.scenario.as_str().into();
+        self.card_first_mes = c.first_mes.as_str().into();
+        self.card_greetings = c.alternate_greetings.join(GREETING_BREAK).into();
+        self.card_examples = c.mes_example.as_str().into();
+        self.card_system = c.system_prompt.as_str().into();
+        self.card_post = c.post_history_instructions.as_str().into();
+        self.card_tags = join(&c.tags);
+        self.card_creator = c.creator.as_str().into();
+        self.card_notes = c.creator_notes.as_str().into();
+        let n = c.character_book.as_ref().map_or(0, |b| b.entries.len());
+        self.card_lore = match n {
+            0 => "".into(),
+            1 => "1 lorebook entry".into(),
+            n => format!("{n} lorebook entries").into(),
+        };
+        self
+    }
+}
+
+/// `base` (the imported or saved card) with the form's edits, or `None`
+/// when the form has no card.
+pub fn card_from_form(f: &AgentForm, base: Option<&Card>) -> Result<Option<Card>> {
+    if !f.has_card {
+        return Ok(None);
+    }
+    let mut c = base.cloned().unwrap_or_default();
+    c.name = f.card_name.trim().to_owned();
+    if c.name.is_empty() {
+        bail!("the character needs a name");
+    }
+    c.nickname = f.card_nickname.trim().to_owned();
+    c.description = f.card_description.to_string();
+    c.personality = f.card_personality.to_string();
+    c.scenario = f.card_scenario.to_string();
+    c.first_mes = f.card_first_mes.to_string();
+    c.alternate_greetings = f.card_greetings.split(GREETING_BREAK).map(str::trim).filter(|g| !g.is_empty()).map(str::to_owned).collect();
+    c.mes_example = f.card_examples.to_string();
+    c.system_prompt = f.card_system.to_string();
+    c.post_history_instructions = f.card_post.to_string();
+    c.tags = list(&f.card_tags).map(str::to_owned).collect();
+    c.creator = f.card_creator.trim().to_owned();
+    c.creator_notes = f.card_notes.to_string();
+    Ok(Some(c))
 }
 
 /// Builds a config from the form. `old` supplies the saved API key when the
 /// key field is empty; `detected` is the result of the last "Connect".
-pub fn from_form(account: AccountId, f: &AgentForm, old: Option<&AgentConfig>, detected: Option<&Detected>) -> Result<AgentConfig> {
+/// `card` is the card to build on (just imported, or the saved one).
+pub fn from_form(account: AccountId, f: &AgentForm, old: Option<&AgentConfig>, detected: Option<&Detected>, card: Option<&Card>) -> Result<AgentConfig> {
     let url = f.url.trim().to_owned();
     if url.is_empty() {
         bail!("enter the AI API's address");
@@ -162,6 +225,8 @@ pub fn from_form(account: AccountId, f: &AgentForm, old: Option<&AgentConfig>, d
     cfg.venice_web_search = f.venice_web_search;
     cfg.cooldown_secs = f.cooldown.max(0) as u64;
     cfg.max_steps = f.max_steps.max(1) as usize;
+    cfg.card = card_from_form(f, card)?;
+    cfg.greet = f.greet;
 
     let p = &mut cfg.permissions;
     p.global = [
@@ -204,7 +269,7 @@ mod tests {
         f.g_ban = true;
         f.extra_json = r#"{"temperature": 0.5}"#.into();
         f.commanders = "@me:anoncat.org".into();
-        let cfg = from_form(id, &f, None, None).unwrap();
+        let cfg = from_form(id, &f, None, None, None).unwrap();
         assert!(cfg.permissions.global.contains(&Permission::Ban));
         assert_eq!(cfg.extra_params["temperature"], 0.5);
 
@@ -212,24 +277,52 @@ mod tests {
         let mut f2 = to_form(id, "bot", Some(&cfg));
         assert!(f2.api_key_set);
         f2.g_ban = false;
-        let cfg2 = from_form(id, &f2, Some(&cfg), None).unwrap();
+        let cfg2 = from_form(id, &f2, Some(&cfg), None, None).unwrap();
         assert_eq!(cfg2.api.api_key.as_deref(), Some("sk-test"));
         assert!(!cfg2.permissions.global.contains(&Permission::Ban));
+    }
+
+    #[test]
+    fn card_edits_keep_the_rest_of_the_card() {
+        let id = AccountId::new();
+        let base = Card::from_json(serde_json::json!({"spec": "chara_card_v3", "spec_version": "3.0", "data": {
+            "name": "Mira", "alternate_greetings": ["a", "b"], "tags": ["x"],
+            "extensions": {"keep": 1}, "character_book": {"entries": [{"keys": ["k"], "content": "c"}]}
+        }})).unwrap();
+        let mut f = to_form(id, "bot", None).with_card(Some(&base));
+        assert_eq!(f.card_lore, "1 lorebook entry");
+        assert_eq!(f.card_greetings, "a\n---\nb");
+        f.url = "localhost:11434".into();
+        f.model = "llama3".into();
+        f.card_description = "edited".into();
+        f.card_greetings = "a\n---\n\n---\nc".into();
+        let cfg = from_form(id, &f, None, None, Some(&base)).unwrap();
+        let c = cfg.card.as_ref().unwrap();
+        assert_eq!(c.description, "edited");
+        assert_eq!(c.alternate_greetings, ["a", "c"]);
+        assert_eq!(c.character_book.as_ref().unwrap().entries.len(), 1);
+        assert_eq!(c.to_v3()["data"]["extensions"]["keep"], 1);
+        // Saved and shown again: the same card.
+        assert_eq!(to_form(id, "bot", Some(&cfg)).card_description, "edited");
+        f.card_name = " ".into();
+        assert!(from_form(id, &f, None, None, Some(&base)).is_err());
+        f.has_card = false;
+        assert!(from_form(id, &f, None, None, Some(&base)).unwrap().card.is_none());
     }
 
     #[test]
     fn rejects_bad_input() {
         let id = AccountId::new();
         let mut f = to_form(id, "bot", None);
-        assert!(from_form(id, &f, None, None).is_err(), "no url");
+        assert!(from_form(id, &f, None, None, None).is_err(), "no url");
         f.url = "localhost:11434".into();
-        assert!(from_form(id, &f, None, None).is_err(), "no model");
+        assert!(from_form(id, &f, None, None, None).is_err(), "no model");
         f.model = "llama3".into();
-        assert!(from_form(id, &f, None, None).is_ok(), "local servers need no key");
+        assert!(from_form(id, &f, None, None, None).is_ok(), "local servers need no key");
         f.commanders = "not a user".into();
-        assert!(from_form(id, &f, None, None).is_err());
+        assert!(from_form(id, &f, None, None, None).is_err());
         f.commanders = "".into();
         f.extra_json = "[1]".into();
-        assert!(from_form(id, &f, None, None).is_err());
+        assert!(from_form(id, &f, None, None, None).is_err());
     }
 }

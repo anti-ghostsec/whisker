@@ -49,16 +49,29 @@ operating system and the **Wisp** browser.
   lists, headings, clickable links); replies, edits and deletions; image previews with a
   full-size viewer; file cards; date dividers; a multi-line composer (Enter sends,
   Shift+Enter adds a line); and an **attach** button for images and files (up to 100 MB).
+- **Emoji and reactions.** The ☺ button next to Send opens a searchable emoji picker.
+  Reactions show under messages with a count (hover to see who); click one to add or take
+  back your own, or right-click a message → *React*. Emoji need an emoji font on your
+  system (on Debian/Ubuntu: `fonts-noto-color-emoji`), or they show as boxes.
+- **Forward** any message from its right-click menu to one or more of your rooms. Images
+  and files are re-posted as the same file (nothing is downloaded or uploaded again);
+  replies lose their reply link. Forwarding from an encrypted room into an unencrypted
+  one makes that file readable to the new room.
+- **Images and videos:** right-click the picture or video itself to save it; the full-size
+  viewer has Save / Forward / Close buttons and its own right-click menu.
 - **Drag to select** any part of a message and copy it with Ctrl+C (turn on *Rich message
   text* in Settings for bold/italic/clickable links instead; rich text can't be selected).
   Click a **name** to reply to that message; click an **avatar** to open the person's
   profile (direct chat, mention, copy id, kick/ban if you're a moderator, ignore).
-- **Drag an account** up or down the rail to reorder (or right-click it for Move up/down). **Right-click a room** to
+- **Drag an account** up or down the rail to reorder; the others slide aside like tabs (or
+  right-click it for Move up/down). Room admins can **change a room's picture** from Room info. **Right-click a room** to
   pin it to the top (saved as a favourite, so other apps see it), mark it read, copy its
   address or leave it. Opening a room clears its unread badge using a *private* read
   receipt, so the server's counter resets without telling anyone you read it.
 - **Read receipts.** Small avatars under a message show who has read up to there (from
   their public receipts; people who use private receipts, like you, don't appear).
+- **Repeated joins hidden.** Some servers don't say what a member event replaced, so every
+  name or picture change looks like another join; Whisker hides those repeats.
 - **Room events.** Settings → *Show room events* adds joins, leaves, invites, kicks, bans,
   renames, description, picture and permission changes as grey lines in the timeline.
 - **Instant sending.** Your message appears at once (dimmed, "Sending…") and settles when
@@ -84,6 +97,21 @@ operating system and the **Wisp** browser.
 - **Settings page** (⚙): dark (the default), light or follow-system theme; auto-lock after
   5/15/60 minutes idle; change a vault's passphrase; nickname, tags and proxy per account;
   a full AI agent setup form (model, API key, effort, permissions, commanders, audit room).
+- **AI accounts.** An AI chats as its own Matrix account. Add one from Settings → General
+  → *Add an AI account*, or turn an account you have into one from its settings page. Its
+  page under **AI** takes any API address and key (Venice, OpenAI, Anthropic, OpenRouter,
+  a local server…), the model, and Venice's privacy switches (both off by default).
+- **Character cards.** On an AI's page, *Import card…* reads Tavern / SillyTavern character
+  cards, versions 1, 2 and 3, as `.json` or as `.png` (the card hidden in the picture,
+  `ccv3` read before `chara`). The AI then plays that character: description,
+  personality, scenario and example messages go into its instructions (your own text stays,
+  and a card's system prompt can place it with `{{original}}`), `{{char}}` and `{{user}}`
+  are filled in, lorebook entries are added when their keywords come up (constant,
+  selective and case-sensitive entries and the scan depth are honoured), and it greets
+  with the first message when it joins a room (can be turned off). Every field can be
+  edited; *Export .png* / *Export .json* write it back out as CCv3 (plus v2 in the PNG, for
+  older apps), keeping fields Whisker doesn't use. *Use the card's name and picture* sets
+  the AI account's display name and avatar. Cards and their pictures are kept in the vault.
 - **End-to-end encryption.** Built on matrix-rust-sdk. Each account's local store
   (room state and encryption keys) is kept *inside its vault file*, not in a folder of
   its own: while a vault is unlocked the store runs from RAM, and it is packed back into
@@ -178,8 +206,9 @@ x build -p whisker --platform android --arch arm64
 ## Setting up an AI account
 
 1. In the GUI, click **+**, sign in to the bot's account, and tick
-   *Automated AI account*. Or use `whisker-agentd login --agent …`.
-2. Whisker opens its settings page. Paste the API address (e.g. `openrouter.ai/api` or
+   *Automated AI account*. Or use `whisker-agentd login --agent …`. An account you've
+   already added can become an AI too: *Settings → its page → Use this account as an AI*.
+2. Whisker opens its settings page. Paste the API address (e.g. `api.venice.ai/api/v1`, `openrouter.ai/api` or
    `localhost:11434`), add a key if it needs one, press **Connect**, pick a model, set its
    permissions, then **Test** and **Save**. Each AI has its own page under *Settings → AI*.
 
@@ -202,5 +231,5 @@ when someone mentions it and to every DM (`--trigger every` makes it read every 
 
 This is an early version. It already does: vaults, signing in to several accounts at once,
 tags, hidden vaults, a settings page, sync, room list and history, sending messages, moderation commands,
-AI agents, and plugin discovery. Still to do: cross-signing and device verification, media, threads and reactions, notifications,
+AI agents, and plugin discovery. Still to do: cross-signing and device verification, media, threads, notifications,
 UI for plugin features, and an Android package that has been tested on a device.

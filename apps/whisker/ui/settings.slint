@@ -65,6 +65,25 @@ export struct AgentForm {
     max-grant: int,
     protected: string,
     audit-room: string,
+    // Character card (has-card false: none). Alternate greetings are
+    // separated by a line holding just "---".
+    has-card: bool,
+    greet: bool,
+    card-name: string,
+    card-nickname: string,
+    card-description: string,
+    card-personality: string,
+    card-scenario: string,
+    card-first-mes: string,
+    card-greetings: string,
+    card-examples: string,
+    card-system: string,
+    card-post: string,
+    card-tags: string,
+    card-creator: string,
+    card-notes: string,
+    // "3 lorebook entries", or "".
+    card-lore: string,
 }
 
 component Card inherits Rectangle {
@@ -157,7 +176,14 @@ component GeneralPage inherits VerticalLayout {
     callback change-passphrase(string, string);
     callback unlock-hidden(string);
     callback create-hidden(string);
+    callback new-ai();
     spacing: 14px;
+
+    Card {
+        title: "AI";
+        subtitle: "An AI chats as its own Matrix account. Add one (a new or existing account for the bot), or turn one of your accounts into an AI from its page under ACCOUNTS. Its settings, including the API service (OpenAI, Anthropic, Venice, a local server…), API key, model and Venice privacy options, then appear under AI on the left.";
+        HorizontalLayout { alignment: start; Btn { text: "Add an AI account"; primary: true; clicked => { root.new-ai(); } } }
+    }
 
     Card {
         title: "Appearance";
@@ -311,6 +337,17 @@ component AccountPage inherits VerticalLayout {
         HorizontalLayout { alignment: start; Btn { text: "Restore keys"; enabled: key.text != ""; clicked => { root.recover(key.text); key.text = ""; } } }
     }
     Card {
+        title: root.account.is-agent ? "AI" : "Use as an AI";
+        subtitle: root.account.is-agent
+            ? "This account is run by an AI. Its API, key and behaviour are under AI on the left. Turning it back stops the AI; its settings are kept."
+            : "Lets an AI chat as this account. You then pick the API service (OpenAI, Anthropic, Venice…), key and model under AI on the left. Best on an account made for the bot.";
+        HorizontalLayout {
+            alignment: start;
+            if !root.account.is-agent: Btn { text: "Use this account as an AI"; clicked => { root.profile-edit("make-ai", root.account.id, ""); } }
+            if root.account.is-agent: Btn { text: "Turn back into a normal account"; clicked => { root.profile-edit("make-human", root.account.id, ""); } }
+        }
+    }
+    Card {
         title: "Log out";
         subtitle: "Signs this device out on the server and deletes its local data.";
         HorizontalLayout { alignment: start; Btn { text: "Log out of " + root.account.user-id; danger: true; clicked => { root.logout(root.account.id); } } }
@@ -326,8 +363,43 @@ component AgentPage inherits VerticalLayout {
     callback save-agent(AgentForm);
     callback test-agent(AgentForm);
     callback remove-agent();
+    in property <image> card-picture;
+    callback card-action(string, AgentForm);
 
     property <bool> a-enabled: agent.enabled;
+    property <bool> a-greet: agent.greet;
+    // Card fields follow the form whenever Rust replaces it (an import),
+    // even after being edited.
+    property <bool> a-has-card: agent.has-card;
+    property <string> c-name: agent.card-name;
+    property <string> c-nickname: agent.card-nickname;
+    property <string> c-description: agent.card-description;
+    property <string> c-personality: agent.card-personality;
+    property <string> c-scenario: agent.card-scenario;
+    property <string> c-first: agent.card-first-mes;
+    property <string> c-greetings: agent.card-greetings;
+    property <string> c-examples: agent.card-examples;
+    property <string> c-system: agent.card-system;
+    property <string> c-post: agent.card-post;
+    property <string> c-tags: agent.card-tags;
+    property <string> c-creator: agent.card-creator;
+    property <string> c-notes: agent.card-notes;
+    changed agent => {
+        root.a-has-card = root.agent.has-card;
+        root.c-name = root.agent.card-name;
+        root.c-nickname = root.agent.card-nickname;
+        root.c-description = root.agent.card-description;
+        root.c-personality = root.agent.card-personality;
+        root.c-scenario = root.agent.card-scenario;
+        root.c-first = root.agent.card-first-mes;
+        root.c-greetings = root.agent.card-greetings;
+        root.c-examples = root.agent.card-examples;
+        root.c-system = root.agent.card-system;
+        root.c-post = root.agent.card-post;
+        root.c-tags = root.agent.card-tags;
+        root.c-creator = root.agent.card-creator;
+        root.c-notes = root.agent.card-notes;
+    }
     property <string> a-url: agent.url;
     property <string> a-key;
     property <string> a-model: agent.model;
@@ -373,6 +445,11 @@ component AgentPage inherits VerticalLayout {
             g-unban: root.a-unban, g-invite: root.a-invite, g-power: root.a-power,
             commanders: root.a-commanders, min-level: root.a-min-level, autonomous: root.a-autonomous,
             max-grant: root.a-max-grant, protected: root.a-protected, audit-room: root.a-audit,
+            has-card: root.a-has-card, greet: root.a-greet, card-name: root.c-name, card-nickname: root.c-nickname,
+            card-description: root.c-description, card-personality: root.c-personality, card-scenario: root.c-scenario,
+            card-first-mes: root.c-first, card-greetings: root.c-greetings, card-examples: root.c-examples,
+            card-system: root.c-system, card-post: root.c-post, card-tags: root.c-tags, card-creator: root.c-creator,
+            card-notes: root.c-notes, card-lore: root.agent.card-lore,
         };
     }
 
@@ -386,7 +463,7 @@ component AgentPage inherits VerticalLayout {
 
     Card {
         title: "AI API";
-        subtitle: "Paste the address of any AI API: OpenAI-style (OpenRouter, Groq, Mistral, DeepSeek, Gemini, LM Studio, llama.cpp, vLLM…), Anthropic-style, or Ollama. Whisker works out which kind it is.";
+        subtitle: "Paste the address of any AI API: OpenAI-style (Venice at api.venice.ai, OpenRouter, Groq, Mistral, DeepSeek, Gemini, LM Studio, llama.cpp, vLLM…), Anthropic-style, or Ollama. Whisker works out which kind it is.";
         Field { label: "API address"; Input { text <=> root.a-url; placeholder: "e.g. openrouter.ai/api   or   localhost:11434"; } }
         Field {
             label: "API key";
@@ -422,6 +499,62 @@ component AgentPage inherits VerticalLayout {
             hint: "Merged into every request, for whatever this API supports, e.g. {\"temperature\": 0.7}";
             TextEdit { text <=> root.a-extra; height: 60px; font-size: 12px; }
         }
+    }
+
+    Card {
+        title: "Character card";
+        subtitle: root.a-has-card
+            ? "The AI plays this character. Its system prompt can include your instructions below with {{original}}; {{char}} and {{user}} are filled in."
+            : "Import a character card (.png or .json; Tavern / SillyTavern cards, versions 1 to 3) to have the AI play that character.";
+        if root.a-has-card: HorizontalLayout {
+            spacing: 14px;
+            if root.card-picture.width > 0: Rectangle {
+                width: 96px;
+                height: 128px;
+                border-radius: 10px;
+                clip: true;
+                background: Theme.raised;
+                Image { source: root.card-picture; width: parent.width; height: parent.height; image-fit: cover; }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+                Text { text: root.c-name; font-size: 18px; font-weight: 800; color: Theme.text; wrap: word-wrap; }
+                if root.c-creator != "": Text { text: "by " + root.c-creator; font-size: 12px; color: Theme.muted; }
+                if root.c-tags != "": Text { text: root.c-tags; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+                if root.agent.card-lore != "": Text { text: root.agent.card-lore; font-size: 11px; color: Theme.muted; }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Btn { text: root.a-has-card ? "Import another…" : "Import card…"; primary: !root.a-has-card; clicked => { root.card-action("import", root.form()); } }
+            if root.a-has-card: Btn { text: "Export .png"; clicked => { root.card-action("export-png", root.form()); } }
+            if root.a-has-card: Btn { text: "Export .json"; clicked => { root.card-action("export-json", root.form()); } }
+            if root.a-has-card: Btn { text: "Remove"; danger: true; clicked => { root.card-action("remove", root.form()); } }
+        }
+        if root.a-has-card: Btn {
+            text: "Use the card's name and picture for this account";
+            clicked => { root.card-action("use-profile", root.form()); }
+        }
+        if root.a-has-card: Toggle { text: "Greet with the first message when joining a room"; checked <=> root.a-greet; }
+        if root.a-has-card: Field { label: "Name"; Input { text <=> root.c-name; } }
+        if root.a-has-card: Field { label: "Nickname (optional, used for {{char}})"; Input { text <=> root.c-nickname; } }
+        if root.a-has-card: Field { label: "Description"; TextEdit { text <=> root.c-description; height: 120px; wrap: word-wrap; } }
+        if root.a-has-card: Field { label: "Personality"; TextEdit { text <=> root.c-personality; height: 60px; wrap: word-wrap; } }
+        if root.a-has-card: Field { label: "Scenario"; TextEdit { text <=> root.c-scenario; height: 60px; wrap: word-wrap; } }
+        if root.a-has-card: Field { label: "First message"; TextEdit { text <=> root.c-first; height: 80px; wrap: word-wrap; } }
+        if root.a-has-card: Field {
+            label: "Other greetings";
+            hint: "Kept with the card. Separate them with a line holding just ---";
+            TextEdit { text <=> root.c-greetings; height: 60px; wrap: word-wrap; }
+        }
+        if root.a-has-card: Field { label: "Example messages"; TextEdit { text <=> root.c-examples; height: 80px; wrap: word-wrap; } }
+        if root.a-has-card: Field { label: "Card system prompt (optional)"; hint: "Replaces your instructions below; put {{original}} where they should go."; TextEdit { text <=> root.c-system; height: 60px; wrap: word-wrap; } }
+        if root.a-has-card: Field { label: "Instructions after the chat (optional)"; TextEdit { text <=> root.c-post; height: 50px; wrap: word-wrap; } }
+        if root.a-has-card: Field { label: "Tags"; Input { text <=> root.c-tags; placeholder: "comma separated"; } }
+        if root.a-has-card: Field { label: "Creator"; Input { text <=> root.c-creator; } }
+        if root.a-has-card: Field { label: "Creator's notes (not sent to the AI)"; TextEdit { text <=> root.c-notes; height: 50px; wrap: word-wrap; } }
     }
 
     Card {
@@ -517,6 +650,8 @@ export component SettingsPage inherits Rectangle {
     callback save-agent(AgentForm);
     callback test-agent(AgentForm);
     callback remove-agent();
+    in property <image> card-picture;
+    callback card-action(string, AgentForm);
     callback change-passphrase(string, string);
     callback unlock-hidden(string);
     callback create-hidden(string);
@@ -589,6 +724,7 @@ export component SettingsPage inherits Rectangle {
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }
                             unlock-hidden(p) => { root.unlock-hidden(p); }
                             create-hidden(p) => { root.create-hidden(p); }
+                            new-ai => { root.new-ai(); }
                         }
                         if root.selected != "" && root.account.id != "" && root.selected == "account:" + root.account.id: AccountPage {
                             account: root.account;
@@ -606,6 +742,8 @@ export component SettingsPage inherits Rectangle {
                             save-agent(f) => { root.save-agent(f); }
                             test-agent(f) => { root.test-agent(f); }
                             remove-agent => { root.remove-agent(); }
+                            card-picture: root.card-picture;
+                            card-action(a, f) => { root.card-action(a, f); }
                         }
                     }
                 }

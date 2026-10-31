@@ -1,0 +1,148 @@
+// Whisker's look: a small set of colours and a few hand-made widgets.
+
+export global Theme {
+    in-out property <bool> dark: true;
+    out property <color> bg: dark ? #101216 : #f5f6f8;
+    out property <color> panel: dark ? #15181d : #ffffff;
+    out property <color> rail: dark ? #0b0c0f : #e8eaee;
+    out property <color> raised: dark ? #1c2026 : #eef0f3;
+    out property <color> hover: dark ? #1f232a : #eceef2;
+    out property <color> active: dark ? #272c35 : #e1e5ec;
+    out property <color> border: dark ? #23272e : #e2e5ea;
+    out property <color> text: dark ? #e7e9ed : #15171b;
+    out property <color> muted: dark ? #8a919d : #6a717d;
+    out property <color> accent: #7b6cf6;
+    out property <color> accent-soft: dark ? #7b6cf633 : #7b6cf622;
+    out property <color> on-accent: #ffffff;
+    out property <color> danger: #e5534b;
+    out property <color> ok: #3fb27f;
+    out property <[color]> hues: [#7b6cf6, #2f9e8f, #d9822b, #c2477e, #3d7be0, #7f8f25, #b5523b, #5a6be0];
+}
+
+export global Prefs {
+    // Rich (styled, clickable links) vs plain drag-selectable message text.
+    in-out property <bool> rich-text: false;
+}
+
+export component Avatar inherits Rectangle {
+    in property <string> initial;
+    in property <int> hue;
+    in property <image> image;
+    in property <bool> robot;
+    in property <length> size: 36px;
+    width: size;
+    height: size;
+    border-radius: self.width / 2;
+    clip: true;
+    background: robot ? #4a4f5c : Theme.hues[Math.mod(hue, 8)];
+    if root.image.width == 0: Text {
+        text: root.robot ? "AI" : root.initial;
+        color: white;
+        font-weight: 700;
+        font-size: root.size * (root.robot ? 0.34 : 0.44);
+    }
+    if root.image.width > 0: Image {
+        source: root.image;
+        width: root.size;
+        height: root.size;
+        image-fit: cover;
+    }
+}
+
+export component Btn inherits Rectangle {
+    horizontal-stretch: 0;
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> danger;
+    in property <bool> enabled: true;
+    callback clicked;
+    height: 34px;
+    min-width: label.preferred-width + 28px;
+    border-radius: 8px;
+    opacity: enabled ? 1 : 0.45;
+    background: primary ? (ta.has-hover ? Theme.accent.brighter(0.1) : Theme.accent)
+        : danger ? (ta.has-hover ? Theme.danger.transparentize(0.75) : Theme.danger.transparentize(0.85))
+        : (ta.has-hover ? Theme.active : Theme.raised);
+    label := Text {
+        text: root.text;
+        color: root.primary ? Theme.on-accent : root.danger ? Theme.danger : Theme.text;
+        font-weight: 600;
+        font-size: 13px;
+    }
+    ta := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+export component IconBtn inherits Rectangle {
+    in property <string> icon;
+    // Draw a padlock instead of a text glyph (emoji fonts aren't everywhere).
+    in property <bool> padlock;
+    in property <length> size: 36px;
+    in property <bool> active;
+    callback clicked;
+    width: size;
+    height: size;
+    border-radius: 10px;
+    background: active ? Theme.accent-soft : ta.has-hover ? Theme.hover : transparent;
+    if !root.padlock: Text { text: root.icon; font-size: root.size * 0.48; color: root.active ? Theme.accent : Theme.muted; }
+    if root.padlock: Path {
+        width: root.size * 0.5;
+        height: root.size * 0.5;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        stroke: Theme.muted;
+        stroke-width: 2px;
+        commands: "M 7 11 V 8 A 5 5 0 0 1 17 8 V 11 M 5 11 H 19 V 21 H 5 Z";
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// A light text field: no frame, just a rounded fill.
+export component Input inherits Rectangle {
+    horizontal-stretch: 1;
+    in property <string> placeholder;
+    in property <bool> password;
+    in property <bool> enabled: true;
+    in-out property <string> text <=> ti.text;
+    callback accepted(string);
+    callback edited(string);
+    height: 38px;
+    border-radius: 10px;
+    clip: true;
+    background: Theme.raised;
+    border-width: ti.has-focus ? 1px : 0px;
+    border-color: Theme.accent;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        ti := TextInput {
+            vertical-alignment: center;
+            color: Theme.text;
+            font-size: 14px;
+            enabled: root.enabled;
+            input-type: root.password ? InputType.password : InputType.text;
+            selection-background-color: Theme.accent-soft;
+            accepted => { root.accepted(self.text); }
+            edited => { root.edited(self.text); }
+        }
+    }
+    if ti.text == "": Text {
+        x: 12px;
+        text: root.placeholder;
+        width: parent.width - 24px;
+        overflow: elide;
+        color: Theme.muted;
+        font-size: 14px;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+}
+
+export component Pill inherits Rectangle {
+    in property <string> text;
+    in property <bool> strong;
+    height: 18px;
+    width: max(18px, t.preferred-width + 10px);
+    border-radius: 9px;
+    background: strong ? Theme.accent : Theme.accent-soft;
+    t := Text { text: root.text; font-size: 10px; font-weight: 700; color: root.strong ? Theme.on-accent : Theme.text; }
+}

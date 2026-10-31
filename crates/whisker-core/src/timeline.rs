@@ -1,0 +1,408 @@
+//! Room lists, message history, media and sending, in plain types the UI can show.
+
+use anyhow::{Context, Result, anyhow};
+use matrix_sdk::attachment::AttachmentConfig;
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
+use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::room::edit::EditedContent;
+use matrix_sdk::room::reply::{EnforceThread, Reply};
+use matrix_sdk::ruma::events::room::MediaSource;
+use matrix_sdk::ruma::events::room::message::{
+    AddMentions, MessageType, Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+};
+use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
+use matrix_sdk::ruma::{
+    EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, UInt, UserId,
+};
+use matrix_sdk::{Client, Room};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// Shown for messages this device has no keys for yet.
+pub const UNDECRYPTABLE: &str = "Encrypted message — this device doesn't have the key yet";
+
+#[derive(Debug, Clone)]
+pub struct RoomSummary {
+    pub room_id: OwnedRoomId,
+    pub name: String,
+    pub invite: bool,
+    pub avatar: Option<OwnedMxcUri>,
+    pub topic: Option<String>,
+    pub encrypted: bool,
+    pub unread: u64,
+    pub members: u64,
+    pub latest: Option<HistoryItem>,
+    /// Favourite ("pinned") rooms sort first. Stored as the standard
+    /// `m.favourite` tag, so other clients see it too.
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Video,
+    Audio,
+    File,
+}
+
+/// An attachment on a message.
+#[derive(Debug, Clone)]
+pub struct Media {
+    pub kind: MediaKind,
+    pub source: MediaSource,
+    /// A server-made thumbnail, when the sender provided one.
+    pub thumbnail: Option<MediaSource>,
+    pub name: String,
+    pub mime: Option<String>,
+    pub size: Option<u64>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryItem {
+    pub event_id: OwnedEventId,
+    pub sender: OwnedUserId,
+    pub sender_name: Option<String>,
+    pub sender_avatar: Option<OwnedMxcUri>,
+    pub body: String,
+    pub ts: MilliSecondsSinceUnixEpoch,
+    pub reply_to: Option<OwnedEventId>,
+    pub media: Option<Media>,
+    pub edited: bool,
+}
+
+impl HistoryItem {
+    pub fn sender_label(&self) -> &str {
+        self.sender_name.as_deref().unwrap_or(self.sender.localpart())
+    }
+}
+
+/// What a message event means for the timeline.
+pub enum Parsed {
+    /// A new message: body, whether it's real text, reply target, attachment.
+    New { body: String, is_text: bool, reply_to: Option<OwnedEventId>, media: Option<Media> },
+    /// An edit of an earlier message.
+    Edit { target: OwnedEventId, body: String },
+}
+
+/// Readable text for a message, and whether it is real text (not a label).
+pub fn message_body(m: &MessageType) -> (String, bool) {
+    match m {
+        MessageType::Text(t) => (t.body.clone(), true),
+        MessageType::Notice(t) => (t.body.clone(), true),
+        MessageType::Emote(t) => (format!("* {}", t.body), true),
+        MessageType::Image(_) => ("Sent an image".into(), false),
+        MessageType::Video(_) => ("Sent a video".into(), false),
+        MessageType::Audio(_) => ("Sent audio".into(), false),
+        MessageType::File(f) => (format!("Sent a file: {}", f.body), false),
+        MessageType::Location(_) => ("Shared a location".into(), false),
+        other => (other.body().to_owned(), true),
+    }
+}
+
+fn media_of(m: &MessageType) -> Option<Media> {
+    let u = |v: Option<UInt>| v.map(u64::from);
+    Some(match m {
+        MessageType::Image(c) => Media {
+            kind: MediaKind::Image,
+            source: c.source.clone(),
+            thumbnail: c.info.as_ref().and_then(|i| i.thumbnail_source.clone()),
+            name: c.filename().to_owned(),
+            mime: c.info.as_ref().and_then(|i| i.mimetype.clone()),
+            size: c.info.as_ref().and_then(|i| u(i.size)),
+            width: c.info.as_ref().and_then(|i| u(i.width)),
+            height: c.info.as_ref().and_then(|i| u(i.height)),
+        },
+        MessageType::Video(c) => Media {
+            kind: MediaKind::Video,
+            source: c.source.clone(),
+            thumbnail: c.info.as_ref().and_then(|i| i.thumbnail_source.clone()),
+            name: c.filename().to_owned(),
+            mime: c.info.as_ref().and_then(|i| i.mimetype.clone()),
+            size: c.info.as_ref().and_then(|i| u(i.size)),
+            width: None,
+            height: None,
+        },
+        MessageType::Audio(c) => Media {
+            kind: MediaKind::Audio,
+            source: c.source.clone(),
+            thumbnail: None,
+            name: c.filename().to_owned(),
+            mime: c.info.as_ref().and_then(|i| i.mimetype.clone()),
+            size: c.info.as_ref().and_then(|i| u(i.size)),
+            width: None,
+            height: None,
+        },
+        MessageType::File(c) => Media {
+            kind: MediaKind::File,
+            source: c.source.clone(),
+            thumbnail: c.info.as_ref().and_then(|i| i.thumbnail_source.clone()),
+            name: c.filename().to_owned(),
+            mime: c.info.as_ref().and_then(|i| i.mimetype.clone()),
+            size: c.info.as_ref().and_then(|i| u(i.size)),
+            width: None,
+            height: None,
+        },
+        _ => return None,
+    })
+}
+
+/// Drops the "> <@user> quoted text" fallback older clients put at the top of replies.
+fn strip_reply_fallback(body: &str) -> String {
+    if !body.starts_with("> ") {
+        return body.to_owned();
+    }
+    let mut lines = body.lines().peekable();
+    while lines.peek().is_some_and(|l| l.starts_with('>')) {
+        lines.next();
+    }
+    while lines.peek().is_some_and(|l| l.trim().is_empty()) {
+        lines.next();
+    }
+    lines.collect::<Vec<_>>().join("\n")
+}
+
+pub fn parse(content: &RoomMessageEventContent) -> Parsed {
+    match &content.relates_to {
+        Some(Relation::Replacement(r)) => Parsed::Edit { target: r.event_id.clone(), body: message_body(&r.new_content.msgtype).0 },
+        rel => {
+            let (mut body, is_text) = message_body(&content.msgtype);
+            let reply_to = match rel {
+                Some(Relation::Reply(r)) => Some(r.in_reply_to.event_id.clone()),
+                Some(Relation::Thread(t)) => t.in_reply_to.as_ref().map(|r| r.event_id.clone()),
+                _ => None,
+            };
+            if reply_to.is_some() {
+                body = strip_reply_fallback(&body);
+            }
+            Parsed::New { body, is_text, reply_to, media: media_of(&content.msgtype) }
+        }
+    }
+}
+
+pub async fn rooms(client: &Client) -> Vec<RoomSummary> {
+    let mut out = Vec::new();
+    for (room, invite) in client
+        .invited_rooms()
+        .into_iter()
+        .map(|r| (r, true))
+        .chain(client.joined_rooms().into_iter().map(|r| (r, false)))
+    {
+        out.push(RoomSummary {
+            room_id: room.room_id().to_owned(),
+            name: room_name(&room).await,
+            invite,
+            avatar: room.avatar_url(),
+            topic: room.topic(),
+            encrypted: room.encryption_state().is_encrypted(),
+            unread: room.unread_notification_counts().notification_count,
+            members: room.joined_members_count(),
+            latest: None,
+            pinned: room.is_favourite(),
+        });
+    }
+    out
+}
+
+/// The room's name; uses the name cached by the last sync when there is one
+/// (computing it from members is slow on big accounts).
+pub async fn room_name(room: &Room) -> String {
+    if let Some(n) = room.cached_display_name() {
+        return n.to_string();
+    }
+    match room.display_name().await {
+        Ok(n) => n.to_string(),
+        Err(_) => room.room_id().to_string(),
+    }
+}
+
+/// Display name and avatar of a room member, from the local store.
+pub async fn member_profile(room: &Room, user: &UserId) -> (Option<String>, Option<OwnedMxcUri>) {
+    match room.get_member_no_sync(user).await {
+        Ok(Some(m)) => (m.display_name().map(str::to_owned), m.avatar_url().map(ToOwned::to_owned)),
+        _ => (None, None),
+    }
+}
+
+/// A page of history, oldest first, and the token for the page before it.
+pub struct Page {
+    pub items: Vec<HistoryItem>,
+    pub older: Option<String>,
+}
+
+/// Messages before `from` (or the newest ones when `from` is `None`). Edits
+/// are applied and deleted messages left out.
+pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Page> {
+    let mut opts = MessagesOptions::backward();
+    opts.limit = UInt::from(limit);
+    opts.from = from;
+    let msgs = room.messages(opts).await?;
+    let mut out = Vec::new();
+    let mut edits: HashMap<OwnedEventId, String> = HashMap::new();
+    let mut profiles: HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)> = HashMap::new();
+    // Newest first: an edit is seen before the message it changes.
+    for ev in &msgs.chunk {
+        let Ok(AnySyncTimelineEvent::MessageLike(m)) = ev.raw().deserialize() else { continue };
+        let (event_id, sender, ts, parsed) = match m {
+            AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)) => {
+                (m.event_id, m.sender, m.origin_server_ts, parse(&m.content))
+            }
+            AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(m)) => (
+                m.event_id,
+                m.sender,
+                m.origin_server_ts,
+                Parsed::New { body: UNDECRYPTABLE.to_owned(), is_text: false, reply_to: None, media: None },
+            ),
+            _ => continue,
+        };
+        let (body, reply_to, media) = match parsed {
+            Parsed::Edit { target, body } => {
+                edits.entry(target).or_insert(body);
+                continue;
+            }
+            Parsed::New { body, reply_to, media, .. } => (body, reply_to, media),
+        };
+        if !profiles.contains_key(&sender) {
+            profiles.insert(sender.clone(), member_profile(room, &sender).await);
+        }
+        let (sender_name, sender_avatar) = profiles[&sender].clone();
+        let edited = edits.remove(&event_id);
+        out.push(HistoryItem {
+            edited: edited.is_some(),
+            body: edited.unwrap_or(body),
+            event_id,
+            sender,
+            sender_name,
+            sender_avatar,
+            ts,
+            reply_to,
+            media,
+        });
+    }
+    out.reverse();
+    Ok(Page { items: out, older: msgs.end })
+}
+
+/// Downloads media (decrypting it if needed). With `thumb`, asks the server
+/// for a small version; encrypted media has no server thumbnails, so then
+/// the full file comes back. Cached in the account's encrypted media store.
+pub async fn download(client: &Client, source: &MediaSource, thumb: Option<u32>) -> Result<Vec<u8>> {
+    let format = match (source, thumb) {
+        (MediaSource::Plain(_), Some(px)) => MediaFormat::Thumbnail(MediaThumbnailSettings::new(UInt::from(px), UInt::from(px))),
+        _ => MediaFormat::File,
+    };
+    let req = MediaRequestParameters { source: source.clone(), format };
+    Ok(client.media().get_media_content(&req, true).await?)
+}
+
+/// A small square thumbnail of an avatar, as encoded image bytes.
+pub async fn thumbnail(client: &Client, mxc: &MxcUri, size: u32) -> Result<Vec<u8>> {
+    download(client, &MediaSource::Plain(mxc.to_owned()), Some(size)).await
+}
+
+/// Sends Markdown text, optionally as a reply.
+pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>) -> Result<()> {
+    let content = RoomMessageEventContentWithoutRelation::text_markdown(text);
+    let content = match reply_to {
+        Some(id) => room
+            .make_reply_event(content, Reply { event_id: id.to_owned(), enforce_thread: EnforceThread::MaybeThreaded, add_mentions: AddMentions::Yes })
+            .await
+            .map_err(|e| anyhow!("couldn't build the reply: {e}"))?,
+        None => content.with_relation(None),
+    };
+    room.send(content).await?;
+    Ok(())
+}
+
+/// Replaces the text of one of our own messages.
+pub async fn edit_text(room: &Room, target: &EventId, text: &str) -> Result<()> {
+    let new = RoomMessageEventContentWithoutRelation::text_markdown(text);
+    let content = room.make_edit_event(target, EditedContent::RoomMessage(new)).await.map_err(|e| anyhow!("couldn't edit: {e}"))?;
+    room.send(content).await?;
+    Ok(())
+}
+
+/// Most bytes we'll upload in one go.
+pub const MAX_UPLOAD: u64 = 100 * 1024 * 1024;
+
+/// Uploads a file from disk and posts it (as an image when it is one).
+pub async fn send_file(room: &Room, path: &Path) -> Result<()> {
+    let meta = tokio::fs::metadata(path).await.context("can't read that file")?;
+    if meta.len() > MAX_UPLOAD {
+        anyhow::bail!("that file is over 100 MB");
+    }
+    let data = tokio::fs::read(path).await?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    room.send_attachment(name, &mime, data, AttachmentConfig::new()).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_reply_fallback() {
+        assert_eq!(strip_reply_fallback("> <@a:b> hi\n> there\n\nmy answer"), "my answer");
+        assert_eq!(strip_reply_fallback("no quote"), "no quote");
+    }
+}
+
+/// A room listed in a server's public room directory.
+#[derive(Debug, Clone)]
+pub struct PublicRoom {
+    pub room_id: OwnedRoomId,
+    pub name: String,
+    pub alias: Option<String>,
+    pub topic: Option<String>,
+    pub members: u64,
+    pub avatar: Option<OwnedMxcUri>,
+}
+
+/// Searches the public room directory of `server` (or the account's own
+/// homeserver). Returns the rooms and a token for the next page.
+pub async fn public_rooms(client: &Client, server: Option<&str>, search: &str, since: Option<String>) -> Result<(Vec<PublicRoom>, Option<String>)> {
+    use matrix_sdk::ruma::api::client::directory::get_public_rooms_filtered::v3::Request;
+    use matrix_sdk::ruma::directory::Filter;
+    let mut req = Request::new();
+    req.limit = Some(UInt::from(30u32));
+    req.since = since;
+    if let Some(s) = server.map(str::trim).filter(|s| !s.is_empty()) {
+        req.server = Some(s.try_into().map_err(|_| anyhow!("“{s}” isn't a server name like matrix.org"))?);
+    }
+    let mut filter = Filter::new();
+    let q = search.trim();
+    if !q.is_empty() {
+        filter.generic_search_term = Some(q.to_owned());
+    }
+    req.filter = filter;
+    let resp = client.public_rooms_filtered(req).await?;
+    let rooms = resp
+        .chunk
+        .into_iter()
+        .map(|r| PublicRoom {
+            name: r
+                .name
+                .clone()
+                .or_else(|| r.canonical_alias.as_ref().map(|a| a.to_string()))
+                .unwrap_or_else(|| r.room_id.to_string()),
+            alias: r.canonical_alias.map(|a| a.to_string()),
+            topic: r.topic,
+            members: r.num_joined_members.into(),
+            avatar: r.avatar_url,
+            room_id: r.room_id,
+        })
+        .collect();
+    Ok((rooms, resp.next_batch))
+}
+
+/// Joins a room by id (`!abc:server`) or address (`#name:server`).
+pub async fn join(client: &Client, id_or_alias: &str) -> Result<Room> {
+    use matrix_sdk::ruma::{OwnedRoomOrAliasId, OwnedServerName};
+    let target: OwnedRoomOrAliasId = id_or_alias.trim().try_into().map_err(|_| anyhow!("that isn't a room address like #room:server"))?;
+    // Ask the room's own server to help us in, as well as ours.
+    let via: Vec<OwnedServerName> = target.server_name().map(ToOwned::to_owned).into_iter().collect();
+    Ok(client.join_room_by_id_or_alias(&target, &via).await?)
+}

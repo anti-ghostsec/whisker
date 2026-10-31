@@ -1,0 +1,40 @@
+[package]
+name = "whisker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "whisker"
+path = "src/main.rs"
+
+[dependencies]
+whisker-core.workspace = true
+whisker-agent.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+chrono.workspace = true
+matrix-sdk.workspace = true
+directories.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+slint = "1.18.1"
+
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.17.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+slint = { version = "1.18.1", features = ["backend-android-activity-06"] }
+
+[build-dependencies]
+slint-build = "1.18.1"
+
+[package.metadata.android]
+package = "io.github.antighostsec.whisker"

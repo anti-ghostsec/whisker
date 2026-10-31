@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/whisker-core",
+    "crates/whisker-agent",
+    "apps/whisker",
+    "apps/whisker-agentd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+whisker-core = { path = "crates/whisker-core" }
+whisker-agent = { path = "crates/whisker-agent" }
+
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+chacha20poly1305 = "0.11.0"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+directories = "6.0.0"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+matrix-sdk = { version = "0.19.1", default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "sqlite", "bundled-sqlite", "rustls-aws-lc-rs", "markdown", "socks"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "socks"] }
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.29.0", features = ["v4", "serde"] }
+zeroize = { version = "1.9.1", features = ["derive"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# Debug builds: optimise dependencies (Argon2, crypto, SQLite, Slint) so the
+# app is usable while developing. Our own crates stay quick to compile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

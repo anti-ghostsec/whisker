@@ -1,0 +1,1549 @@
+import { ListView, ScrollView, Palette, TextEdit, Switch } from "std-widgets.slint";
+import { Theme, Prefs, Avatar, Btn, IconBtn, Input, Pill } from "theme.slint";
+import { SettingsPage, AccountForm, AgentForm, NavItem } from "settings.slint";
+
+export { AccountForm, AgentForm, NavItem, Prefs }
+
+// `initial`/`hue`/`avatar` are worked out in Rust so a name looks the same everywhere.
+export struct AccountItem {
+    id: string,
+    name: string,
+    user-id: string,
+    tags: string,
+    is-agent: bool,
+    initial: string,
+    hue: int,
+    avatar: image,
+    unread: int,
+}
+
+export struct RoomItem {
+    id: string,
+    name: string,
+    invite: bool,
+    initial: string,
+    hue: int,
+    avatar: image,
+    preview: string,
+    time: string,
+    unread: int,
+    encrypted: bool,
+    pinned: bool,
+}
+
+// A room in a public directory.
+export struct PublicItem {
+    id: string,
+    name: string,
+    alias: string,
+    topic: string,
+    members: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+    joined: bool,
+}
+
+// One line of a message: 0 text, 1 quote, 2 code, 3 heading, 4 blank.
+export struct Block {
+    kind: int,
+    text: styled-text,
+    plain: string,
+}
+
+export struct MessageItem {
+    id: string,
+    sender: string,
+    name: string,
+    body: string,
+    blocks: [Block],
+    mine: bool,
+    time: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+    // First message of a run by the same sender: shows avatar and name.
+    first: bool,
+    // Date divider shown above this message ("Today", "Yesterday", …), or "".
+    day: string,
+    faint: bool,
+    edited: bool,
+    reply-name: string,
+    reply-text: string,
+    // 0 none, 1 image, 2 video, 3 audio, 4 file
+    media: int,
+    media-name: string,
+    media-info: string,
+    picture: image,
+    picture-width: length,
+    picture-height: length,
+    links: [string],
+}
+
+export struct MemberItem {
+    user-id: string,
+    name: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+    role: string,
+}
+
+export struct PinnedItem {
+    who: string,
+    text: string,
+}
+
+export struct RoomDetails {
+    id: string,
+    name: string,
+    topic: string,
+    alias: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+    encrypted: bool,
+    join-rule: string,
+    history: string,
+    members: string,
+    can-edit: bool,
+    can-invite: bool,
+}
+
+// A user's profile card.
+export struct Profile {
+    user-id: string,
+    name: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+    role: string,
+    is-me: bool,
+    can-kick: bool,
+    can-ban: bool,
+    has-dm: bool,
+    // 0 = no encryption keys to verify, 1 = not verified, 2 = verified, -1 = checking
+    verified: int,
+}
+
+export struct EmojiItem {
+    symbol: string,
+    name: string,
+}
+
+
+component Blocks inherits VerticalLayout {
+    in property <[Block]> blocks;
+    in property <bool> faint;
+    // Exact width the text gets. Passed down so wrapped text measures its
+    // height at the width it will really have.
+    in property <length> avail;
+    callback link(string);
+    spacing: 2px;
+    for b in root.blocks: VerticalLayout {
+        if b.kind == 0 && !Prefs.rich-text: TextInput {
+            width: root.avail;
+            text: b.plain;
+            read-only: true;
+            single-line: false;
+            wrap: word-wrap;
+            color: root.faint ? Theme.muted : Theme.text;
+            font-italic: root.faint;
+            selection-background-color: Theme.accent.transparentize(0.55);
+        }
+        if b.kind == 0 && Prefs.rich-text: StyledText {
+            width: root.avail;
+            text: b.text;
+            default-color: root.faint ? Theme.muted : Theme.text;
+            link-color: Theme.accent;
+            link-clicked(l) => { root.link(l); }
+        }
+        if b.kind == 1: HorizontalLayout {
+            spacing: 8px;
+            Rectangle { width: 3px; border-radius: 2px; background: Theme.accent.transparentize(0.4); }
+            if !Prefs.rich-text: TextInput {
+                width: root.avail - 11px;
+                text: b.plain;
+                read-only: true;
+                single-line: false;
+                wrap: word-wrap;
+                color: Theme.muted;
+                selection-background-color: Theme.accent.transparentize(0.55);
+            }
+            if Prefs.rich-text: StyledText {
+                width: root.avail - 11px;
+                text: b.text;
+                default-color: Theme.muted;
+                link-color: Theme.accent;
+                link-clicked(l) => { root.link(l); }
+            }
+        }
+        if b.kind == 2: Rectangle {
+            background: Theme.raised;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border;
+            HorizontalLayout {
+                padding: 8px;
+                TextInput {
+                    width: root.avail - 16px;
+                    text: b.plain;
+                    read-only: true;
+                    single-line: false;
+                    wrap: word-wrap;
+                    font-family: "monospace";
+                    font-size: 13px;
+                    color: Theme.text;
+                    selection-background-color: Theme.accent.transparentize(0.55);
+                }
+            }
+        }
+        if b.kind == 3 && !Prefs.rich-text: TextInput {
+            width: root.avail;
+            text: b.plain;
+            read-only: true;
+            single-line: false;
+            wrap: word-wrap;
+            font-size: 17px;
+            font-weight: 700;
+            color: Theme.text;
+            selection-background-color: Theme.accent.transparentize(0.55);
+        }
+        if b.kind == 3 && Prefs.rich-text: StyledText { width: root.avail; text: b.text; default-color: Theme.text; default-font-size: 17px; link-color: Theme.accent; }
+        if b.kind == 4: Rectangle { height: 6px; }
+    }
+}
+
+component MessageRow inherits Rectangle {
+    in property <MessageItem> item;
+    in property <bool> can-moderate;
+    in property <string> room-id;
+    callback action(string, string);
+    callback copy(string);
+    callback link(string);
+
+    background: area.has-hover ? Theme.hover : transparent;
+    area := TouchArea {}
+
+    ContextMenuArea {
+        Menu {
+            MenuItem { title: "Reply"; activated => { root.action("reply", root.item.id); } }
+            MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
+            MenuItem { title: "Copy text"; activated => { root.copy(root.item.body); } }
+            MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
+            if root.item.media > 0: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
+            for l in root.item.links: MenuItem { title: "Open " + l; activated => { root.link(l); } }
+            MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); } }
+            if root.item.mine && root.item.media == 0: MenuItem { title: "Edit"; activated => { root.action("edit", root.item.id); } }
+            MenuSeparator {}
+            if root.item.mine || root.can-moderate: MenuItem { title: "Delete"; activated => { root.action("delete", root.item.id); } }
+            if !root.item.mine && root.can-moderate: Menu {
+                title: "Moderate " + root.item.name;
+                MenuItem { title: "Kick"; activated => { root.action("kick", root.item.id); } }
+                MenuItem { title: "Ban"; activated => { root.action("ban", root.item.id); } }
+            }
+            MenuItem { title: "View profile"; activated => { root.action("profile", root.item.id); } }
+            MenuItem { title: "Copy user id"; activated => { root.copy(root.item.sender); } }
+        }
+
+        VerticalLayout {
+            if root.item.day != "": HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 14px;
+                padding-bottom: 4px;
+                spacing: 10px;
+                Rectangle { height: 1px; y: 8px; background: Theme.border; horizontal-stretch: 1; }
+                Text { text: root.item.day; font-size: 11px; font-weight: 700; color: Theme.muted; }
+                Rectangle { height: 1px; y: 8px; background: Theme.border; horizontal-stretch: 1; }
+            }
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: root.item.first ? 10px : 1px;
+                padding-bottom: 2px;
+                spacing: 12px;
+                VerticalLayout {
+                    width: 36px;
+                    alignment: start;
+                    if root.item.first: Avatar {
+                        initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; size: 36px;
+                        TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
+                    }
+                    if !root.item.first && area.has-hover: Text { text: root.item.time; font-size: 9px; color: Theme.muted; horizontal-alignment: right; height: 20px; vertical-alignment: center; }
+                }
+                VerticalLayout {
+                    spacing: 3px;
+                    if root.item.first: HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Text {
+                            text: root.item.name;
+                            font-weight: 700;
+                            color: root.item.mine ? Theme.accent : Theme.text;
+                            font-size: 14px;
+                            // Click a name to reply to this message.
+                            TouchArea { mouse-cursor: pointer; clicked => { root.action("reply", root.item.id); } }
+                        }
+                        Text { text: root.item.time; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                    }
+                    if root.item.reply-name != "": HorizontalLayout {
+                        spacing: 6px;
+                        Rectangle { width: 2px; background: Theme.muted.transparentize(0.5); }
+                        Text { text: root.item.reply-name; font-size: 12px; font-weight: 700; color: Theme.muted; }
+                        Text { text: root.item.reply-text; font-size: 12px; color: Theme.muted; overflow: elide; horizontal-stretch: 1; }
+                    }
+                    if root.item.media == 1: Rectangle {
+                        width: root.item.picture-width;
+                        height: root.item.picture-height;
+                        border-radius: 8px;
+                        clip: true;
+                        background: Theme.raised;
+                        if root.item.picture.width > 0: Image { source: root.item.picture; width: parent.width; height: parent.height; image-fit: cover; }
+                        if root.item.picture.width == 0: Text { text: "Loading image…"; color: Theme.muted; font-size: 12px; }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.action("view", root.item.id); } }
+                    }
+                    if root.item.media > 1: Rectangle {
+                        height: 52px;
+                        max-width: 340px;
+                        border-radius: 8px;
+                        background: Theme.raised;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding: 8px;
+                            spacing: 10px;
+                            Rectangle {
+                                width: 36px;
+                                border-radius: 6px;
+                                background: Theme.accent-soft;
+                                Text {
+                                    text: root.item.media == 2 ? "VID" : root.item.media == 3 ? "AUD" : "FILE";
+                                    font-size: 9px; font-weight: 800; color: Theme.accent;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Text { text: root.item.media-name; color: Theme.text; overflow: elide; font-weight: 600; }
+                                Text { text: root.item.media-info; color: Theme.muted; font-size: 11px; }
+                            }
+                        }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.action("save", root.item.id); } }
+                    }
+                    if root.item.media == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } }
+                    if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
+                }
+            }
+        }
+    }
+}
+
+component RailAccount inherits Rectangle {
+    in property <AccountItem> item;
+    in property <bool> selected;
+    callback clicked;
+    callback menu(string);
+    width: 64px;
+    height: 54px;
+    // Rows are 54px plus 2px spacing in the rail.
+    property <length> drag-y: ta.pressed && abs(ta.mouse-y - ta.pressed-y) > 8px ? ta.mouse-y - ta.pressed-y : 0;
+    z: root.drag-y != 0 ? 10 : 0;
+    cm := ContextMenuArea {
+        Menu {
+            MenuItem { title: "Move up"; activated => { root.menu("up"); } }
+            MenuItem { title: "Move down"; activated => { root.menu("down"); } }
+            MenuSeparator {}
+            MenuItem { title: "Account settings"; activated => { root.menu("settings"); } }
+            if root.item.is-agent: MenuItem { title: "AI settings"; activated => { root.menu("ai"); } }
+            MenuItem { title: "Copy user id"; activated => { root.menu("copy"); } }
+        }
+    }
+    Rectangle {
+        x: 0;
+        width: 4px;
+        height: root.selected ? 36px : ta.has-hover ? 16px : 0;
+        y: (parent.height - self.height) / 2;
+        border-radius: 2px;
+        background: Theme.text;
+        animate height { duration: 120ms; }
+    }
+    Avatar {
+        initial: root.item.initial;
+        hue: root.item.hue;
+        image: root.item.avatar;
+        robot: root.item.is-agent && root.item.avatar.width == 0;
+        size: 42px;
+        y: (parent.height - self.height) / 2 + root.drag-y;
+        opacity: root.selected || ta.has-hover || root.drag-y != 0 ? 1 : 0.8;
+    }
+    if root.item.unread > 0: Pill { x: 38px; y: 6px + root.drag-y; text: root.item.unread > 99 ? "99+" : root.item.unread; strong: true; }
+    // Drag up or down to reorder. The TouchArea takes every button, so it
+    // opens the right-click menu itself (the menu area below never sees it).
+    ta := TouchArea {
+        mouse-cursor: root.drag-y != 0 ? MouseCursor.grabbing : MouseCursor.pointer;
+        clicked => { if abs(self.mouse-y - self.pressed-y) <= 8px { root.clicked(); } }
+        pointer-event(e) => {
+            if e.button == PointerEventButton.right && e.kind == PointerEventKind.down {
+                cm.show({ x: self.mouse-x, y: self.mouse-y });
+            } else if e.button == PointerEventButton.left && e.kind == PointerEventKind.up {
+                let steps = round((self.mouse-y - self.pressed-y) / 56px);
+                if abs(self.mouse-y - self.pressed-y) > 8px && steps != 0 { root.menu("move:" + steps); }
+            }
+        }
+    }
+}
+
+component RoomRow inherits Rectangle {
+    in property <RoomItem> item;
+    in property <bool> selected;
+    callback clicked;
+    callback menu(string);
+    cm := ContextMenuArea {
+        Menu {
+            if root.item.invite: MenuItem { title: "Accept invitation"; activated => { root.menu("accept"); } }
+            if root.item.invite: MenuItem { title: "Decline invitation"; activated => { root.menu("leave"); } }
+            if !root.item.invite: MenuItem { title: root.item.pinned ? "Unpin" : "Pin to top"; activated => { root.menu(root.item.pinned ? "unpin" : "pin"); } }
+            if !root.item.invite: MenuItem { title: "Mark as read"; activated => { root.menu("read"); } }
+            if !root.item.invite: MenuItem { title: "Room info"; activated => { root.menu("info"); } }
+            if !root.item.invite: MenuItem { title: "Invite people…"; activated => { root.menu("info"); } }
+            MenuItem { title: "Copy room address"; activated => { root.menu("copy"); } }
+            if !root.item.invite: MenuSeparator {}
+            if !root.item.invite: MenuItem { title: "Leave room"; activated => { root.menu("leave"); } }
+        }
+    }
+    height: 58px;
+    border-radius: 10px;
+    background: selected ? Theme.active : ta.has-hover ? Theme.hover : transparent;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 10px;
+        spacing: 10px;
+        VerticalLayout { alignment: center; Avatar { initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; size: 40px; } }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            HorizontalLayout {
+                spacing: 6px;
+                if root.item.pinned: Text { text: "▲"; font-size: 9px; color: Theme.accent; vertical-alignment: center; }
+                Text {
+                    text: root.item.name;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    color: Theme.text;
+                    font-weight: root.item.unread > 0 || root.item.invite ? 700 : 600;
+                    font-size: 14px;
+                }
+                Text { text: root.item.time; color: Theme.muted; font-size: 11px; }
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: root.item.invite ? "Invitation" : root.item.preview;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    color: root.item.invite ? Theme.accent : Theme.muted;
+                    font-size: 12px;
+                }
+                if root.item.unread > 0: Pill { text: root.item.unread > 99 ? "99+" : root.item.unread; strong: true; }
+            }
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        // This takes every button, so open the right-click menu from here.
+        pointer-event(e) => {
+            if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.mouse-x, y: self.mouse-y }); }
+        }
+    }
+}
+
+component UnlockScreen inherits Rectangle {
+    in property <bool> first-run;
+    in property <string> error;
+    in property <bool> busy;
+    callback submit(string);
+    background: Theme.bg;
+    VerticalLayout {
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            VerticalLayout {
+                width: min(340px, root.width - 32px);
+                spacing: 14px;
+                HorizontalLayout { alignment: center; Avatar { initial: "W"; hue: 0; size: 64px; } }
+                Text { text: "Whisker"; font-size: 26px; font-weight: 800; horizontal-alignment: center; color: Theme.text; }
+                Text {
+                    text: root.first-run ? "Pick a passphrase. It encrypts every account on this device." : "Enter your passphrase";
+                    wrap: word-wrap; horizontal-alignment: center; color: Theme.muted;
+                }
+                pass := Input {
+                    password: true;
+                    placeholder: "Passphrase";
+                    enabled: !root.busy;
+                    accepted(t) => { root.submit(t); self.text = ""; }
+                }
+                Btn {
+                    text: root.busy ? "Unlocking…" : root.first-run ? "Create vault" : "Unlock";
+                    primary: true;
+                    enabled: !root.busy;
+                    clicked => { root.submit(pass.text); pass.text = ""; }
+                }
+                if root.error != "": Text { text: root.error; color: Theme.danger; wrap: word-wrap; horizontal-alignment: center; }
+            }
+        }
+    }
+}
+
+component Overlay inherits Rectangle {
+    in property <length> card-width: 380px;
+    callback dismiss;
+    background: #000000b0;
+    TouchArea { clicked => { root.dismiss(); } }
+    VerticalLayout {
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: min(root.card-width, root.width - 32px);
+                background: Theme.panel;
+                border-radius: 14px;
+                border-width: 1px;
+                border-color: Theme.border;
+                TouchArea {}
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 10px;
+                    @children
+                }
+            }
+        }
+    }
+}
+
+component Tab inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    height: 32px;
+    horizontal-stretch: 1;
+    border-radius: 8px;
+    background: active ? Theme.active : ta.has-hover ? Theme.hover : transparent;
+    Text { text: root.text; color: root.active ? Theme.text : Theme.muted; font-weight: 700; }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component LoginDialog inherits Overlay {
+    in property <string> error;
+    in property <bool> busy;
+    in property <bool> agent;
+    in-out property <bool> register;
+    // server, user, password, tags, proxy, is-ai, register, token
+    callback login(string, string, string, string, string, bool, bool, string);
+    property <bool> mismatch: root.register && pw2.text != "" && pw.text != pw2.text;
+    function go() {
+        if root.register && pw.text != pw2.text { return; }
+        root.login(hs.text, user.text, pw.text, tags.text, proxy.text, root.agent, root.register, token.text);
+    }
+    Text { text: root.agent ? "Add an AI account" : "Add an account"; font-size: 18px; font-weight: 800; color: Theme.text; }
+    HorizontalLayout {
+        spacing: 4px;
+        Tab { text: "Sign in"; active: !root.register; clicked => { root.register = false; } }
+        Tab { text: "Create account"; active: root.register; clicked => { root.register = true; } }
+    }
+    if root.agent: Text {
+        text: root.register ? "Create the Matrix account the AI will use. You'll set up its model next." : "Sign in to the Matrix account the AI will use. You'll set up its model next.";
+        wrap: word-wrap; color: Theme.muted; font-size: 12px;
+    }
+    hs := Input { placeholder: "Server, e.g. anoncat.org"; }
+    user := Input { placeholder: root.register ? "Pick a username" : "Username"; }
+    pw := Input { placeholder: root.register ? "Pick a password" : "Password"; password: true; accepted => { root.go(); } }
+    pw2 := Input { visible: root.register; height: root.register ? 38px : 0; placeholder: "Repeat password"; password: true; accepted => { root.go(); } }
+    token := Input { visible: root.register; height: root.register ? 38px : 0; placeholder: "Registration token (if you have one)"; }
+    tags := Input { placeholder: "Tags (optional), e.g. alt, work"; }
+    proxy := Input { placeholder: "Proxy (optional), e.g. socks5h://127.0.0.1:9050"; }
+    if root.mismatch: Text { text: "The passwords don't match."; color: Theme.danger; }
+    if root.error != "": Text { text: root.error; color: Theme.danger; wrap: char-wrap; }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Btn { text: "Cancel"; clicked => { root.dismiss(); } }
+        Btn {
+            text: root.busy ? (root.register ? "Creating…" : "Signing in…") : (root.register ? "Create account" : "Sign in");
+            primary: true;
+            enabled: !root.busy && !root.mismatch;
+            clicked => { root.go(); }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Whisker";
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    min-width: 320px;
+    min-height: 480px;
+    background: Theme.bg;
+    default-font-size: 14px;
+
+    // 0 = unlock, 1 = main, 2 = settings
+    in-out property <int> screen: 0;
+    // 0 = dark (default), 1 = light, 2 = follow system
+    in-out property <int> theme: 0;
+    in-out property <int> auto-lock: 0;
+    in property <bool> first-run;
+    in-out property <string> error;
+    in-out property <bool> busy;
+    in-out property <string> status;
+
+    in property <[AccountItem]> accounts;
+    in property <[string]> tags;
+    in property <[RoomItem]> rooms;
+    in property <[MessageItem]> messages;
+    in-out property <string> tag-filter;
+    in-out property <string> current-account;
+    in-out property <string> current-room;
+    in property <string> current-room-name;
+    in property <string> current-room-topic;
+    in property <string> current-account-name;
+    in property <string> current-account-user;
+    in property <bool> loading-rooms;
+    in property <bool> loading-history;
+    // The open room is an invitation: show Accept / Decline instead of chat.
+    in property <bool> current-invite;
+    in property <string> invite-from;
+    in property <bool> has-older;
+    in property <bool> can-moderate;
+
+    // Composer
+    in-out property <string> draft;
+    in-out property <string> reply-to;
+    in property <string> reply-label;
+    in-out property <string> editing;
+    in-out property <bool> stick-bottom: true;
+
+    // Overlays
+    in-out property <string> select-text;
+    in-out property <image> viewer-image;
+    in-out property <bool> viewer-open;
+    in-out property <bool> profile-open;
+    in-out property <bool> room-info-open;
+    property <bool> panel-open: root.profile-open || root.room-info-open;
+    in-out property <string> confirm-mod;
+    // Verification
+    in-out property <bool> verify-open;
+    in property <string> verify-state;
+    in property <string> verify-name;
+    in property <bool> verify-self;
+    in property <string> verify-message;
+    in property <[EmojiItem]> verify-emojis;
+    callback verify-action(string);
+    in property <RoomDetails> room-details;
+    in property <[MemberItem]> members;
+    in property <[PinnedItem]> pinned;
+    in property <bool> members-loading;
+    in-out property <string> room-info-status;
+    in-out property <bool> create-open;
+    in-out property <bool> create-public: false;
+    in-out property <bool> create-encrypted: true;
+    in-out property <bool> info-editing;
+    in-out property <string> create-error;
+    in property <bool> profile-loading;
+    in-out property <Profile> profile;
+
+    // Settings
+    in property <[NavItem]> nav;
+    in-out property <string> nav-selected;
+    in property <AccountForm> account-form;
+    in property <AgentForm> agent-form;
+    in property <[string]> models;
+    in-out property <string> settings-message;
+    in-out property <string> detect-status;
+    in-out property <string> test-status;
+    in property <string> encryption-summary;
+
+    in-out property <bool> exploring;
+    in property <[PublicItem]> public-rooms;
+    in property <bool> explore-busy;
+    in property <bool> explore-has-more;
+    in property <string> explore-status;
+    in-out property <bool> show-login;
+    in-out property <bool> login-agent;
+    in-out property <string> login-error;
+    in-out property <string> room-search;
+
+    // On phones one pane shows at a time: 1 rooms, 2 chat.
+    in-out property <int> pane: 1;
+    property <bool> narrow: root.width < 760px;
+
+    callback unlock(string);
+    callback unlock-more(string);
+    callback create-hidden(string);
+    callback lock();
+    callback filter-tag(string);
+    callback select-account(string);
+    callback select-room(string);
+    callback search-rooms(string);
+    callback send(string);
+    callback attach();
+    callback load-older();
+    callback message-action(string, string);
+    callback open-link(string);
+    callback login(string, string, string, string, string, bool, bool, string);
+    callback account-menu(string, string);
+    callback room-menu(string, string);
+    callback explore-search(string, string);
+    callback explore-more();
+    callback explore-join(string);
+    callback open-settings(string);
+    callback set-theme(int);
+    callback set-auto-lock(int);
+    callback save-account(AccountForm);
+    callback recover(string);
+    callback logout(string);
+    callback detect-api(string, string);
+    callback save-agent(AgentForm);
+    callback test-agent(AgentForm);
+    callback remove-agent();
+    callback change-passphrase(string, string);
+    callback activity();
+    callback profile-action(string, string);
+    callback profile-requested(string);
+    callback profile-edit(string, string, string);
+    callback open-room-info();
+    callback room-invite(string);
+    callback room-edit(string, string);
+    callback create-room(string, string, bool, string, bool, string);
+
+    // Opens a profile card at once with what we already know; Rust fills in the rest.
+    public function show-profile(user: string, name: string, initial: string, hue: int, avatar: image) {
+        root.profile = { user-id: user, name: name, initial: initial, hue: hue, avatar: avatar, verified: -1 };
+        root.confirm-mod = "";
+        root.pane = 2;
+        root.profile-open = true;
+        root.profile-requested(user);
+    }
+    callback set-rich-text(bool);
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme == 0 ? ColorScheme.dark : root.theme == 1 ? ColorScheme.light : ColorScheme.unknown;
+        Theme.dark = root.theme == 0 || (root.theme == 2 && Palette.color-scheme == ColorScheme.dark);
+    }
+    init => { root.apply-theme(); }
+    changed theme => { root.apply-theme(); }
+
+    // Copies to the system clipboard through a hidden text field.
+    clip := TextInput { width: 0; height: 0; opacity: 0; read-only: true; }
+    public function copy-text(t: string) {
+        clip.text = t;
+        clip.select-all();
+        clip.copy();
+        root.status = "Copied";
+    }
+
+    function do-send() {
+        if root.draft != "" {
+            root.activity();
+            root.send(root.draft);
+            root.draft = "";
+            root.stick-bottom = true;
+        }
+    }
+
+    if root.screen == 0: UnlockScreen {
+        first-run: root.first-run;
+        error: root.error;
+        busy: root.busy;
+        submit(p) => { root.unlock(p); }
+    }
+
+    if root.screen == 1: HorizontalLayout {
+        // Account rail
+        Rectangle {
+            width: 64px;
+            background: Theme.rail;
+            VerticalLayout {
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 2px;
+                Flickable {
+                    vertical-stretch: 1;
+                    content-height: rail-list.preferred-height;
+                    rail-list := VerticalLayout {
+                        spacing: 2px;
+                        for a in root.accounts: RailAccount {
+                            item: a;
+                            selected: a.id == root.current-account;
+                            clicked => { root.activity(); root.select-account(a.id); root.pane = 1; }
+                            menu(action) => {
+                                if action == "copy" { root.copy-text(a.user-id); } else { root.account-menu(action, a.id); }
+                            }
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            padding-top: 4px;
+                            IconBtn { icon: "+"; size: 42px; clicked => { root.activity(); root.login-error = ""; root.login-agent = false; root.show-login = true; } }
+                        }
+                    }
+                }
+                if root.tags.length > 0: HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 52px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: root.tag-filter == "" ? Theme.raised : Theme.accent-soft;
+                        Text { text: root.tag-filter == "" ? "all" : root.tag-filter; font-size: 11px; color: Theme.text; overflow: elide; width: 46px; horizontal-alignment: center; }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.filter-tag(root.tag-filter); } }
+                    }
+                }
+                HorizontalLayout { alignment: center; IconBtn { icon: "⚙"; clicked => { root.activity(); root.open-settings(""); } } }
+                HorizontalLayout { alignment: center; IconBtn { padlock: true; clicked => { root.lock(); } } }
+            }
+        }
+
+        // Rooms
+        if !root.narrow || root.pane == 1: Rectangle {
+            width: root.narrow ? root.width - 64px : 290px;
+            background: Theme.panel;
+            VerticalLayout {
+                Rectangle {
+                    height: 60px;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 8px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text { text: root.current-account-name == "" ? "No account" : root.current-account-name; font-size: 16px; font-weight: 800; color: Theme.text; overflow: elide; }
+                            if root.current-account-user != "": Text { text: root.current-account-user; font-size: 11px; color: Theme.muted; overflow: elide; }
+                        }
+                        if root.current-account != "": VerticalLayout {
+                            alignment: center;
+                            IconBtn { icon: "+"; clicked => { root.activity(); root.create-error = ""; root.create-open = true; } }
+                        }
+                        if root.current-account != "": VerticalLayout {
+                            alignment: center;
+                            IconBtn {
+                                icon: "#";
+                                active: root.exploring;
+                                clicked => {
+                                    root.activity();
+                                    root.exploring = true;
+                                    root.pane = 2;
+                                    if root.public-rooms.length == 0 { root.explore-search("", ""); }
+                                }
+                            }
+                        }
+                        if root.current-account != "": VerticalLayout {
+                            alignment: center;
+                            IconBtn { icon: "⋯"; clicked => { root.activity(); root.open-settings("account:" + root.current-account); } }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-bottom: 8px;
+                    Input { placeholder: "Search rooms"; text <=> root.room-search; edited(t) => { root.search-rooms(t); } }
+                }
+                if root.loading-rooms && root.rooms.length == 0: Text { text: "Syncing rooms…"; color: Theme.muted; horizontal-alignment: center; font-size: 12px; }
+                if !root.loading-rooms && root.current-account != "" && root.rooms.length == 0: Text {
+                    text: root.room-search == "" ? "No rooms yet" : "No rooms match"; color: Theme.muted; horizontal-alignment: center; font-size: 12px;
+                }
+                if root.current-account == "": VerticalLayout {
+                    alignment: center;
+                    vertical-stretch: 1;
+                    padding: 20px;
+                    spacing: 12px;
+                    Text { text: "No accounts yet"; color: Theme.text; font-weight: 700; horizontal-alignment: center; }
+                    Btn { text: "Add an account"; primary: true; clicked => { root.login-error = ""; root.login-agent = false; root.show-login = true; } }
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for r in root.rooms: HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        RoomRow {
+                            item: r;
+                            selected: r.id == root.current-room && !root.exploring;
+                            clicked => { root.activity(); root.exploring = false; root.select-room(r.id); root.pane = 2; root.stick-bottom = true; }
+                            menu(action) => { root.activity(); root.room-menu(action, r.id); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Chat
+        if (!root.narrow || root.pane == 2) && root.exploring: Rectangle {
+            horizontal-stretch: 1;
+            background: Theme.bg;
+            VerticalLayout {
+                Rectangle {
+                    height: 60px;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+                        if root.narrow: VerticalLayout { alignment: center; IconBtn { icon: "‹"; clicked => { root.pane = 1; } } }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text { text: "Public rooms"; font-size: 16px; font-weight: 800; color: Theme.text; }
+                            Text { text: "Browse rooms anyone can join, on your server or another one."; font-size: 12px; color: Theme.muted; overflow: elide; }
+                        }
+                        VerticalLayout { alignment: center; IconBtn { icon: "✕"; clicked => { root.exploring = false; } } }
+                    }
+                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                }
+                HorizontalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    q := Input {
+                        placeholder: "Search rooms";
+                        accepted => { root.explore-search(srv.text, q.text); }
+                    }
+                    srv := Input {
+                        max-width: 220px;
+                        horizontal-stretch: 0.5;
+                        placeholder: "Server (yours)";
+                        accepted => { root.explore-search(srv.text, q.text); }
+                    }
+                    Btn { text: "Search"; primary: true; height: 38px; clicked => { root.explore-search(srv.text, q.text); } }
+                }
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-bottom: 8px;
+                    spacing: 8px;
+                    addr := Input { placeholder: "Or join by address, e.g. #room:matrix.org"; accepted => { root.explore-join(addr.text); } }
+                    Btn { text: "Join"; height: 38px; enabled: addr.text != ""; clicked => { root.explore-join(addr.text); } }
+                    Btn { text: "Create a room"; height: 38px; clicked => { root.create-error = ""; root.create-open = true; } }
+                }
+                if root.explore-status != "": HorizontalLayout {
+                    padding-left: 16px;
+                    padding-bottom: 6px;
+                    Text { text: root.explore-status; color: Theme.muted; font-size: 12px; wrap: char-wrap; }
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for p in root.public-rooms: Rectangle {
+                        height: 76px;
+                        background: pta.has-hover ? Theme.hover : transparent;
+                        pta := TouchArea {}
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+                            VerticalLayout { alignment: center; Avatar { initial: p.initial; hue: p.hue; image: p.avatar; size: 44px; } }
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                spacing: 2px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: p.name; font-weight: 700; color: Theme.text; overflow: elide; horizontal-stretch: 1; }
+                                    Text { text: p.members; font-size: 11px; color: Theme.muted; }
+                                }
+                                if p.alias != "": Text { text: p.alias; font-size: 11px; color: Theme.muted; overflow: elide; }
+                                Text { text: p.topic; font-size: 12px; color: Theme.muted; overflow: elide; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Btn {
+                                    text: p.joined ? "Open" : "Join";
+                                    primary: !p.joined;
+                                    enabled: !root.explore-busy;
+                                    clicked => { root.explore-join(p.id); }
+                                }
+                            }
+                        }
+                    }
+                }
+                if root.explore-has-more: HorizontalLayout {
+                    padding: 10px;
+                    alignment: center;
+                    Btn { text: root.explore-busy ? "Loading…" : "Load more"; enabled: !root.explore-busy; clicked => { root.explore-more(); } }
+                }
+            }
+        }
+
+        if (!root.narrow || root.pane == 2) && !root.exploring && !(root.narrow && root.panel-open): Rectangle {
+            horizontal-stretch: 1;
+            background: Theme.bg;
+            VerticalLayout {
+                Rectangle {
+                    height: 60px;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+                        if root.narrow: VerticalLayout { alignment: center; IconBtn { icon: "‹"; clicked => { root.pane = 1; } } }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text { text: root.current-room-name; font-size: 16px; font-weight: 800; color: Theme.text; overflow: elide; }
+                            if root.current-room-topic != "": Text { text: root.current-room-topic; font-size: 12px; color: Theme.muted; overflow: elide; }
+                            TouchArea { mouse-cursor: pointer; clicked => { if root.current-room != "" { root.open-room-info(); } } }
+                        }
+                        if root.current-room != "": VerticalLayout {
+                            alignment: center;
+                            IconBtn { icon: "i"; clicked => { root.activity(); root.open-room-info(); } }
+                        }
+                    }
+                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                }
+                if root.current-room != "" && root.current-invite: VerticalLayout {
+                    vertical-stretch: 1;
+                    alignment: center;
+                    spacing: 14px;
+                    padding: 24px;
+                    Text { text: root.current-room-name; font-size: 20px; font-weight: 800; color: Theme.text; horizontal-alignment: center; wrap: char-wrap; }
+                    Text {
+                        text: root.invite-from != "" ? root.invite-from + " invited you to this room." : "You've been invited to this room.";
+                        color: Theme.muted; horizontal-alignment: center; wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 10px;
+                        Btn { text: "Accept"; primary: true; clicked => { root.activity(); root.room-menu("accept", root.current-room); } }
+                        Btn { text: "Decline"; clicked => { root.activity(); root.room-menu("leave", root.current-room); } }
+                    }
+                }
+                if root.current-room != "" && !root.current-invite: Rectangle {
+                    vertical-stretch: 1;
+                    if root.loading-history && root.messages.length == 0: Text { text: "Loading messages…"; color: Theme.muted; }
+                    if !root.loading-history && root.messages.length == 0: Text { text: "No messages yet. Say hi!"; color: Theme.muted; }
+                    // A plain scroll area (not ListView): ListView sizes rows before
+                    // they wrap, so long messages overlapped the next ones.
+                    msgs := ScrollView {
+                        content-width: self.visible-width;
+                        content-height: col.preferred-height;
+                        // Keep the newest message in view unless the user scrolled up.
+                        changed content-height => {
+                            if root.stick-bottom { self.content-y = min(0px, self.visible-height - self.content-height); }
+                        }
+                        changed visible-height => {
+                            if root.stick-bottom { self.content-y = min(0px, self.visible-height - self.content-height); }
+                        }
+                        scrolled => {
+                            root.stick-bottom = self.content-y <= self.visible-height - self.content-height + 40px;
+                        }
+                        col := VerticalLayout {
+                            width: msgs.visible-width;
+                            padding-bottom: 8px;
+                            for m in root.messages: MessageRow {
+                                item: m;
+                                can-moderate: root.can-moderate;
+                                room-id: root.current-room;
+                                action(a, id) => {
+                                    root.activity();
+                                    if a == "profile" {
+                                        root.show-profile(m.sender, m.name, m.initial, m.hue, m.avatar);
+                                    } else {
+                                        root.message-action(a, id);
+                                    }
+                                }
+                                copy(t) => { root.copy-text(t); }
+                                link(l) => { root.open-link(l); }
+                            }
+                        }
+                    }
+                    if root.has-older && msgs.content-y > -30px && !root.loading-history: Rectangle {
+                        y: 8px;
+                        height: 30px;
+                        width: older.preferred-width + 24px;
+                        border-radius: 15px;
+                        background: Theme.raised;
+                        drop-shadow-blur: 8px;
+                        drop-shadow-color: #00000060;
+                        older := Text { text: "Load older messages"; font-size: 12px; color: Theme.text; }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.stick-bottom = false; root.load-older(); } }
+                    }
+                    if !root.stick-bottom: Rectangle {
+                        x: parent.width - 52px;
+                        y: parent.height - 52px;
+                        width: 38px;
+                        height: 38px;
+                        border-radius: 19px;
+                        background: Theme.raised;
+                        drop-shadow-blur: 8px;
+                        drop-shadow-color: #00000060;
+                        Text { text: "↓"; font-size: 18px; color: Theme.text; }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.stick-bottom = true; msgs.content-y = min(0px, msgs.visible-height - msgs.content-height); }
+                        }
+                    }
+                }
+                if root.current-room == "": VerticalLayout {
+                    vertical-stretch: 1;
+                    alignment: center;
+                    Text { text: "Pick a room"; horizontal-alignment: center; color: Theme.muted; }
+                }
+
+                // Reply / edit bar
+                if root.reply-to != "" || root.editing != "": HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 12px;
+                    padding-top: 6px;
+                    spacing: 8px;
+                    Rectangle { width: 3px; border-radius: 2px; background: Theme.accent; }
+                    Text {
+                        text: root.editing != "" ? "Editing your message" : "Replying to " + root.reply-label;
+                        color: Theme.muted; font-size: 12px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center;
+                    }
+                    IconBtn { icon: "✕"; size: 24px; clicked => { root.reply-to = ""; if root.editing != "" { root.editing = ""; root.draft = ""; } } }
+                }
+
+                // Composer
+                HorizontalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    alignment: stretch;
+                    VerticalLayout {
+                        alignment: end;
+                        IconBtn { icon: "+"; size: 38px; clicked => { root.activity(); root.attach(); } }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: min(160px, max(40px, compose.preferred-height + 20px));
+                        border-radius: 12px;
+                        background: Theme.raised;
+                        border-width: compose.has-focus ? 1px : 0px;
+                        border-color: Theme.accent;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            compose := TextInput {
+                                text <=> root.draft;
+                                single-line: false;
+                                wrap: word-wrap;
+                                color: Theme.text;
+                                font-size: 14px;
+                                enabled: root.current-room != "";
+                                selection-background-color: Theme.accent-soft;
+                                key-pressed(e) => {
+                                    if e.text == Key.Return && !e.modifiers.shift {
+                                        root.do-send();
+                                        return accept;
+                                    }
+                                    if e.text == Key.Escape {
+                                        root.reply-to = "";
+                                        if root.editing != "" { root.editing = ""; root.draft = ""; }
+                                        return accept;
+                                    }
+                                    return reject;
+                                }
+                            }
+                        }
+                        if root.draft == "": Text {
+                            x: 14px;
+                            y: 10px;
+                            text: root.current-room == "" ? "" : "Message " + root.current-room-name + "   (Shift+Enter for a new line)";
+                            color: Theme.muted;
+                            font-size: 14px;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Btn { text: root.editing != "" ? "Save" : "Send"; primary: true; height: 40px; enabled: root.current-room != "" && root.draft != ""; clicked => { root.do-send(); } }
+                    }
+                }
+                if root.status != "": HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 14px;
+                    padding-bottom: 8px;
+                    Text { text: root.status; font-size: 11px; color: Theme.muted; wrap: char-wrap; }
+                }
+            }
+        }
+
+        // Side panel: a person's profile, or the room's details (Element-style).
+        if root.panel-open && (!root.narrow || root.pane == 2): Rectangle {
+            width: root.narrow ? root.width - 64px : 340px;
+            background: Theme.panel;
+            Rectangle { x: 0; width: 1px; background: Theme.border; }
+            VerticalLayout {
+                Rectangle {
+                    height: 60px;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 4px;
+                        if root.profile-open && root.room-info-open: VerticalLayout {
+                            alignment: center;
+                            IconBtn { icon: "‹"; clicked => { root.profile-open = false; } }
+                        }
+                        Text {
+                            text: root.profile-open ? "Profile" : "Room info";
+                            font-size: 16px; font-weight: 800; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            IconBtn { icon: "✕"; clicked => { root.profile-open = false; root.room-info-open = false; root.info-editing = false; } }
+                        }
+                    }
+                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                }
+                sv := ScrollView {
+                    vertical-stretch: 1;
+                    content-width: self.visible-width;
+                    content-height: panel-col.preferred-height;
+                    panel-col := VerticalLayout {
+                        width: sv.visible-width;
+                        alignment: start;
+                        padding: 16px;
+                        spacing: 10px;
+
+                        // ---- a person ----
+                        if root.profile-open: VerticalLayout {
+                            alignment: start;
+                            spacing: 10px;
+                            HorizontalLayout { alignment: center; Avatar { initial: root.profile.initial; hue: root.profile.hue; image: root.profile.avatar; size: 112px; } }
+                            Text { text: root.profile.name; font-size: 20px; font-weight: 800; color: Theme.text; horizontal-alignment: center; wrap: char-wrap; }
+                            TextInput {
+                                text: root.profile.user-id;
+                                read-only: true; horizontal-alignment: center; font-size: 13px; color: Theme.muted; vertical-stretch: 0;
+                                selection-background-color: Theme.accent.transparentize(0.55);
+                            }
+                            HorizontalLayout {
+                                alignment: center;
+                                spacing: 6px;
+                                if root.profile.role != "": Pill { text: root.profile.role; }
+                                if root.profile.verified == 2: Rectangle {
+                                    height: 18px; width: vt.preferred-width + 12px; border-radius: 9px; background: Theme.ok.transparentize(0.75);
+                                    vt := Text { text: "✓ Verified"; font-size: 10px; font-weight: 700; color: Theme.ok; }
+                                }
+                                if root.profile.verified == 1: Rectangle {
+                                    height: 18px; width: nt.preferred-width + 12px; border-radius: 9px; background: Theme.raised;
+                                    nt := Text { text: "Not verified"; font-size: 10px; font-weight: 700; color: Theme.muted; }
+                                }
+                            }
+                            if root.profile-loading: Text { text: "Loading…"; color: Theme.muted; horizontal-alignment: center; font-size: 12px; }
+                            Rectangle { height: 4px; }
+                            if !root.profile.is-me: Btn {
+                                text: root.profile.has-dm ? "Message" : "Start a chat";
+                                primary: true;
+                                clicked => { root.profile-action("message", root.profile.user-id); }
+                            }
+                            if root.profile.verified == 1: Btn {
+                                text: root.profile.is-me ? "Verify this session" : "Verify";
+                                clicked => { root.profile-action("verify", root.profile.user-id); }
+                            }
+                            if root.profile.verified == 0 && !root.profile.is-me: Text {
+                                text: "This user hasn't set up encryption keys, so they can't be verified yet.";
+                                font-size: 11px; color: Theme.muted; wrap: word-wrap; horizontal-alignment: center;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Btn { text: "Mention"; horizontal-stretch: 1; clicked => { root.profile-action("mention", root.profile.user-id); } }
+                                Btn { text: "Copy address"; horizontal-stretch: 1; clicked => { root.copy-text(root.profile.user-id); } }
+                            }
+                            if !root.profile.is-me && (root.profile.can-kick || root.profile.can-ban): VerticalLayout {
+                                alignment: start;
+                                spacing: 6px;
+                                Text { text: "MODERATION"; font-size: 10px; font-weight: 800; color: Theme.muted; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    if root.profile.can-kick: Btn {
+                                        text: root.confirm-mod == "kick" ? "Really kick?" : "Kick";
+                                        danger: true;
+                                        horizontal-stretch: 1;
+                                        clicked => { if root.confirm-mod == "kick" { root.confirm-mod = ""; root.profile-action("kick", root.profile.user-id); } else { root.confirm-mod = "kick"; } }
+                                    }
+                                    if root.profile.can-ban: Btn {
+                                        text: root.confirm-mod == "ban" ? "Really ban?" : "Ban";
+                                        danger: true;
+                                        horizontal-stretch: 1;
+                                        clicked => { if root.confirm-mod == "ban" { root.confirm-mod = ""; root.profile-action("ban", root.profile.user-id); } else { root.confirm-mod = "ban"; } }
+                                    }
+                                }
+                            }
+                            if !root.profile.is-me: Text {
+                                text: "Ignore this user";
+                                font-size: 11px; color: Theme.muted; horizontal-alignment: center;
+                                TouchArea { mouse-cursor: pointer; clicked => { root.profile-action("ignore", root.profile.user-id); } }
+                            }
+                        }
+
+                        // ---- the room ----
+                        if !root.profile-open && root.room-info-open: VerticalLayout {
+                            alignment: start;
+                            spacing: 10px;
+                            HorizontalLayout { alignment: center; Avatar { initial: root.room-details.initial; hue: root.room-details.hue; image: root.room-details.avatar; size: 96px; } }
+                            Text { text: root.room-details.name; font-size: 20px; font-weight: 800; color: Theme.text; horizontal-alignment: center; wrap: char-wrap; }
+                            if root.room-details.alias != "": TextInput {
+                                text: root.room-details.alias; read-only: true; horizontal-alignment: center; font-size: 12px; color: Theme.muted; vertical-stretch: 0;
+                                selection-background-color: Theme.accent.transparentize(0.55);
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: center;
+                                if root.room-details.encrypted: Pill { text: "Encrypted"; }
+                                Pill { text: root.room-details.join-rule; }
+                                Pill { text: root.room-details.members; }
+                            }
+                            if !root.info-editing: VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "DESCRIPTION"; font-size: 10px; font-weight: 800; color: Theme.muted; }
+                                TextInput {
+                                    text: root.room-details.topic == "" ? "No description." : root.room-details.topic;
+                                    read-only: true; single-line: false; wrap: word-wrap; color: Theme.text;
+                                    selection-background-color: Theme.accent.transparentize(0.55);
+                                }
+                            }
+                            if root.room-details.history != "" && !root.info-editing: Text { text: root.room-details.history; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+                            if root.pinned.length > 0 && !root.info-editing: VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "PINNED (RULES USUALLY LIVE HERE)"; font-size: 10px; font-weight: 800; color: Theme.muted; }
+                                for p in root.pinned: Rectangle {
+                                    background: Theme.raised;
+                                    border-radius: 8px;
+                                    VerticalLayout {
+                                        padding: 8px;
+                                        Text { text: p.who; font-size: 11px; font-weight: 700; color: Theme.muted; }
+                                        TextInput { text: p.text; read-only: true; single-line: false; wrap: word-wrap; color: Theme.text; selection-background-color: Theme.accent.transparentize(0.55); }
+                                    }
+                                }
+                            }
+                            if root.info-editing: VerticalLayout {
+                                spacing: 6px;
+                                ename := Input { text: root.room-details.name; placeholder: "Room name"; }
+                                etopic := TextEdit { text: root.room-details.topic; height: 110px; wrap: word-wrap; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: end;
+                                    Btn { text: "Cancel"; clicked => { root.info-editing = false; } }
+                                    Btn { text: "Save"; primary: true; clicked => { root.room-edit(ename.text, etopic.text); root.info-editing = false; } }
+                                }
+                            }
+                            if root.room-details.can-edit && !root.info-editing: Btn { text: "Edit name and description"; clicked => { root.info-editing = true; } }
+                            if root.room-details.can-invite: VerticalLayout {
+                                spacing: 6px;
+                                Text { text: "INVITE"; font-size: 10px; font-weight: 800; color: Theme.muted; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    inv := Input { placeholder: "@name:server, @other:server"; accepted => { root.room-invite(inv.text); inv.text = ""; } }
+                                    Btn { text: "Invite"; primary: true; height: 38px; enabled: inv.text != ""; clicked => { root.room-invite(inv.text); inv.text = ""; } }
+                                }
+                            }
+                            if root.room-info-status != "": Text { text: root.room-info-status; font-size: 12px; color: Theme.muted; wrap: char-wrap; }
+                            Text { text: "MEMBERS"; font-size: 10px; font-weight: 800; color: Theme.muted; }
+                            if root.members-loading: Text { text: "Loading members…"; font-size: 12px; color: Theme.muted; }
+                            for mem in root.members: Rectangle {
+                                height: 44px;
+                                border-radius: 8px;
+                                background: mta.has-hover ? Theme.hover : transparent;
+                                mta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.show-profile(mem.user-id, mem.name, mem.initial, mem.hue, mem.avatar); }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 6px;
+                                    padding-right: 6px;
+                                    spacing: 10px;
+                                    VerticalLayout { alignment: center; Avatar { initial: mem.initial; hue: mem.hue; image: mem.avatar; size: 32px; } }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 1;
+                                        Text { text: mem.name; color: Theme.text; font-weight: 600; overflow: elide; }
+                                        Text { text: mem.user-id; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                    }
+                                    if mem.role != "": VerticalLayout { alignment: center; Pill { text: mem.role; } }
+                                }
+                            }
+                            Rectangle { height: 6px; }
+                            Btn { text: "Leave room"; danger: true; clicked => { root.room-menu("leave", root.room-details.id); root.room-info-open = false; } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.screen == 2: SettingsPage {
+        narrow: root.narrow;
+        theme <=> root.theme;
+        auto-lock <=> root.auto-lock;
+        nav: root.nav;
+        selected <=> root.nav-selected;
+        account: root.account-form;
+        agent: root.agent-form;
+        models: root.models;
+        message <=> root.settings-message;
+        detect-status <=> root.detect-status;
+        test-status <=> root.test-status;
+        encryption-summary: root.encryption-summary;
+        close => { root.settings-message = ""; root.screen = 1; }
+        navigate(id) => { root.activity(); root.open-settings(id); }
+        set-theme(t) => { root.set-theme(t); }
+        set-auto-lock(i) => { root.set-auto-lock(i); }
+        set-rich-text(b) => { root.set-rich-text(b); }
+        save-account(f) => { root.activity(); root.save-account(f); }
+        profile-edit(a, id, v) => { root.activity(); root.profile-edit(a, id, v); }
+        recover(k) => { root.activity(); root.recover(k); }
+        logout(id) => { root.logout(id); }
+        new-ai => { root.login-error = ""; root.login-agent = true; root.show-login = true; }
+        detect-api(u, k) => { root.activity(); root.detect-api(u, k); }
+        save-agent(f) => { root.activity(); root.save-agent(f); }
+        test-agent(f) => { root.activity(); root.test-agent(f); }
+        remove-agent => { root.remove-agent(); }
+        change-passphrase(o, n) => { root.activity(); root.change-passphrase(o, n); }
+        unlock-hidden(p) => { root.unlock-more(p); }
+        create-hidden(p) => { root.create-hidden(p); }
+    }
+
+    if root.show-login: LoginDialog {
+        error: root.login-error;
+        busy: root.busy;
+        agent: root.login-agent;
+        login(hs, u, p, t, px, ag, reg, tok) => { root.login(hs, u, p, t, px, ag, reg, tok); }
+        dismiss => { root.show-login = false; }
+    }
+
+    if root.select-text != "": Overlay {
+        card-width: 640px;
+        dismiss => { root.select-text = ""; }
+        Text { text: "Select text"; font-size: 16px; font-weight: 800; color: Theme.text; }
+        TextEdit { text: root.select-text; read-only: true; height: min(400px, root.height - 200px); wrap: word-wrap; }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Btn { text: "Copy all"; clicked => { root.copy-text(root.select-text); } }
+            Btn { text: "Close"; primary: true; clicked => { root.select-text = ""; } }
+        }
+    }
+
+    if root.viewer-open: Rectangle {
+        background: #000000e0;
+        TouchArea { clicked => { root.viewer-open = false; } }
+        if root.viewer-image.width == 0: Text { text: "Loading…"; color: white; }
+        Image {
+            source: root.viewer-image;
+            width: parent.width - 40px;
+            height: parent.height - 40px;
+            image-fit: contain;
+        }
+        Text { x: parent.width - 40px; y: 12px; text: "✕"; color: white; font-size: 22px; }
+    }
+
+    if root.create-open: Overlay {
+        card-width: 420px;
+        dismiss => { root.create-open = false; }
+        Text { text: "Create a room"; font-size: 18px; font-weight: 800; color: Theme.text; }
+        cname := Input { placeholder: "Room name"; }
+        ctopic := Input { placeholder: "Description (optional)"; }
+        HorizontalLayout {
+            spacing: 4px;
+            Tab { text: "Private (invite only)"; active: !root.create-public; clicked => { root.create-public = false; root.create-encrypted = true; } }
+            Tab { text: "Public"; active: root.create-public; clicked => { root.create-public = true; root.create-encrypted = false; } }
+        }
+        if root.create-public: Text {
+            text: "Anyone can find and join it, and it's listed in your server's room directory.";
+            font-size: 11px; color: Theme.muted; wrap: word-wrap;
+        }
+        calias := Input { visible: root.create-public; height: root.create-public ? 38px : 0; placeholder: "Address, e.g. cats → #cats:yourserver"; }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "End-to-end encrypted"; color: Theme.text; }
+                Text { text: "Can't be turned off later. Usually off for big public rooms."; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+            }
+            Switch { checked <=> root.create-encrypted; }
+        }
+        cinvite := Input { placeholder: "Invite (optional): @friend:server, @other:server"; }
+        if root.create-error != "": Text { text: root.create-error; color: Theme.danger; wrap: char-wrap; }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Btn { text: "Cancel"; clicked => { root.create-open = false; } }
+            Btn {
+                text: root.busy ? "Creating…" : "Create";
+                primary: true;
+                enabled: cname.text != "" && !root.busy;
+                clicked => { root.create-room(cname.text, ctopic.text, root.create-public, calias.text, root.create-encrypted, cinvite.text); }
+            }
+        }
+    }
+
+    if root.verify-open: Overlay {
+        card-width: 460px;
+        dismiss => { }
+        Text {
+            text: root.verify-self ? "Verify this session" : "Verify " + root.verify-name;
+            font-size: 18px; font-weight: 800; color: Theme.text; wrap: word-wrap;
+        }
+        if root.verify-state == "incoming": VerticalLayout {
+            spacing: 10px;
+            Text {
+                text: root.verify-self
+                    ? "One of your other sessions wants to verify this one. Accept only if you started this yourself."
+                    : root.verify-name + " wants to verify you. Accept only if you expected it.";
+                wrap: word-wrap; color: Theme.muted;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                Btn { text: "Decline"; clicked => { root.verify-action("cancel"); } }
+                Btn { text: "Accept"; primary: true; clicked => { root.verify-action("accept"); } }
+            }
+        }
+        if root.verify-state == "waiting": VerticalLayout {
+            spacing: 10px;
+            Text {
+                text: root.verify-self ? "Accept the request on one of your other sessions (e.g. Element)…" : "Waiting for " + root.verify-name + " to accept…";
+                wrap: word-wrap; color: Theme.muted;
+            }
+            HorizontalLayout { alignment: end; Btn { text: "Cancel"; clicked => { root.verify-action("cancel"); } } }
+        }
+        if root.verify-state == "emojis": VerticalLayout {
+            spacing: 12px;
+            Text { text: "Check that the other screen shows the same pictures, in the same order:"; wrap: word-wrap; color: Theme.muted; }
+            HorizontalLayout {
+                alignment: center;
+                spacing: 4px;
+                for e in root.verify-emojis: Rectangle {
+                    width: 58px;
+                    height: 74px;
+                    border-radius: 8px;
+                    background: Theme.raised;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        Text { text: e.symbol; font-size: 26px; horizontal-alignment: center; }
+                        Text { text: e.name; font-size: 10px; font-weight: 700; color: Theme.text; horizontal-alignment: center; wrap: word-wrap; }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                Btn { text: "They don't match"; danger: true; clicked => { root.verify-action("mismatch"); } }
+                Btn { text: "They match"; primary: true; clicked => { root.verify-action("match"); } }
+            }
+        }
+        if root.verify-state == "confirmed": VerticalLayout {
+            spacing: 10px;
+            Text { text: "Waiting for the other side to confirm…"; color: Theme.muted; }
+            HorizontalLayout { alignment: end; Btn { text: "Cancel"; clicked => { root.verify-action("cancel"); } } }
+        }
+        if root.verify-state == "done": VerticalLayout {
+            spacing: 10px;
+            Text { text: "✓ Verified"; font-size: 18px; font-weight: 800; color: Theme.ok; }
+            Text { text: root.verify-self ? "This session is now trusted by your other sessions." : root.verify-name + " is verified. You'll be warned if their keys ever change."; wrap: word-wrap; color: Theme.muted; }
+            HorizontalLayout { alignment: end; Btn { text: "Done"; primary: true; clicked => { root.verify-action("close"); } } }
+        }
+        if root.verify-state == "cancelled": VerticalLayout {
+            spacing: 10px;
+            Text { text: "Verification stopped" + (root.verify-message == "" ? "." : ": " + root.verify-message); wrap: word-wrap; color: Theme.danger; }
+            HorizontalLayout { alignment: end; Btn { text: "Close"; clicked => { root.verify-action("close"); } } }
+        }
+    }
+}

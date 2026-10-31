@@ -1,0 +1,559 @@
+import { ComboBox, SpinBox, Switch, TextEdit, ScrollView } from "std-widgets.slint";
+import { Theme, Prefs, Avatar, Btn, IconBtn, Input } from "theme.slint";
+
+// One entry in the settings sidebar. `id` is "general", "account:<id>" or "ai:<id>".
+export struct NavItem {
+    id: string,
+    title: string,
+    subtitle: string,
+    section: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+    robot: bool,
+}
+
+export struct AccountForm {
+    id: string,
+    user-id: string,
+    display-name: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+    is-agent: bool,
+    label: string,
+    tags: string,
+    proxy: string,
+}
+
+export struct AgentForm {
+    account: string,
+    exists: bool,
+    enabled: bool,
+    name: string,
+    url: string,
+    api-key-set: bool,
+    api-key: string,
+    model: string,
+    service: string,
+    max-tokens: int,
+    extra-json: string,
+    // 0 mention, 1 every message, 2 DMs only
+    trigger: int,
+    system-prompt: string,
+    rooms: string,
+    history: int,
+    cooldown: int,
+    max-steps: int,
+    g-reply: bool,
+    g-redact: bool,
+    g-kick: bool,
+    g-ban: bool,
+    g-unban: bool,
+    g-invite: bool,
+    g-power: bool,
+    commanders: string,
+    min-level: int,
+    autonomous: bool,
+    max-grant: int,
+    protected: string,
+    audit-room: string,
+}
+
+component Card inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    background: Theme.panel;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.border;
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+        Text { text: root.title; font-size: 15px; font-weight: 800; color: Theme.text; }
+        if root.subtitle != "": Text { text: root.subtitle; wrap: word-wrap; color: Theme.muted; font-size: 12px; }
+        @children
+    }
+}
+
+component Field inherits VerticalLayout {
+    in property <string> label;
+    in property <string> hint;
+    spacing: 4px;
+    Text { text: root.label; font-size: 12px; font-weight: 600; color: Theme.muted; }
+    @children
+    if root.hint != "": Text { text: root.hint; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+}
+
+component Toggle inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> hint;
+    in-out property <bool> checked;
+    spacing: 8px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: center;
+        Text { text: root.text; wrap: word-wrap; color: Theme.text; }
+        if root.hint != "": Text { text: root.hint; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+    }
+    Switch { checked <=> root.checked; }
+}
+
+component Number inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> hint;
+    in property <int> minimum: 0;
+    in property <int> maximum: 100;
+    in-out property <int> value;
+    spacing: 8px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: center;
+        Text { text: root.text; wrap: word-wrap; color: Theme.text; }
+        if root.hint != "": Text { text: root.hint; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+    }
+    SpinBox { width: 130px; value <=> root.value; minimum: root.minimum; maximum: root.maximum; }
+}
+
+component NavRow inherits Rectangle {
+    in property <NavItem> item;
+    in property <bool> selected;
+    callback clicked;
+    height: item.section == "" ? 40px : 48px;
+    border-radius: 8px;
+    background: selected ? Theme.active : ta.has-hover ? Theme.hover : transparent;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 10px;
+        if root.item.section != "": VerticalLayout {
+            alignment: center;
+            Avatar { initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; robot: root.item.robot && root.item.avatar.width == 0; size: 30px; }
+        }
+        VerticalLayout {
+            alignment: center;
+            Text { text: root.item.title; color: Theme.text; font-weight: 600; overflow: elide; }
+            if root.item.subtitle != "": Text { text: root.item.subtitle; color: Theme.muted; font-size: 11px; overflow: elide; }
+        }
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component GeneralPage inherits VerticalLayout {
+    in-out property <int> theme;
+    callback set-rich-text(bool);
+    in-out property <int> auto-lock;
+    in property <string> encryption-summary;
+    callback set-theme(int);
+    callback set-auto-lock(int);
+    callback change-passphrase(string, string);
+    callback unlock-hidden(string);
+    callback create-hidden(string);
+    spacing: 14px;
+
+    Card {
+        title: "Appearance";
+        Field {
+            label: "Theme";
+            ComboBox {
+                model: ["Dark", "Light", "Follow system"];
+                current-index <=> root.theme;
+                selected => { root.set-theme(self.current-index); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Rich message text"; color: Theme.text; }
+                Text {
+                    text: "Shows bold, italic and clickable links. Rich text can't be selected with the mouse; leave this off to drag-select and copy parts of messages.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.rich-text;
+                toggled => { root.set-rich-text(self.checked); }
+            }
+        }
+    }
+    Card {
+        title: "Security";
+        subtitle: "Locking stops every account and AI and forgets the vault keys until you unlock again.";
+        Field {
+            label: "Lock automatically when idle";
+            ComboBox {
+                model: ["Never", "After 5 minutes", "After 15 minutes", "After 1 hour"];
+                current-index <=> root.auto-lock;
+                selected => { root.set-auto-lock(self.current-index); }
+            }
+        }
+        Field {
+            label: "Change passphrase";
+            hint: "Changes the vault that holds the selected account.";
+            old-pass := Input { password: true; placeholder: "Current passphrase"; }
+            new-pass := Input { password: true; placeholder: "New passphrase (8+ characters)"; }
+            new-pass2 := Input { password: true; placeholder: "Repeat new passphrase"; }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Change passphrase";
+                enabled: old-pass.text != "" && new-pass.text != "" && new-pass.text == new-pass2.text;
+                clicked => { root.change-passphrase(old-pass.text, new-pass.text); old-pass.text = ""; new-pass.text = ""; new-pass2.text = ""; }
+            }
+        }
+    }
+    Card {
+        title: "Hidden vaults";
+        subtitle: "Accounts in a hidden vault only appear after you enter its own passphrase, and disappear when you lock. Nothing in your main vault mentions them.";
+        hidden-pass := Input { password: true; placeholder: "Hidden vault passphrase"; }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Btn { text: "Unlock"; enabled: hidden-pass.text != ""; clicked => { root.unlock-hidden(hidden-pass.text); hidden-pass.text = ""; } }
+            Btn { text: "Create new"; enabled: hidden-pass.text != ""; clicked => { root.create-hidden(hidden-pass.text); hidden-pass.text = ""; } }
+        }
+    }
+    Card {
+        title: "Privacy & encryption";
+        Text { text: root.encryption-summary; wrap: word-wrap; font-size: 12px; color: Theme.text; }
+    }
+}
+
+component AccountPage inherits VerticalLayout {
+    in property <AccountForm> account;
+    callback save-account(AccountForm);
+    callback profile-edit(string, string, string);
+    property <string> f-display: account.display-name;
+    callback recover(string);
+    callback logout(string);
+    property <string> f-label: account.label;
+    property <string> f-tags: account.tags;
+    property <string> f-proxy: account.proxy;
+    spacing: 14px;
+
+    Card {
+        title: "Your profile";
+        subtitle: "What everyone in your rooms sees.";
+        HorizontalLayout {
+            spacing: 14px;
+            Avatar { initial: root.account.initial; hue: root.account.hue; image: root.account.avatar; size: 72px; }
+            VerticalLayout {
+                alignment: center;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Btn { text: "Change picture"; clicked => { root.profile-edit("avatar", root.account.id, ""); } }
+                    if root.account.avatar.width > 0: Btn { text: "Remove"; clicked => { root.profile-edit("remove-avatar", root.account.id, ""); } }
+                }
+            }
+        }
+        Field { label: "Display name"; Input { text <=> root.f-display; placeholder: root.account.user-id; } }
+        HorizontalLayout {
+            alignment: start;
+            Btn { text: "Save display name"; primary: true; clicked => { root.profile-edit("name", root.account.id, root.f-display); } }
+        }
+    }
+    Card {
+        title: "On this device";
+        subtitle: root.account.user-id;
+        Field { label: "Nickname"; hint: "Only shown on this device."; Input { text <=> root.f-label; placeholder: "Same as server name"; } }
+        Field { label: "Tags"; hint: "Comma separated. Used to filter the account rail."; Input { text <=> root.f-tags; placeholder: "e.g. main, alt, work"; } }
+        Field { label: "Proxy"; hint: "Applies the next time you unlock. Give alts different proxies so a server can't link them by IP."; Input { text <=> root.f-proxy; placeholder: "None, e.g. socks5h://127.0.0.1:9050"; } }
+        HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Save";
+                primary: true;
+                clicked => {
+                    root.save-account({ id: root.account.id, user-id: root.account.user-id, display-name: root.account.display-name,
+                        is-agent: root.account.is-agent, label: root.f-label, tags: root.f-tags, proxy: root.f-proxy });
+                }
+            }
+        }
+    }
+    Card {
+        title: "Verify this session";
+        subtitle: "Confirms this Whisker login is really you, using one of your other sessions (e.g. Element). People then stop seeing it as an unverified device, and it can receive your encryption keys.";
+        HorizontalLayout { alignment: start; Btn { text: "Verify with another session"; clicked => { root.profile-edit("verify-self", root.account.id, ""); } } }
+    }
+    Card {
+        title: "Read older encrypted messages";
+        subtitle: "A new login has no keys for messages sent before it. Enter the recovery key (or security phrase) from another client to restore them from your server-side key backup.";
+        key := Input { password: true; placeholder: "Recovery key"; }
+        HorizontalLayout { alignment: start; Btn { text: "Restore keys"; enabled: key.text != ""; clicked => { root.recover(key.text); key.text = ""; } } }
+    }
+    Card {
+        title: "Log out";
+        subtitle: "Signs this device out on the server and deletes its local data.";
+        HorizontalLayout { alignment: start; Btn { text: "Log out of " + root.account.user-id; danger: true; clicked => { root.logout(root.account.id); } } }
+    }
+}
+
+component AgentPage inherits VerticalLayout {
+    in property <AgentForm> agent;
+    in property <[string]> models;
+    in property <string> detect-status;
+    in property <string> test-status;
+    callback detect-api(string, string);
+    callback save-agent(AgentForm);
+    callback test-agent(AgentForm);
+    callback remove-agent();
+
+    property <bool> a-enabled: agent.enabled;
+    property <string> a-url: agent.url;
+    property <string> a-key;
+    property <string> a-model: agent.model;
+    property <int> a-max-tokens: agent.max-tokens;
+    property <string> a-extra: agent.extra-json;
+    property <int> a-trigger: agent.trigger;
+    property <string> a-prompt: agent.system-prompt;
+    property <string> a-rooms: agent.rooms;
+    property <int> a-history: agent.history;
+    property <int> a-cooldown: agent.cooldown;
+    property <int> a-steps: agent.max-steps;
+    property <bool> a-reply: agent.g-reply;
+    property <bool> a-redact: agent.g-redact;
+    property <bool> a-kick: agent.g-kick;
+    property <bool> a-ban: agent.g-ban;
+    property <bool> a-unban: agent.g-unban;
+    property <bool> a-invite: agent.g-invite;
+    property <bool> a-power: agent.g-power;
+    property <string> a-commanders: agent.commanders;
+    property <int> a-min-level: agent.min-level;
+    property <bool> a-autonomous: agent.autonomous;
+    property <int> a-max-grant: agent.max-grant;
+    property <string> a-protected: agent.protected;
+    property <string> a-audit: agent.audit-room;
+
+    function form() -> AgentForm {
+        return {
+            account: root.agent.account, exists: root.agent.exists, enabled: root.a-enabled, name: root.agent.name,
+            url: root.a-url, api-key-set: root.agent.api-key-set, api-key: root.a-key, model: root.a-model,
+            service: root.agent.service, max-tokens: root.a-max-tokens, extra-json: root.a-extra,
+            trigger: root.a-trigger, system-prompt: root.a-prompt, rooms: root.a-rooms, history: root.a-history,
+            cooldown: root.a-cooldown, max-steps: root.a-steps,
+            g-reply: root.a-reply, g-redact: root.a-redact, g-kick: root.a-kick, g-ban: root.a-ban,
+            g-unban: root.a-unban, g-invite: root.a-invite, g-power: root.a-power,
+            commanders: root.a-commanders, min-level: root.a-min-level, autonomous: root.a-autonomous,
+            max-grant: root.a-max-grant, protected: root.a-protected, audit-room: root.a-audit,
+        };
+    }
+
+    spacing: 14px;
+
+    Card {
+        title: root.agent.name;
+        subtitle: root.agent.exists ? "Changes take effect when you save; the AI restarts with them." : "This AI account has no model yet. Connect one below and save.";
+        Toggle { text: "Running"; hint: "Turn off to keep the account logged in but silent."; checked <=> root.a-enabled; }
+    }
+
+    Card {
+        title: "AI API";
+        subtitle: "Paste the address of any AI API: OpenAI-style (OpenRouter, Groq, Mistral, DeepSeek, Gemini, LM Studio, llama.cpp, vLLM…), Anthropic-style, or Ollama. Whisker works out which kind it is.";
+        Field { label: "API address"; Input { text <=> root.a-url; placeholder: "e.g. openrouter.ai/api   or   localhost:11434"; } }
+        Field {
+            label: "API key";
+            hint: root.agent.api-key-set ? "A key is saved. Leave empty to keep it." : "Leave empty for local servers that don't need one.";
+            Input { text <=> root.a-key; password: true; placeholder: root.agent.api-key-set ? "••••••••  (saved)" : "Key"; }
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            alignment: start;
+            Btn { text: "Connect"; enabled: root.a-url != ""; clicked => { root.detect-api(root.a-url, root.a-key); } }
+            Text { text: root.detect-status; color: Theme.muted; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
+        }
+        if root.models.length > 0: Field {
+            label: "Model";
+            ComboBox {
+                model: root.models;
+                selected(v) => { root.a-model = v; }
+            }
+        }
+        Field {
+            label: root.models.length > 0 ? "Model name (picked above, or type one)" : "Model name";
+            Input { text <=> root.a-model; placeholder: "e.g. meta-llama/llama-3.3-70b-instruct"; }
+        }
+        Number { text: "Longest reply (tokens)"; minimum: 64; maximum: 32000; value <=> root.a-max-tokens; }
+        Field {
+            label: "Extra request settings (JSON, optional)";
+            hint: "Merged into every request, for whatever this API supports, e.g. {\"temperature\": 0.7}";
+            TextEdit { text <=> root.a-extra; height: 60px; font-size: 12px; }
+        }
+    }
+
+    Card {
+        title: "Behaviour";
+        Field { label: "Personality and instructions"; TextEdit { text <=> root.a-prompt; height: 100px; wrap: word-wrap; } }
+        Field {
+            label: "When it answers";
+            ComboBox { model: ["When mentioned, and in DMs", "Reads every message", "Only in DMs"]; current-index <=> root.a-trigger; }
+        }
+        Field { label: "Only in these rooms"; hint: "Room ids, comma separated. Empty means every room it's in."; Input { text <=> root.a-rooms; placeholder: "All rooms"; } }
+        Number { text: "Messages of context"; hint: "Recent messages it sees (kept in memory only)."; minimum: 1; maximum: 200; value <=> root.a-history; }
+        Number { text: "Seconds between replies"; hint: "Per room, to stop it flooding."; minimum: 0; maximum: 3600; value <=> root.a-cooldown; }
+        Number { text: "Actions per message"; hint: "How many tool steps it may take before answering."; minimum: 1; maximum: 20; value <=> root.a-steps; }
+    }
+
+    Card {
+        title: "Permissions";
+        subtitle: "Moderation actions are only offered to the AI when a commander asks, unless autonomous mode is on. It can never act against your own accounts.";
+        Toggle { text: "Post replies"; checked <=> root.a-reply; }
+        Toggle { text: "Delete messages"; checked <=> root.a-redact; }
+        Toggle { text: "Kick"; checked <=> root.a-kick; }
+        Toggle { text: "Ban"; checked <=> root.a-ban; }
+        Toggle { text: "Unban"; checked <=> root.a-unban; }
+        Toggle { text: "Invite"; checked <=> root.a-invite; }
+        Toggle { text: "Change power levels"; checked <=> root.a-power; }
+        if root.a-power: Number { text: "Highest level it may give"; value <=> root.a-max-grant; }
+    }
+
+    Card {
+        title: "Who can give it orders";
+        Number { text: "Room members at or above power level"; value <=> root.a-min-level; }
+        Field { label: "Plus these users"; Input { text <=> root.a-commanders; placeholder: "e.g. @you:anoncat.org"; } }
+        Toggle { text: "Autonomous moderation"; hint: "Lets it use its permissions on its own judgement, e.g. against spam."; checked <=> root.a-autonomous; }
+        Field { label: "Never act against"; Input { text <=> root.a-protected; placeholder: "e.g. @friend:anoncat.org"; } }
+        Field { label: "Audit room"; hint: "Every moderation action is posted here."; Input { text <=> root.a-audit; placeholder: "None, e.g. !abc:anoncat.org"; } }
+    }
+
+    if root.test-status != "": Rectangle {
+        background: Theme.raised;
+        border-radius: 10px;
+        HorizontalLayout { padding: 12px; Text { text: root.test-status; wrap: word-wrap; color: Theme.text; } }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        Btn { text: root.agent.exists ? "Save" : "Save and start"; primary: true; clicked => { root.save-agent(root.form()); root.a-key = ""; } }
+        Btn { text: "Test"; clicked => { root.test-agent(root.form()); } }
+        if root.agent.exists: Btn { text: "Remove AI setup"; danger: true; clicked => { root.remove-agent(); } }
+    }
+}
+
+export component SettingsPage inherits Rectangle {
+    in property <bool> narrow;
+    in-out property <int> theme;
+    in-out property <int> auto-lock;
+    in property <[NavItem]> nav;
+    in-out property <string> selected;
+    in property <AccountForm> account;
+    in property <AgentForm> agent;
+    in property <[string]> models;
+    in-out property <string> message;
+    in-out property <string> detect-status;
+    in-out property <string> test-status;
+    in property <string> encryption-summary;
+
+    callback close();
+    callback navigate(string);
+    callback set-theme(int);
+    callback set-auto-lock(int);
+    callback set-rich-text(bool);
+    callback save-account(AccountForm);
+    callback profile-edit(string, string, string);
+    callback recover(string);
+    callback logout(string);
+    callback new-ai();
+    callback detect-api(string, string);
+    callback save-agent(AgentForm);
+    callback test-agent(AgentForm);
+    callback remove-agent();
+    callback change-passphrase(string, string);
+    callback unlock-hidden(string);
+    callback create-hidden(string);
+
+    // On phones the sidebar and the page take turns.
+    property <bool> show-nav: !narrow || selected == "";
+    property <bool> show-page: !narrow || selected != "";
+
+    background: Theme.bg;
+
+    HorizontalLayout {
+        if root.show-nav: Rectangle {
+            width: root.narrow ? root.width : 250px;
+            background: Theme.panel;
+            VerticalLayout {
+                padding: 10px;
+                spacing: 2px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    height: 44px;
+                    IconBtn { icon: "‹"; clicked => { root.close(); } }
+                    Text { text: "Settings"; font-size: 18px; font-weight: 800; vertical-alignment: center; color: Theme.text; }
+                }
+                for n[i] in root.nav: VerticalLayout {
+                    if i == 0 || root.nav[i - 1].section != n.section: Text {
+                        text: n.section == "" ? "" : n.section;
+                        height: n.section == "" ? 0px : 28px;
+                        vertical-alignment: bottom;
+                        font-size: 10px; font-weight: 800; color: Theme.muted; letter-spacing: 1px;
+                    }
+                    NavRow { item: n; selected: n.id == root.selected; clicked => { root.navigate(n.id); } }
+                }
+                Rectangle { height: 6px; }
+                Btn { text: "+ Add an AI"; clicked => { root.new-ai(); } }
+                Rectangle { vertical-stretch: 1; }
+            }
+        }
+        if root.show-nav && root.show-page: Rectangle { width: 1px; background: Theme.border; }
+        if root.show-page: VerticalLayout {
+            horizontal-stretch: 1;
+            if root.narrow: HorizontalLayout {
+                padding: 8px;
+                IconBtn { icon: "‹"; clicked => { root.selected = ""; } }
+            }
+            if root.message != "": Rectangle {
+                background: Theme.accent-soft;
+                HorizontalLayout {
+                    padding: 10px;
+                    padding-left: 16px;
+                    Text { text: root.message; color: Theme.text; wrap: word-wrap; horizontal-stretch: 1; }
+                    IconBtn { icon: "✕"; size: 24px; clicked => { root.message = ""; } }
+                }
+            }
+            ScrollView {
+                vertical-stretch: 1;
+                HorizontalLayout {
+                    alignment: center;
+                    VerticalLayout {
+                        width: min(640px, root.width - (root.narrow ? 24px : 290px));
+                        padding-top: 18px;
+                        padding-bottom: 40px;
+                        if root.selected == "general" || root.selected == "": GeneralPage {
+                            theme <=> root.theme;
+                            auto-lock <=> root.auto-lock;
+                            encryption-summary: root.encryption-summary;
+                            set-theme(t) => { root.set-theme(t); }
+                            set-auto-lock(i) => { root.set-auto-lock(i); }
+                            set-rich-text(b) => { root.set-rich-text(b); }
+                            change-passphrase(o, n) => { root.change-passphrase(o, n); }
+                            unlock-hidden(p) => { root.unlock-hidden(p); }
+                            create-hidden(p) => { root.create-hidden(p); }
+                        }
+                        if root.selected != "" && root.account.id != "" && root.selected == "account:" + root.account.id: AccountPage {
+                            account: root.account;
+                            save-account(f) => { root.save-account(f); }
+                            profile-edit(a, id, v) => { root.profile-edit(a, id, v); }
+                            recover(k) => { root.recover(k); }
+                            logout(id) => { root.logout(id); }
+                        }
+                        if root.selected != "" && root.agent.account != "" && root.selected == "ai:" + root.agent.account: AgentPage {
+                            agent: root.agent;
+                            models: root.models;
+                            detect-status: root.detect-status;
+                            test-status: root.test-status;
+                            detect-api(u, k) => { root.detect-api(u, k); }
+                            save-agent(f) => { root.save-agent(f); }
+                            test-agent(f) => { root.test-agent(f); }
+                            remove-agent => { root.remove-agent(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

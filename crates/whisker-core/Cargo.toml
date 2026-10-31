@@ -1,0 +1,28 @@
+[package]
+name = "whisker-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+mime_guess = "2.0.5"
+matrix-sdk.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+matrix-sdk = { workspace = true, features = ["testing"] }
+matrix-sdk-test = "0.19.1"
+wiremock = "0.6.5"
+serde_json.workspace = true

@@ -1,0 +1,217 @@
+//! Converts between an AI's settings page and its `AgentConfig`.
+
+use crate::AgentForm;
+use anyhow::{Context, Result, bail};
+use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
+use slint::SharedString;
+use std::collections::BTreeSet;
+use whisker_agent::config::default_prompt;
+use whisker_agent::{AgentConfig, ApiConfig, Detected, Permission, Trigger};
+use whisker_core::AccountId;
+
+fn join<T: AsRef<str>>(items: impl IntoIterator<Item = T>) -> SharedString {
+    items.into_iter().map(|i| i.as_ref().to_owned()).collect::<Vec<_>>().join(", ").into()
+}
+
+fn list(s: &str) -> impl Iterator<Item = &str> {
+    s.split([',', '\n']).map(str::trim).filter(|x| !x.is_empty())
+}
+
+fn users(s: &str) -> Result<BTreeSet<OwnedUserId>> {
+    list(s).map(|u| u.try_into().with_context(|| format!("“{u}” isn't a user id like @name:server"))).collect()
+}
+
+fn rooms(s: &str) -> Result<BTreeSet<OwnedRoomId>> {
+    list(s).map(|r| r.try_into().with_context(|| format!("“{r}” isn't a room id like !abc:server"))).collect()
+}
+
+/// The form for `account`'s AI, from its saved config (or defaults).
+pub fn to_form(account: AccountId, name: &str, cfg: Option<&AgentConfig>) -> AgentForm {
+    let Some(c) = cfg else {
+        return AgentForm {
+            account: account.to_string().into(),
+            name: name.into(),
+            exists: false,
+            enabled: true,
+            max_tokens: 1024,
+            g_reply: true,
+            min_level: 50,
+            history: 30,
+            cooldown: 2,
+            max_steps: 6,
+            system_prompt: default_prompt().into(),
+            ..Default::default()
+        };
+    };
+    let g = &c.permissions.global;
+    let has = |p| g.contains(&p);
+    AgentForm {
+        account: account.to_string().into(),
+        name: name.into(),
+        exists: true,
+        enabled: c.enabled,
+        url: c.api.url.as_str().into(),
+        api_key_set: c.api.api_key.as_ref().is_some_and(|k| !k.is_empty()),
+        api_key: "".into(),
+        model: c.api.model.as_str().into(),
+        service: c.api.service.as_str().into(),
+        max_tokens: c.max_tokens.min(i32::MAX as u32) as i32,
+        extra_json: if c.extra_params.is_empty() {
+            "".into()
+        } else {
+            serde_json::to_string_pretty(&c.extra_params).unwrap_or_default().into()
+        },
+        trigger: match c.trigger {
+            Trigger::Mention => 0,
+            Trigger::Every => 1,
+            Trigger::DirectOnly => 2,
+        },
+        system_prompt: c.system_prompt.as_str().into(),
+        rooms: join(c.rooms.iter().map(|r| r.as_str())),
+        history: c.history.min(200) as i32,
+        cooldown: c.cooldown_secs.min(3600) as i32,
+        max_steps: c.max_steps.min(20) as i32,
+        g_reply: has(Permission::Reply),
+        g_redact: has(Permission::Redact),
+        g_kick: has(Permission::Kick),
+        g_ban: has(Permission::Ban),
+        g_unban: has(Permission::Unban),
+        g_invite: has(Permission::Invite),
+        g_power: has(Permission::SetPowerLevel),
+        commanders: join(c.permissions.commanders.users.iter().map(|u| u.as_str())),
+        min_level: c.permissions.commanders.min_power_level.clamp(0, 100) as i32,
+        autonomous: c.permissions.autonomous,
+        max_grant: c.permissions.max_grant_level.clamp(0, 100) as i32,
+        protected: join(c.permissions.protected.iter().map(|u| u.as_str())),
+        audit_room: c.audit_room.as_ref().map(|r| r.as_str().into()).unwrap_or_default(),
+    }
+}
+
+/// Builds a config from the form. `old` supplies the saved API key when the
+/// key field is empty; `detected` is the result of the last "Connect".
+pub fn from_form(account: AccountId, f: &AgentForm, old: Option<&AgentConfig>, detected: Option<&Detected>) -> Result<AgentConfig> {
+    let url = f.url.trim().to_owned();
+    if url.is_empty() {
+        bail!("enter the AI API's address");
+    }
+    let model = f.model.trim().to_owned();
+    if model.is_empty() {
+        bail!("pick or type a model name");
+    }
+    let new_key = f.api_key.trim().to_owned();
+    let key = if new_key.is_empty() { old.and_then(|o| o.api.api_key.clone()) } else { Some(new_key) };
+
+    // Keep what we know about the API unless the address changed.
+    let mut api = match old {
+        Some(o) if o.api.url == url => o.api.clone(),
+        _ => ApiConfig { url: url.clone(), ..Default::default() },
+    };
+    api.url = url;
+    api.api_key = key;
+    api.model = model;
+    if let Some(d) = detected {
+        api.format = d.format;
+        api.endpoint = d.endpoint.clone();
+        api.service = d.service.clone();
+    }
+
+    let extra = f.extra_json.trim();
+    let extra_params = if extra.is_empty() {
+        Default::default()
+    } else {
+        match serde_json::from_str::<serde_json::Value>(extra).context("extra request settings must be JSON")? {
+            serde_json::Value::Object(m) => m,
+            _ => bail!("extra request settings must be a JSON object like {{\"temperature\": 0.7}}"),
+        }
+    };
+
+    let mut cfg = match old {
+        Some(o) => o.clone(),
+        None => AgentConfig::new(account, api.clone()),
+    };
+    cfg.account = account;
+    cfg.api = api;
+    cfg.enabled = f.enabled;
+    cfg.max_tokens = f.max_tokens.max(16) as u32;
+    cfg.extra_params = extra_params;
+    cfg.trigger = match f.trigger {
+        1 => Trigger::Every,
+        2 => Trigger::DirectOnly,
+        _ => Trigger::Mention,
+    };
+    cfg.system_prompt = if f.system_prompt.trim().is_empty() { default_prompt() } else { f.system_prompt.to_string() };
+    cfg.rooms = rooms(&f.rooms)?;
+    cfg.history = f.history.max(1) as usize;
+    cfg.cooldown_secs = f.cooldown.max(0) as u64;
+    cfg.max_steps = f.max_steps.max(1) as usize;
+
+    let p = &mut cfg.permissions;
+    p.global = [
+        (f.g_reply, Permission::Reply),
+        (f.g_redact, Permission::Redact),
+        (f.g_kick, Permission::Kick),
+        (f.g_ban, Permission::Ban),
+        (f.g_unban, Permission::Unban),
+        (f.g_invite, Permission::Invite),
+        (f.g_power, Permission::SetPowerLevel),
+    ]
+    .into_iter()
+    .filter_map(|(on, perm)| on.then_some(perm))
+    .collect();
+    p.commanders.users = users(&f.commanders)?;
+    p.commanders.min_power_level = f.min_level.into();
+    p.autonomous = f.autonomous;
+    p.max_grant_level = f.max_grant.into();
+    p.protected = users(&f.protected)?;
+    let audit = f.audit_room.trim();
+    cfg.audit_room = if audit.is_empty() {
+        None
+    } else {
+        Some(audit.try_into().with_context(|| format!("“{audit}” isn't a room id"))?)
+    };
+    Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_keeps_saved_key() {
+        let id = AccountId::new();
+        let mut f = to_form(id, "bot", None);
+        f.url = "openrouter.ai/api".into();
+        f.api_key = "sk-test".into();
+        f.model = "some/model".into();
+        f.g_ban = true;
+        f.extra_json = r#"{"temperature": 0.5}"#.into();
+        f.commanders = "@me:anoncat.org".into();
+        let cfg = from_form(id, &f, None, None).unwrap();
+        assert!(cfg.permissions.global.contains(&Permission::Ban));
+        assert_eq!(cfg.extra_params["temperature"], 0.5);
+
+        // Saving again with an empty key field keeps the stored key.
+        let mut f2 = to_form(id, "bot", Some(&cfg));
+        assert!(f2.api_key_set);
+        f2.g_ban = false;
+        let cfg2 = from_form(id, &f2, Some(&cfg), None).unwrap();
+        assert_eq!(cfg2.api.api_key.as_deref(), Some("sk-test"));
+        assert!(!cfg2.permissions.global.contains(&Permission::Ban));
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        let id = AccountId::new();
+        let mut f = to_form(id, "bot", None);
+        assert!(from_form(id, &f, None, None).is_err(), "no url");
+        f.url = "localhost:11434".into();
+        assert!(from_form(id, &f, None, None).is_err(), "no model");
+        f.model = "llama3".into();
+        assert!(from_form(id, &f, None, None).is_ok(), "local servers need no key");
+        f.commanders = "not a user".into();
+        assert!(from_form(id, &f, None, None).is_err());
+        f.commanders = "".into();
+        f.extra_json = "[1]".into();
+        assert!(from_form(id, &f, None, None).is_err());
+    }
+}

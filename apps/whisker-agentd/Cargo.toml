@@ -1,0 +1,17 @@
+[package]
+name = "whisker-agentd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+whisker-core.workspace = true
+whisker-agent.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+directories.workspace = true
+rpassword.workspace = true
+serde_json.workspace = true

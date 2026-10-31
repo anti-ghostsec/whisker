@@ -434,6 +434,138 @@ pub const ALL: &[(&str, &str)] = &[
     ("🏁", "chequered flag finish"),
 ];
 
+/// Common shortcode names (as Slack, GitHub and Element use them) where
+/// they differ from the first search word in [`ALL`].
+const ALIASES: &[(&str, &str)] = &[
+    ("smile", "😄"), ("smiley", "😃"), ("grinning", "😀"), ("grin", "😁"), ("laughing", "😆"), ("satisfied", "😆"),
+    ("joy", "😂"), ("rofl", "🤣"), ("wink", "😉"), ("blush", "😊"), ("innocent", "😇"), ("heart_eyes", "😍"),
+    ("kissing_heart", "😘"), ("yum", "😋"), ("stuck_out_tongue", "😛"), ("thinking", "🤔"), ("neutral_face", "😐"),
+    ("smirk", "😏"), ("unamused", "😒"), ("roll_eyes", "🙄"), ("relieved", "😌"), ("pensive", "😔"), ("sleepy", "😪"),
+    ("sleeping", "😴"), ("mask", "😷"), ("sunglasses", "😎"), ("nerd", "🤓"), ("confused", "😕"), ("worried", "😟"),
+    ("open_mouth", "😮"), ("astonished", "😲"), ("flushed", "😳"), ("pleading", "🥺"), ("fearful", "😨"),
+    ("cry", "😢"), ("sob", "😭"), ("scream", "😱"), ("disappointed", "😞"), ("sweat_smile", "😅"), ("sweat", "😓"),
+    ("weary", "😩"), ("tired_face", "😫"), ("yawning", "🥱"), ("triumph", "😤"), ("rage", "😡"), ("angry", "😠"),
+    ("upside_down", "🙃"), ("slightly_smiling_face", "🙂"), ("hugs", "🤗"), ("shushing", "🤫"), ("zany", "🤪"),
+    ("partying", "🥳"), ("exploding_head", "🤯"), ("skull", "💀"), ("poop", "💩"), ("hankey", "💩"), ("clown", "🤡"),
+    ("ghost", "👻"), ("robot", "🤖"), ("heart", "❤️"), ("broken_heart", "💔"), ("two_hearts", "💕"), ("sparkling_heart", "💖"),
+    ("100", "💯"), ("boom", "💥"), ("sparkles", "✨"), ("star", "⭐"), ("star2", "🌟"), ("fire", "🔥"), ("zap", "⚡"),
+    ("white_check_mark", "✅"), ("heavy_check_mark", "✔️"), ("check", "✅"), ("x", "❌"), ("warning", "⚠️"),
+    ("question", "❓"), ("exclamation", "❗"), ("+1", "👍"), ("thumbsup", "👍"), ("-1", "👎"), ("thumbsdown", "👎"),
+    ("ok_hand", "👌"), ("v", "✌️"), ("crossed_fingers", "🤞"), ("metal", "🤘"), ("call_me", "🤙"), ("wave", "👋"),
+    ("clap", "👏"), ("raised_hands", "🙌"), ("handshake", "🤝"), ("pray", "🙏"), ("muscle", "💪"), ("eyes", "👀"),
+    ("brain", "🧠"), ("shrug", "🤷"), ("facepalm", "🤦"), ("salute", "🫡"), ("cat", "🐱"), ("dog", "🐶"), ("fox", "🦊"),
+    ("crab", "🦀"), ("tada", "🎉"), ("confetti_ball", "🎊"), ("balloon", "🎈"), ("gift", "🎁"), ("trophy", "🏆"),
+    ("rocket", "🚀"), ("coffee", "☕"), ("beer", "🍺"), ("beers", "🍻"), ("pizza", "🍕"), ("cake", "🎂"),
+    ("lock", "🔒"), ("unlock", "🔓"), ("key", "🔑"), ("bulb", "💡"), ("bell", "🔔"), ("pushpin", "📌"), ("memo", "📝"),
+    ("eggplant", "🍆"), ("peach", "🍑"), ("see_no_evil", "🙈"), ("hear_no_evil", "🙉"), ("speak_no_evil", "🙊"),
+];
+
+/// The emoji for a shortcode name like `smile` or `thumbsup` (without colons).
+pub fn shortcode(name: &str) -> Option<&'static str> {
+    let name = name.to_lowercase();
+    if let Some((_, e)) = ALIASES.iter().find(|(n, _)| *n == name) {
+        return Some(e);
+    }
+    let words = name.replace(['_', '-'], " ");
+    // The emoji whose first word is the name, else any whose words are.
+    ALL.iter()
+        .find(|(_, k)| k.split(' ').next() == Some(words.as_str()))
+        .or_else(|| ALL.iter().find(|(_, k)| k.contains(words.as_str()) && k.split(' ').any(|w| w == words)))
+        .map(|(e, _)| *e)
+}
+
+/// The name shown for an emoji in suggestions (`:smile:`).
+pub fn name_of(emoji: &str) -> &'static str {
+    ALIASES
+        .iter()
+        .find(|(_, e)| *e == emoji)
+        .map(|(n, _)| *n)
+        .or_else(|| ALL.iter().find(|(e, _)| *e == emoji).and_then(|(_, k)| k.split(' ').next()))
+        .unwrap_or_default()
+}
+
+/// Emoji for a half-typed shortcode: the exact name first, then names
+/// starting with it, then other search matches.
+pub fn suggest(q: &str) -> Vec<&'static str> {
+    let q = q.to_lowercase();
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut add = |e: &'static str| {
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    };
+    if let Some(e) = shortcode(&q) {
+        add(e);
+    }
+    for (n, e) in ALIASES {
+        if n.starts_with(q.as_str()) {
+            add(e);
+        }
+    }
+    for e in search(&q.replace(['_', '-'], " ")) {
+        add(e);
+    }
+    out
+}
+
+/// Replaces `:name:` shortcodes in `text` with their emoji (unknown names
+/// stay as typed; code isn't touched).
+pub fn replace_shortcodes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    for (n, line) in text.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            out.push_str(line);
+            continue;
+        }
+        if in_code {
+            out.push_str(line);
+            continue;
+        }
+        let mut rest = line;
+        while let Some(a) = rest.find(':') {
+            let after = &rest[a + 1..];
+            let name_len = after.find(|c: char| !(c.is_alphanumeric() || "_+-".contains(c))).unwrap_or(after.len());
+            let emoji = (name_len > 0 && after[name_len..].starts_with(':')).then(|| shortcode(&after[..name_len])).flatten();
+            match emoji {
+                Some(e) => {
+                    out.push_str(&rest[..a]);
+                    out.push_str(e);
+                    rest = &after[name_len + 1..];
+                }
+                None => {
+                    out.push_str(&rest[..a + 1]);
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+    }
+    out
+}
+
+/// Also turns a whole word `:name` (no closing colon) into its emoji, for
+/// names that match exactly. Used when sending.
+pub fn replace_open_shortcodes(text: &str) -> String {
+    let text = replace_shortcodes(text);
+    let mut out = String::with_capacity(text.len());
+    for (i, word) in text.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let name = word.strip_prefix(':').filter(|n| n.chars().count() >= 2 && n.chars().all(|c| c.is_alphanumeric() || "_+-".contains(c)));
+        match name.and_then(shortcode) {
+            Some(e) => out.push_str(e),
+            None => out.push_str(word),
+        }
+    }
+    out
+}
+
 /// Emoji whose words contain every word of `query` (all of them for an empty query).
 pub fn search(query: &str) -> Vec<&'static str> {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
@@ -454,6 +586,22 @@ mod tests {
         assert!(!search("cat heart").contains(&"🐱"));
         assert_eq!(search("").len(), ALL.len());
         assert!(search("zzzznothing").is_empty());
+    }
+
+    #[test]
+    fn shortcodes() {
+        assert_eq!(shortcode("smile"), Some("😄"));
+        assert_eq!(shortcode("thumbsup"), Some("👍"));
+        assert_eq!(shortcode("+1"), Some("👍"));
+        assert_eq!(shortcode("cat"), Some("🐱"));
+        assert_eq!(shortcode("heart_eyes"), Some("😍"));
+        assert_eq!(shortcode("nonsense"), None);
+        assert_eq!(suggest("smi")[0], "😄");
+        assert_eq!(name_of("😄"), "smile");
+        assert_eq!(replace_shortcodes("hi :smile: and :tada:!"), "hi 😄 and 🎉!");
+        assert_eq!(replace_shortcodes("time 10:30:00 :nope: a:b"), "time 10:30:00 :nope: a:b");
+        assert_eq!(replace_shortcodes("```\n:smile:\n```\n:smile:"), "```\n:smile:\n```\n😄");
+        assert_eq!(replace_open_shortcodes("nice :smile and :tada: :zzzq"), "nice 😄 and 🎉 :zzzq");
     }
 
     #[test]

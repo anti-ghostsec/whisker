@@ -515,9 +515,9 @@ impl AccountManager {
                     timeline::Parsed::Edit { target, body } => {
                         let _ = tx.send(ClientEvent::Edited { account, room_id: room.room_id().to_owned(), target, body });
                     }
-                    timeline::Parsed::New { body, is_text, reply_to, media, thread } => {
+                    timeline::Parsed::New { body, is_text, reply_to, media, thread, pills } => {
                         let is_notice = matches!(ev.content.msgtype, matrix_sdk::ruma::events::room::message::MessageType::Notice(_));
-                        let m = Msg { body, is_text, is_notice, reply_to, media, thread };
+                        let m = Msg { body, is_text, is_notice, reply_to, media, thread, pills };
                         publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
                     }
                 }
@@ -576,7 +576,7 @@ impl AccountManager {
         client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
             let (tx, latest) = (tx.clone(), latest.clone());
             async move {
-                let m = Msg { body: timeline::UNDECRYPTABLE.into(), is_text: false, is_notice: false, reply_to: None, media: None, thread: None };
+                let m = Msg { body: timeline::UNDECRYPTABLE.into(), is_text: false, is_notice: false, reply_to: None, media: None, thread: None, pills: Vec::new() };
                 publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
             }
         });
@@ -975,6 +975,7 @@ struct Msg {
     reply_to: Option<matrix_sdk::ruma::OwnedEventId>,
     media: Option<timeline::Media>,
     thread: Option<matrix_sdk::ruma::OwnedEventId>,
+    pills: Vec<(String, String)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -988,7 +989,7 @@ async fn publish(
     msg: Msg,
     ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch,
 ) {
-    let Msg { body, is_text, is_notice, reply_to, media, thread } = msg;
+    let Msg { body, is_text, is_notice, reply_to, media, thread, pills } = msg;
     let (sender_name, sender_avatar) = timeline::member_profile(room, sender).await;
     let item = HistoryItem {
         event_id: event_id.clone(),
@@ -1003,6 +1004,7 @@ async fn publish(
         notice: false,
         member: None,
         thread: thread.clone(),
+        pills: pills.clone(),
     };
     {
         let mut l = latest.lock().unwrap();
@@ -1025,6 +1027,7 @@ async fn publish(
         reply_to,
         media: media.map(Box::new),
         thread,
+        pills,
     });
 }
 

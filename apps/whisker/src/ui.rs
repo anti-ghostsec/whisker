@@ -15,6 +15,45 @@ use std::sync::{Arc, Mutex};
 use whisker_core::timeline::{HistoryItem, MediaKind, UNDECRYPTABLE};
 
 pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
+/// An animation: its frames, and how long each shows (ms).
+pub type Frames = (Arc<Vec<Pixels>>, u32);
+
+/// Most frames kept of one animation (the rest are dropped).
+const MAX_FRAMES: usize = 150;
+
+/// The frames of an animated GIF or WebP, shrunk to fit; `None` for still
+/// pictures (and anything that isn't one of those).
+pub fn decode_frames(bytes: &[u8], max_w: u32, max_h: u32) -> Option<Frames> {
+    use image::AnimationDecoder;
+    let cursor = std::io::Cursor::new(bytes);
+    let frames: Vec<image::Frame> = if bytes.starts_with(b"GIF8") {
+        image::codecs::gif::GifDecoder::new(cursor).ok()?.into_frames().take(MAX_FRAMES).collect::<Result<_, _>>().ok()?
+    } else if bytes.get(8..12) == Some(b"WEBP") {
+        let d = image::codecs::webp::WebPDecoder::new(cursor).ok()?;
+        if !d.has_animation() {
+            return None;
+        }
+        d.into_frames().take(MAX_FRAMES).collect::<Result<_, _>>().ok()?
+    } else {
+        return None;
+    };
+    if frames.len() < 2 {
+        return None;
+    }
+    let (num, den) = frames[0].delay().numer_denom_ms();
+    // Browsers treat very short delays as 100 ms; so do we.
+    let ms = num.checked_div(den).filter(|ms| *ms > 10).unwrap_or(100);
+    let out: Vec<Pixels> = frames
+        .into_iter()
+        .map(|f| {
+            let img = image::DynamicImage::ImageRgba8(f.into_buffer());
+            let img = if img.width() > max_w || img.height() > max_h { img.resize(max_w, max_h, image::imageops::FilterType::Triangle) } else { img };
+            let img = img.to_rgba8();
+            Pixels::clone_from_slice(img.as_raw(), img.width(), img.height())
+        })
+        .collect();
+    Some((Arc::new(out), ms))
+}
 pub type PixelCache = Arc<Mutex<HashMap<OwnedMxcUri, Option<Pixels>>>>;
 
 pub struct Models {
@@ -122,19 +161,27 @@ thread_local! {
     pub static RICH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub fn blocks(body: &str) -> ModelRc<Block> {
+/// `pills` are mentions (name, user id): lines naming them are drawn styled
+/// (even when rich text is off) with the name as a link, like Element's pills.
+pub fn blocks(body: &str, pills: &[(String, String)]) -> ModelRc<Block> {
     let lines = if RICH.get() { format::split(body) } else { format::merged(body) };
     let rich = RICH.get();
     let v: Vec<Block> = lines
         .into_iter()
-        .map(|l| Block {
-            kind: l.kind as i32,
-            text: match l.kind {
-                Kind::Code | Kind::Blank => Default::default(),
-                _ if !rich => Default::default(),
-                _ => format::styled(&l.source),
-            },
-            plain: s(&l.source),
+        .map(|l| {
+            let text_like = matches!(l.kind, Kind::Text | Kind::Quote | Kind::Heading);
+            let mention = text_like && pills.iter().any(|(n, _)| l.source.contains(n.as_str()));
+            Block {
+                kind: l.kind as i32,
+                mention,
+                text: match l.kind {
+                    Kind::Code | Kind::Blank => Default::default(),
+                    _ if mention => format::styled(&format::link_mentions(&l.source, pills)),
+                    _ if !rich => Default::default(),
+                    _ => format::styled(&l.source),
+                },
+                plain: s(&l.source),
+            }
         })
         .collect();
     ModelRc::new(VecModel::from(v))
@@ -150,6 +197,8 @@ pub struct MsgRow {
     pub day: String,
     pub reply: Option<(String, String)>,
     pub picture: Option<Pixels>,
+    /// Animated pictures: all frames.
+    pub frames: Option<Frames>,
     /// People whose read receipt lands on this message: (name, avatar).
     pub readers: Vec<(String, Option<OwnedMxcUri>)>,
     /// Emoji reactions: (emoji, how many, one of them is ours, who).
@@ -186,6 +235,7 @@ impl Models {
         format!("{:?}", r.item).hash(&mut h);
         (r.mine, r.first, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, RICH.get()).hash(&mut h);
         r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
+        r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
         loaded(&r.item.sender_avatar).hash(&mut h);
         r.readers.iter().map(|x| loaded(&x.1)).collect::<Vec<_>>().hash(&mut h);
         let sig = h.finish();
@@ -227,7 +277,7 @@ impl Models {
             sender: s(r.item.sender.as_str()),
             name: s(&name),
             body: s(&r.item.body),
-            blocks: blocks(&r.item.body),
+            blocks: blocks(&r.item.body, &r.item.pills),
             links: ModelRc::new(VecModel::from(format::links(&r.item.body).iter().map(s).collect::<Vec<_>>())),
             readers: ModelRc::new(VecModel::from(
                 r.readers
@@ -260,6 +310,10 @@ impl Models {
             media_name: s(media_name),
             media_info: s(media_info),
             picture: r.picture.as_ref().map(|p| Image::from_rgba8(p.clone())).unwrap_or_default(),
+            frames: ModelRc::new(VecModel::from(
+                r.frames.as_ref().map(|f| f.0.iter().map(|p| Image::from_rgba8(p.clone())).collect::<Vec<_>>()).unwrap_or_default(),
+            )),
+            frame_ms: r.frames.as_ref().map_or(0, |f| f.1 as i32),
             picture_width: pw,
             picture_height: ph,
         }
@@ -269,6 +323,28 @@ impl Models {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gifs_animate() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        let mut bytes = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut bytes);
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            for shade in [0u8, 255] {
+                let img = image::RgbaImage::from_pixel(40, 20, image::Rgba([shade, 0, 0, 255]));
+                enc.encode_frame(image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(50, 1))).unwrap();
+            }
+        }
+        let (frames, ms) = decode_frames(&bytes, 20, 20).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(ms, 50);
+        assert_eq!((frames[0].width(), frames[0].height()), (20, 10));
+        // A still picture isn't an animation.
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(4, 4).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert!(decode_frames(png.get_ref(), 20, 20).is_none());
+    }
 
     #[test]
     fn sizes() {

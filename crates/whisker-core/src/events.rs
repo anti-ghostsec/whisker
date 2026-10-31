@@ -27,6 +27,8 @@ pub enum ClientEvent {
         media: Option<Box<Media>>,
         /// A reply in a thread: the thread's first message.
         thread: Option<OwnedEventId>,
+        /// Mentions of people in `body`: (name as shown, user id).
+        pills: Vec<(String, String)>,
     },
     /// A room event (join, leave, rename, …) as a notice line.
     Notice { account: AccountId, item: Box<crate::timeline::HistoryItem>, room_id: OwnedRoomId },

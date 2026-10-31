@@ -58,16 +58,20 @@ operating system and the **Wisp** browser.
   replies lose their reply link. Forwarding from an encrypted room into an unencrypted
   one makes that file readable to the new room.
 - **Images and videos:** right-click the picture or video itself to save it; the full-size
-  viewer has Save / Forward / Close buttons and its own right-click menu. Click a video or
-  audio file to **play** it in your system's player; the copy goes to the RAM folder and is
-  deleted when you lock or quit (your player may still list it under recent files).
+  viewer has Save / Forward / Close buttons and its own right-click menu. **GIFs and
+  animated WebP play and loop**, in the timeline and the viewer. Videos show their preview
+  frame; click to **play** in mpv (looping, sound off to start) or, without mpv, your
+  system's player. The copy goes to the RAM folder and is deleted when you lock or quit
+  (your player may still list it under recent files).
 - **Spaces** show as folders in the room list, holding their rooms and sub-spaces (click to
   fold or unfold; a folded space shows the unread count of everything inside).
 - **Threads:** replies in a thread are tucked under the message that started it ("3
   replies"); click that, or right-click → *Reply in thread*, to read and answer in the side panel.
-- **Mentions and emoji shortcodes:** type `@` and part of a name, or `:` and part of an
-  emoji name, and pick from the list (Tab or Enter takes the first). Picked people become
-  proper mentions, so they're notified.
+- **Mentions and emoji shortcodes:** type `@` and part of a name for the closest matches
+  (Tab or Enter takes the first); picked people become real mentions, so they're notified,
+  and mentions show in the accent colour like links (click one for that person's profile).
+  `:smile:` turns into 😄 as you type the closing colon; `:smi` offers matches, and a
+  whole-word `:smile` is converted when you send.
 - **Notifications** (Linux desktops) for direct messages, mentions, and rooms you've set to
   notify, never for the room you're looking at or for messages from your own accounts.
   Settings → *Notifications and typing* picks how much they say: nothing, who and where

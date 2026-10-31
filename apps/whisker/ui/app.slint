@@ -62,6 +62,8 @@ export struct Block {
     kind: int,
     text: styled-text,
     plain: string,
+    // Names someone: drawn styled (the name as a link) even in plain mode.
+    mention: bool,
 }
 
 // An emoji reaction under a message: how many, and whether one is ours.
@@ -121,6 +123,9 @@ export struct MessageItem {
     media-name: string,
     media-info: string,
     picture: image,
+    // Animated GIF/WebP: every frame, shown in turn (looping).
+    frames: [image],
+    frame-ms: int,
     picture-width: length,
     picture-height: length,
     links: [string],
@@ -195,7 +200,7 @@ component Blocks inherits VerticalLayout {
     callback link(string);
     spacing: 2px;
     for b in root.blocks: VerticalLayout {
-        if b.kind == 0 && !Prefs.rich-text: TextInput {
+        if b.kind == 0 && !Prefs.rich-text && !b.mention: TextInput {
             width: root.avail;
             text: b.plain;
             read-only: true;
@@ -205,7 +210,7 @@ component Blocks inherits VerticalLayout {
             font-italic: root.faint;
             selection-background-color: Theme.accent.transparentize(0.55);
         }
-        if b.kind == 0 && Prefs.rich-text: StyledText {
+        if b.kind == 0 && (Prefs.rich-text || b.mention): StyledText {
             width: root.avail;
             text: b.text;
             default-color: root.faint ? Theme.muted : Theme.text;
@@ -215,7 +220,7 @@ component Blocks inherits VerticalLayout {
         if b.kind == 1: HorizontalLayout {
             spacing: 8px;
             Rectangle { width: 3px; border-radius: 2px; background: Theme.accent.transparentize(0.4); }
-            if !Prefs.rich-text: TextInput {
+            if !Prefs.rich-text && !b.mention: TextInput {
                 width: root.avail - 11px;
                 text: b.plain;
                 read-only: true;
@@ -224,7 +229,7 @@ component Blocks inherits VerticalLayout {
                 color: Theme.muted;
                 selection-background-color: Theme.accent.transparentize(0.55);
             }
-            if Prefs.rich-text: StyledText {
+            if Prefs.rich-text || b.mention: StyledText {
                 width: root.avail - 11px;
                 text: b.text;
                 default-color: Theme.muted;
@@ -252,7 +257,7 @@ component Blocks inherits VerticalLayout {
                 }
             }
         }
-        if b.kind == 3 && !Prefs.rich-text: TextInput {
+        if b.kind == 3 && !Prefs.rich-text && !b.mention: TextInput {
             width: root.avail;
             text: b.plain;
             read-only: true;
@@ -263,7 +268,7 @@ component Blocks inherits VerticalLayout {
             color: Theme.text;
             selection-background-color: Theme.accent.transparentize(0.55);
         }
-        if b.kind == 3 && Prefs.rich-text: StyledText { width: root.avail; text: b.text; default-color: Theme.text; default-font-size: 17px; link-color: Theme.accent; }
+        if b.kind == 3 && (Prefs.rich-text || b.mention): StyledText { width: root.avail; text: b.text; default-color: Theme.text; default-font-size: 17px; link-color: Theme.accent; link-clicked(l) => { root.link(l); } }
         if b.kind == 4: Rectangle { height: 6px; }
     }
 }
@@ -373,25 +378,39 @@ component MessageRow inherits Rectangle {
                         Text { text: root.item.reply-text; font-size: 12px; color: Theme.muted; overflow: elide; horizontal-stretch: 1; }
                     }
                     // Narrow chat (side panel open): shrink, keeping the shape.
-                    if root.item.media == 1: Rectangle {
+                    // Pictures, and videos that came with a preview frame.
+                    if root.item.media == 1 || (root.item.media == 2 && root.item.picture.width > 0): Rectangle {
                         property <float> fit: min(1, max(60px, root.width - 100px) / max(1px, root.item.picture-width));
+                        // Animated pictures step through their frames, looping.
+                        property <int> frame: 0;
                         width: root.item.picture-width * self.fit;
                         height: root.item.picture-height * self.fit;
                         border-radius: 8px;
                         clip: true;
                         background: Theme.raised;
-                        if root.item.picture.width > 0: Image { source: root.item.picture; width: parent.width; height: parent.height; image-fit: cover; }
+                        Timer {
+                            interval: max(20, root.item.frame-ms) * 1ms;
+                            running: root.item.frames.length > 1;
+                            triggered => { parent.frame = mod(parent.frame + 1, root.item.frames.length); }
+                        }
+                        if root.item.picture.width > 0 && root.item.frames.length == 0: Image { source: root.item.picture; width: parent.width; height: parent.height; image-fit: cover; }
+                        if root.item.frames.length > 0: Image { source: root.item.frames[min(parent.frame, root.item.frames.length - 1)]; width: parent.width; height: parent.height; image-fit: cover; }
                         if root.item.picture.width == 0: Text { text: "Loading image…"; color: Theme.muted; font-size: 12px; }
+                        if root.item.media == 2: Rectangle {
+                            width: 48px; height: 48px; border-radius: 24px;
+                            background: #000000a0;
+                            Text { text: "▶"; color: white; font-size: 20px; }
+                        }
                         // Takes every button, so it opens the menu itself on right-click.
                         TouchArea {
                             mouse-cursor: pointer;
-                            clicked => { root.action("view", root.item.id); }
+                            clicked => { root.action(root.item.media == 2 ? "play" : "view", root.item.id); }
                             pointer-event(e) => {
                                 if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
                             }
                         }
                     }
-                    if root.item.media > 1: Rectangle {
+                    if root.item.media > 2 || (root.item.media == 2 && root.item.picture.width == 0): Rectangle {
                         height: 52px;
                         max-width: 340px;
                         border-radius: 8px;
@@ -870,6 +889,10 @@ export component AppWindow inherits Window {
     // Overlays
     in-out property <string> select-text;
     in-out property <image> viewer-image;
+    // Animated pictures in the viewer: frames shown in turn, looping.
+    in property <[image]> viewer-frames;
+    in property <int> viewer-frame-ms;
+    property <int> viewer-frame;
     in-out property <bool> viewer-open;
     // The message the viewer shows (for Save / Forward).
     in property <string> viewer-id;
@@ -1845,8 +1868,13 @@ export component AppWindow inherits Window {
                 MenuSeparator {}
                 MenuItem { title: "Close"; activated => { root.viewer-open = false; } }
             }
+            Timer {
+                interval: max(20, root.viewer-frame-ms) * 1ms;
+                running: root.viewer-open && root.viewer-frames.length > 1;
+                triggered => { root.viewer-frame = mod(root.viewer-frame + 1, root.viewer-frames.length); }
+            }
             Image {
-                source: root.viewer-image;
+                source: root.viewer-frames.length > 1 ? root.viewer-frames[min(root.viewer-frame, root.viewer-frames.length - 1)] : root.viewer-image;
                 width: parent.width;
                 height: parent.height;
                 image-fit: contain;

@@ -81,6 +81,8 @@ pub struct HistoryItem {
     pub member: Option<MemberChange>,
     /// A reply in a thread: the message that started it.
     pub thread: Option<OwnedEventId>,
+    /// Mentions of people in the text: (name as shown, user id).
+    pub pills: Vec<(String, String)>,
 }
 
 /// Someone's membership after a room event.
@@ -102,7 +104,7 @@ impl HistoryItem {
 /// What a message event means for the timeline.
 pub enum Parsed {
     /// A new message: body, whether it's real text, reply target, attachment.
-    New { body: String, is_text: bool, reply_to: Option<OwnedEventId>, media: Option<Media>, thread: Option<OwnedEventId> },
+    New { body: String, is_text: bool, reply_to: Option<OwnedEventId>, media: Option<Media>, thread: Option<OwnedEventId>, pills: Vec<(String, String)> },
     /// An edit of an earlier message.
     Edit { target: OwnedEventId, body: String },
 }
@@ -198,7 +200,13 @@ pub fn parse(content: &RoomMessageEventContent) -> Parsed {
             if reply_to.is_some() || thread.is_some() {
                 body = strip_reply_fallback(&body);
             }
-            Parsed::New { body, is_text, reply_to, media: media_of(&content.msgtype), thread }
+            let pills = match &content.msgtype {
+                MessageType::Text(t) => t.formatted.as_ref().map(|f| mention_names(&f.body)).unwrap_or_default(),
+                MessageType::Emote(t) => t.formatted.as_ref().map(|f| mention_names(&f.body)).unwrap_or_default(),
+                MessageType::Notice(t) => t.formatted.as_ref().map(|f| mention_names(&f.body)).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            Parsed::New { body, is_text, reply_to, media: media_of(&content.msgtype), thread, pills }
         }
     }
 }
@@ -230,9 +238,26 @@ pub async fn rooms(client: &Client) -> Vec<RoomSummary> {
     out
 }
 
+/// The rooms a space lists, remembered for a little while: the room list
+/// is redrawn often and this reads the space's state from the store.
+async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+    type Children = (Instant, Vec<OwnedRoomId>);
+    static CACHE: LazyLock<Mutex<HashMap<OwnedRoomId, Children>>> = LazyLock::new(Default::default);
+    if let Some((t, kids)) = CACHE.lock().unwrap().get(space.room_id())
+        && t.elapsed() < Duration::from_secs(20)
+    {
+        return kids.clone();
+    }
+    let kids = read_space_children(space).await;
+    CACHE.lock().unwrap().insert(space.room_id().to_owned(), (Instant::now(), kids.clone()));
+    kids
+}
+
 /// The rooms a space lists (`m.space.child` events that still have a
 /// `via`; an empty one means the room was taken out), by their `order`.
-pub async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
+pub async fn read_space_children(space: &Room) -> Vec<OwnedRoomId> {
     use matrix_sdk::deserialized_responses::SyncOrStrippedState;
     use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
     let Ok(events) = space.get_state_events_static::<SpaceChildEventContent>().await else { return Vec::new() };
@@ -402,16 +427,16 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
                 m.event_id,
                 m.sender,
                 m.origin_server_ts,
-                Parsed::New { body: UNDECRYPTABLE.to_owned(), is_text: false, reply_to: None, media: None, thread: None },
+                Parsed::New { body: UNDECRYPTABLE.to_owned(), is_text: false, reply_to: None, media: None, thread: None, pills: Vec::new() },
             ),
             _ => continue,
         };
-        let (body, reply_to, media, thread) = match parsed {
+        let (body, reply_to, media, thread, pills) = match parsed {
             Parsed::Edit { target, body } => {
                 edits.entry(target).or_insert(body);
                 continue;
             }
-            Parsed::New { body, reply_to, media, thread, .. } => (body, reply_to, media, thread),
+            Parsed::New { body, reply_to, media, thread, pills, .. } => (body, reply_to, media, thread, pills),
         };
         if !profiles.contains_key(&sender) {
             profiles.insert(sender.clone(), member_profile(room, &sender).await);
@@ -431,6 +456,7 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             notice: false,
             member: None,
             thread,
+            pills,
         });
     }
     out.reverse();
@@ -500,6 +526,7 @@ pub async fn notice_item(
         notice: true,
         member,
         thread: None,
+        pills: Vec::new(),
     })
 }
 
@@ -525,11 +552,18 @@ pub async fn thumbnail(client: &Client, mxc: &MxcUri, size: u32) -> Result<Vec<u
 pub const LOCAL_ECHO: &str = "$whisker-local-";
 
 /// Sends a message and returns the id the server gave it.
-/// `mentions` are the people the message mentions (so they're notified).
-pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>, mentions: Vec<OwnedUserId>) -> Result<OwnedEventId> {
-    let mut content = RoomMessageEventContentWithoutRelation::text_markdown(text);
-    if !mentions.is_empty() {
-        content = content.add_mentions(matrix_sdk::ruma::events::Mentions::with_user_ids(mentions));
+/// `mentions` are people picked from @-suggestions: (name as typed, user).
+/// Their names become links in the formatted text (pills in other apps)
+/// while the plain text keeps just the names, and they're listed so they
+/// get notified.
+pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>, mentions: &[(String, OwnedUserId)]) -> Result<OwnedEventId> {
+    let (linked, users) = link_mentions(text, mentions);
+    let mut content = RoomMessageEventContentWithoutRelation::text_markdown(&linked);
+    if !users.is_empty() {
+        if let MessageType::Text(t) = &mut content.msgtype {
+            t.body = text.to_owned();
+        }
+        content = content.add_mentions(matrix_sdk::ruma::events::Mentions::with_user_ids(users));
     }
     let content = match reply_to {
         Some(id) => room
@@ -546,6 +580,61 @@ pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>, ment
     let sent = room.send(content).with_request_config(config).await?;
     tracing::debug!(room = %room.room_id(), ms = started.elapsed().as_millis() as u64, "message sent (incl. encryption setup)");
     Ok(sent.response.event_id)
+}
+
+/// `text` with the first use of each mentioned name made a Markdown link to
+/// that person, and the people still mentioned.
+pub fn link_mentions(text: &str, picked: &[(String, OwnedUserId)]) -> (String, Vec<OwnedUserId>) {
+    let mut out = text.to_owned();
+    let mut users = Vec::new();
+    for (name, user) in picked {
+        if users.contains(user) {
+            continue;
+        }
+        if let Some(i) = out.find(name.as_str()) {
+            let link = format!("[{}](https://matrix.to/#/{user})", name.replace(['[', ']'], ""));
+            out.replace_range(i..i + name.len(), &link);
+            users.push(user.clone());
+        }
+    }
+    (out, users)
+}
+
+/// Mentions in a formatted message: (shown name, user id) for each of its
+/// links to users (`https://matrix.to/#/@…` or `matrix:u/…`).
+pub fn mention_names(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(a) = rest.find("<a ") {
+        rest = &rest[a..];
+        let Some(close) = rest.find('>') else { break };
+        let tag = &rest[..close];
+        let user = link_user(tag);
+        let body = &rest[close + 1..];
+        let Some(end) = body.find("</a>") else { break };
+        if let Some(user) = user {
+            let name = body[..end].replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'");
+            let name = name.trim().to_owned();
+            if !name.is_empty() && !out.iter().any(|(n, _)| *n == name) {
+                out.push((name, user));
+            }
+        }
+        rest = &body[end..];
+    }
+    out
+}
+
+/// The user an `<a href=…>` tag links to, if it's a user link.
+fn link_user(tag: &str) -> Option<String> {
+    let href = tag.split("href=").nth(1)?;
+    let href = href.trim_start_matches(['"', '\'']);
+    let href = &href[..href.find(['"', '\'', ' ']).unwrap_or(href.len())];
+    let id = if let Some(rest) = href.split("matrix.to/#/").nth(1) {
+        rest.split(['?', '/']).next()?.replace("%40", "@").replace("%3A", ":").replace("%3a", ":")
+    } else {
+        format!("@{}", href.strip_prefix("matrix:u/")?.split('?').next()?)
+    };
+    (id.starts_with('@') && id.contains(':')).then_some(id)
 }
 
 /// Posts `text` as a reply in the thread started by `root`; `latest` is

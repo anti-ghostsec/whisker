@@ -98,6 +98,22 @@ fn autolink(s: &str) -> String {
 
 /// Inline-styled text for one line; plain text if the Markdown doesn't parse
 /// (e.g. stray `<tags>`).
+/// Each mentioned name in `source` (once) as a link to that person.
+pub fn link_mentions(source: &str, pills: &[(String, String)]) -> String {
+    let mut out = source.to_owned();
+    for (name, user) in pills {
+        if let Some(i) = out.find(name.as_str()) {
+            // Not inside a link already made for a longer name.
+            if out[..i].matches('[').count() > out[..i].matches(']').count() {
+                continue;
+            }
+            let link = format!("[{}](https://matrix.to/#/{user})", name.replace(['[', ']'], ""));
+            out.replace_range(i..i + name.len(), &link);
+        }
+    }
+    out
+}
+
 pub fn styled(source: &str) -> StyledText {
     StyledText::from_markdown(&autolink(source)).unwrap_or_else(|_| StyledText::from_plain_text(source))
 }
@@ -105,6 +121,13 @@ pub fn styled(source: &str) -> StyledText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mentions_link() {
+        let p = [("Bob".to_owned(), "@bob:x".to_owned())];
+        assert_eq!(link_mentions("hi Bob!", &p), "hi [Bob](https://matrix.to/#/@bob:x)!");
+        assert_eq!(link_mentions("nobody", &p), "nobody");
+    }
 
     #[test]
     fn splits_blocks() {

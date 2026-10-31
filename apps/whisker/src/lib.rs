@@ -30,6 +30,9 @@ slint::include_modules!();
 const KEEP_PER_ROOM: usize = 1000;
 const PAGE: u32 = 50;
 const AVATAR_PX: u32 = 96;
+/// Animated pictures bigger than this show still (playing them means
+/// downloading and decoding every frame).
+const MAX_ANIMATION_BYTES: u64 = 12 * 1024 * 1024;
 
 type RoomKey = (AccountId, OwnedRoomId);
 /// A character card and its PNG picture (if it came in one).
@@ -81,6 +84,13 @@ struct State {
     editing: Option<OwnedEventId>,
     /// Decoded image previews, by event.
     pictures: HashMap<OwnedEventId, Option<Pixels>>,
+    /// Read receipts per room, worked out when they change (it reads every
+    /// member's receipt, too slow to redo on every redraw).
+    marks: HashMap<RoomKey, Vec<timeline::ReadMark>>,
+    /// Rooms whose receipts are being worked out again.
+    marks_pending: HashSet<RoomKey>,
+    /// Animated pictures (GIF, WebP): their frames and ms per frame.
+    animations: HashMap<OwnedEventId, ui::Frames>,
     /// Rooms marked read locally: the server's unread count at that moment.
     /// The badge stays hidden until the server reports a different count.
     cleared: HashMap<RoomKey, u64>,
@@ -169,6 +179,19 @@ fn open_link(url: &str) {
 /// Where played videos and audio go: the RAM folder, wiped on lock and quit.
 fn media_dir(data_dir: &std::path::Path) -> PathBuf {
     whisker_core::stores::runtime_root(data_dir).join("media")
+}
+
+/// Plays a video (looping, sound off to start, like videos in chat apps)
+/// or audio in mpv when it's installed, else in the system's player.
+fn play_file(path: &std::path::Path, video: bool) {
+    let mut cmd = std::process::Command::new("mpv");
+    cmd.arg("--force-window=yes").arg("--title=Whisker").arg("--no-terminal");
+    if video {
+        cmd.arg("--loop-file=inf").arg("--mute=yes");
+    }
+    if cmd.arg(path).spawn().is_err() {
+        open_file(path);
+    }
 }
 
 /// Opens a downloaded file in the app the system picks for it.
@@ -272,22 +295,34 @@ impl Ctl {
     }
 
     /// Fetches image previews for messages in the open room.
+    /// Loads previews: image thumbnails, video poster frames, and whole
+    /// animated GIF/WebP files (so they play). A few at a time, decoded off
+    /// the network threads.
     fn fetch_pictures(&self, key: &RoomKey, items: &[HistoryItem]) {
-        let wanted: Vec<(OwnedEventId, MediaSource, bool)> = {
+        // (event, source, ask the server for a thumbnail, animated)
+        let wanted: Vec<(OwnedEventId, MediaSource, bool, bool)> = {
             let st = self.st.lock().unwrap();
             let mut loading = self.loading.lock().unwrap();
             items
                 .iter()
                 .filter_map(|m| {
-                    let media = m.media.as_ref().filter(|x| x.kind == MediaKind::Image)?;
+                    let media = m.media.as_ref()?;
                     if st.pictures.contains_key(&m.event_id) || !loading.insert(m.event_id.to_string()) {
                         return None;
                     }
-                    let (src, thumb) = match &media.thumbnail {
-                        Some(t) => (t.clone(), false),
-                        None => (media.source.clone(), true),
-                    };
-                    Some((m.event_id.clone(), src, thumb))
+                    let animated = media.kind == MediaKind::Image
+                        && matches!(media.mime.as_deref(), Some("image/gif" | "image/webp"))
+                        && media.size.is_none_or(|s| s <= MAX_ANIMATION_BYTES);
+                    match (media.kind, &media.thumbnail) {
+                        (MediaKind::Image, _) if animated => Some((m.event_id.clone(), media.source.clone(), false, true)),
+                        (MediaKind::Image, Some(t)) => Some((m.event_id.clone(), t.clone(), false, false)),
+                        (MediaKind::Image, None) => Some((m.event_id.clone(), media.source.clone(), true, false)),
+                        (MediaKind::Video, Some(t)) => Some((m.event_id.clone(), t.clone(), false, false)),
+                        _ => {
+                            loading.remove(m.event_id.as_str());
+                            None
+                        }
+                    }
                 })
                 .collect()
         };
@@ -297,12 +332,31 @@ impl Ctl {
         let (c, account, room) = (self.clone(), key.0, key.1.clone());
         self.spawn(async move {
             let Some(client) = c.mgr.client(account).await else { return };
-            for (id, src, thumb) in wanted {
-                let bytes = timeline::download(&client, &src, thumb.then_some(640)).await.ok();
-                let px = bytes.and_then(|b| decode(&b, 720, 600, false));
-                c.st.lock().unwrap().pictures.insert(id.clone(), px);
-                c.loading.lock().unwrap().remove(id.as_str());
-                c.update_message(&(account, room.clone()), &id);
+            let slots = Arc::new(tokio::sync::Semaphore::new(4));
+            for (id, src, thumb, animated) in wanted {
+                let (c, client, room, slots) = (c.clone(), client.clone(), room.clone(), slots.clone());
+                tokio::spawn(async move {
+                    let _slot = slots.acquire().await;
+                    let bytes = timeline::download(&client, &src, thumb.then_some(640)).await.ok();
+                    let decoded = match bytes {
+                        Some(b) => tokio::task::spawn_blocking(move || {
+                            let frames = if animated { ui::decode_frames(&b, 720, 600) } else { None };
+                            (decode(&b, 720, 600, false), frames)
+                        })
+                        .await
+                        .unwrap_or((None, None)),
+                        None => (None, None),
+                    };
+                    {
+                        let mut st = c.st.lock().unwrap();
+                        st.pictures.insert(id.clone(), decoded.0);
+                        if let Some(f) = decoded.1 {
+                            st.animations.insert(id.clone(), f);
+                        }
+                    }
+                    c.loading.lock().unwrap().remove(id.as_str());
+                    c.update_message(&(account, room), &id);
+                });
             }
         });
     }
@@ -624,10 +678,7 @@ impl Ctl {
     async fn rows_for(&self, key: &RoomKey, thread: Option<&OwnedEventId>) -> Vec<MsgRow> {
         let client = self.mgr.client(key.0).await;
         let me: Option<OwnedUserId> = client.as_ref().and_then(|c| c.user_id().map(ToOwned::to_owned));
-        let marks = match client.and_then(|c| c.get_room(&key.1)) {
-            Some(room) => timeline::read_marks(&room).await,
-            None => Vec::new(),
-        };
+        let marks = self.st.lock().unwrap().marks.get(key).cloned().unwrap_or_default();
         let show_events = self.settings.lock().unwrap().show_events;
         let st = self.st.lock().unwrap();
         let mut msgs = st.messages.get(key).cloned().unwrap_or_default();
@@ -697,6 +748,7 @@ impl Ctl {
                 });
                 MsgRow {
                     picture: st.pictures.get(&m.event_id).cloned().flatten(),
+                    frames: st.animations.get(&m.event_id).cloned(),
                     mine: me.as_ref() == Some(&m.sender),
                     first,
                     day,
@@ -900,6 +952,7 @@ impl Ctl {
         // What we already have goes up first; the rest follows.
         self.show_messages().await;
         self.show_typing(&key).await;
+        self.schedule_marks(key.clone());
         // Can our account kick/ban/delete others' messages here?
         let can_moderate = match (room.power_levels().await, client.user_id()) {
             (Ok(pl), Some(me)) => pl.user_can_kick(me) || pl.user_can_ban(me) || pl.user_can_redact_event_of_other(me),
@@ -1461,7 +1514,7 @@ impl Ctl {
     }
 
     async fn send(&self, text: String) {
-        let text = text.trim().to_owned();
+        let text = emoji::replace_open_shortcodes(text.trim());
         if text.is_empty() {
             return;
         }
@@ -1501,6 +1554,8 @@ impl Ctl {
         let account = self.mgr.accounts().await.into_iter().find(|a| a.id == key.0);
         let local = OwnedEventId::try_from(format!("{}{}", timeline::LOCAL_ECHO, &whisker_core::vault::random_secret()[..12]))
             .expect("valid local event id");
+        // People picked from @-suggestions, still named in the text.
+        let picked: Vec<(String, OwnedUserId)> = std::mem::take(&mut self.st.lock().unwrap().mentions).into_iter().filter(|(n, _)| text.contains(n.as_str())).collect();
         let item = HistoryItem {
             event_id: local.clone(),
             sender: me,
@@ -1514,6 +1569,7 @@ impl Ctl {
             notice: false,
             member: None,
             thread: None,
+            pills: picked.iter().map(|(n, u)| (n.clone(), u.to_string())).collect(),
         };
         self.merge(&key, vec![item]);
         self.ui(|u| u.set_stick_bottom(true));
@@ -1521,9 +1577,7 @@ impl Ctl {
 
         // Picked @-mentions become links (pills in other apps) and are
         // listed in the message so those people get notified.
-        let picked = std::mem::take(&mut self.st.lock().unwrap().mentions);
-        let (text, mentioned) = with_mentions(&text, &picked);
-        match timeline::send_text(&room, &text, reply_to.as_deref(), mentioned).await {
+        match timeline::send_text(&room, &text, reply_to.as_deref(), &picked).await {
             Ok(real) => self.settle_echo(&key, &local, Some(real)).await,
             Err(e) => {
                 self.settle_echo(&key, &local, None).await;
@@ -1823,7 +1877,7 @@ impl Ctl {
         match r {
             Ok(()) => {
                 self.status("");
-                open_file(&path);
+                play_file(&path, media.kind == MediaKind::Video);
             }
             Err(e) => self.status(format!("Couldn't open it: {e:#}")),
         }
@@ -1835,11 +1889,22 @@ impl Ctl {
         self.ui(move |u| {
             u.set_viewer_id(s(id));
             u.set_viewer_image(Image::default());
+            u.set_viewer_frames(ModelRc::default());
             u.set_viewer_open(true);
         });
         let Some(client) = self.mgr.client(key.0).await else { return };
-        match timeline::download(&client, &media.source, None).await.ok().and_then(|b| decode(&b, 2560, 2560, false)) {
-            Some(px) => self.ui(move |u| u.set_viewer_image(Image::from_rgba8(px))),
+        let decoded = match timeline::download(&client, &media.source, None).await {
+            Ok(b) => tokio::task::spawn_blocking(move || (decode(&b, 2560, 2560, false), ui::decode_frames(&b, 1600, 1200))).await.unwrap_or((None, None)),
+            Err(_) => (None, None),
+        };
+        match decoded.0 {
+            Some(px) => self.ui(move |u| {
+                u.set_viewer_image(Image::from_rgba8(px));
+                // GIFs and animated WebP play (and loop) in the viewer too.
+                let (frames, ms) = decoded.1.map(|f| (f.0.iter().map(|p| Image::from_rgba8(p.clone())).collect::<Vec<_>>(), f.1)).unwrap_or_default();
+                u.set_viewer_frames(ModelRc::new(VecModel::from(frames)));
+                u.set_viewer_frame_ms(ms as i32);
+            }),
             None => {
                 self.ui(|u| u.set_viewer_open(false));
                 self.status("Couldn't open that image.");
@@ -2106,25 +2171,30 @@ impl Ctl {
     /// The draft changed: offer @-mentions or :emoji: for the word being
     /// typed, and say we're typing if that's on.
     async fn draft_edited(&self, text: String) {
-        self.st.lock().unwrap().draft = text.clone();
+        // A finished `:name:` becomes its emoji straight away.
         let word = last_word(&text);
+        if let Some(e) = word.strip_prefix(':').and_then(|w| w.strip_suffix(':')).filter(|n| !n.is_empty()).and_then(emoji::shortcode) {
+            let new = format!("{}{e}", &text[..text.len() - word.len()]);
+            self.st.lock().unwrap().draft = new.clone();
+            self.ui(move |u| {
+                u.set_suggestions(ModelRc::default());
+                u.set_draft(s(&new));
+                u.set_cursor_at(new.len() as i32);
+                u.set_cursor_request(u.get_cursor_request() + 1);
+            });
+            return;
+        }
+        self.st.lock().unwrap().draft = text.clone();
         let mut out: Vec<Suggestion> = Vec::new();
         if let Some(q) = word.strip_prefix('@').filter(|q| !q.is_empty()) {
             if let Some((key, room)) = self.current_room().await {
-                let q = q.to_lowercase();
-                for (user, name) in self.members(&key, &room).await {
-                    if name.to_lowercase().split_whitespace().any(|w| w.starts_with(&q)) || user.localpart().to_lowercase().starts_with(&q) {
-                        out.push(Suggestion { label: s(&name), detail: s(user.as_str()), insert: s(&name), kind: 0 });
-                    }
-                    if out.len() >= 6 {
-                        break;
-                    }
+                for (user, name) in best_members(&self.members(&key, &room).await, q).into_iter().take(6) {
+                    out.push(Suggestion { label: s(&name), detail: s(user.as_str()), insert: s(&name), kind: 0 });
                 }
             }
-        } else if let Some(q) = word.strip_prefix(':').filter(|q| q.chars().count() >= 2 && !q.contains(':')) {
-            for e in emoji::search(q).into_iter().take(8) {
-                let name = emoji::ALL.iter().find(|(x, _)| *x == e).map(|(_, k)| k.split(' ').next().unwrap_or_default()).unwrap_or_default();
-                out.push(Suggestion { label: s(e), detail: s(format!(":{name}:")), insert: s(e), kind: 1 });
+        } else if let Some(q) = word.strip_prefix(':').filter(|q| !q.is_empty() && !q.contains(':')) {
+            for e in emoji::suggest(q).into_iter().take(8) {
+                out.push(Suggestion { label: s(e), detail: s(format!(":{}:", emoji::name_of(e))), insert: s(e), kind: 1 });
             }
         }
         self.ui(move |u| u.set_suggestions(ModelRc::new(VecModel::from(out))));
@@ -2236,6 +2306,29 @@ impl Ctl {
         }
     }
 
+    /// Works out a room's read receipts again soon (at most every half
+    /// second), then redraws it.
+    fn schedule_marks(&self, key: RoomKey) {
+        if !self.st.lock().unwrap().marks_pending.insert(key.clone()) {
+            return;
+        }
+        let c = self.clone();
+        self.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            c.st.lock().unwrap().marks_pending.remove(&key);
+            c.refresh_marks(&key).await;
+            if c.current().as_ref() == Some(&key) {
+                c.show_messages().await;
+            }
+        });
+    }
+
+    async fn refresh_marks(&self, key: &RoomKey) {
+        let Some(room) = self.mgr.client(key.0).await.and_then(|c| c.get_room(&key.1)) else { return };
+        let marks = timeline::read_marks(&room).await;
+        self.st.lock().unwrap().marks.insert(key.clone(), marks);
+    }
+
     /// Redraws the thread panel, if a thread is open.
     async fn show_thread(&self) {
         let (Some(key), Some(root)) = (self.current(), self.st.lock().unwrap().thread.clone()) else { return };
@@ -2287,6 +2380,7 @@ impl Ctl {
             notice: false,
             member: None,
             thread: Some(root.clone()),
+            pills: Vec::new(),
         };
         self.merge(&key, vec![item]);
         self.show_thread().await;
@@ -2739,9 +2833,10 @@ impl Ctl {
             Err(e) => format!("✗ {e:#}"),
             Ok((_, _, cfg)) => match Llm::new(cfg.api.clone(), cfg.max_tokens.min(300), cfg.extra_params.clone()).map(|l| l.with_venice(cfg.venice())) {
                 Err(e) => format!("✗ {e:#}"),
-                Ok(llm) => match llm.test().await {
-                    Ok(reply) => format!("✓ It works. The model said: “{}”", reply.trim()),
-                    Err(e) => format!("✗ {e:#}"),
+                Ok(llm) => match tokio::time::timeout(Duration::from_secs(60), llm.test()).await {
+                    Ok(Ok(reply)) => format!("✓ It works. The model said: “{}”", short_reply(&reply)),
+                    Ok(Err(e)) => format!("✗ {e:#}"),
+                    Err(_) => "✗ No answer after a minute. The model may be overloaded, or the address may be wrong.".into(),
                 },
             },
         };
@@ -2813,18 +2908,18 @@ impl Ctl {
                         self.schedule_rooms();
                     }
                 }
-                ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, thread, .. } => {
+                ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, thread, pills, .. } => {
                     {
                         let c = self.clone();
                         let (room_id, sender, name, body) = (room_id.clone(), sender.clone(), sender_name.clone(), body.clone());
                         self.spawn(async move { c.maybe_notify(account, room_id, sender, name, body, origin_server_ts).await });
                     }
                     let key = (account, room_id);
-                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone() };
-                    // Only keep live messages for rooms we've opened; others load on open.
-                    let opened = self.st.lock().unwrap().older.contains_key(&key);
-                    if opened {
-                        self.merge(&key, vec![item]);
+                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone(), pills };
+                    // Kept for every room, so opening one shows something at once
+                    // (its history still loads on first open).
+                    self.merge(&key, vec![item]);
+                    {
                         if self.current().as_ref() == Some(&key) {
                             // A thread reply updates its thread, not the timeline's end.
                             match &thread {
@@ -2857,9 +2952,9 @@ impl Ctl {
                     }
                 }
                 ClientEvent::Receipts { account, room_id } => {
-                    if self.current().as_ref() == Some(&(account, room_id)) {
-                        let c = self.clone();
-                        self.spawn(async move { c.show_messages().await });
+                    let key = (account, room_id);
+                    if self.current().as_ref() == Some(&key) {
+                        self.schedule_marks(key);
                     }
                 }
                 ClientEvent::Edited { account, room_id, target, body } => {
@@ -2928,28 +3023,54 @@ fn drop_repeat_joins(msgs: &mut Vec<HistoryItem>) {
     });
 }
 
+/// A model's test reply, fit for one status line: without "thinking"
+/// sections, on one line, at most 300 characters.
+fn short_reply(reply: &str) -> String {
+    let mut text = reply.to_owned();
+    while let (Some(a), Some(b)) = (text.find("<think>"), text.find("</think>")) {
+        if b < a {
+            break;
+        }
+        text.replace_range(a..b + "</think>".len(), "");
+    }
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(300) {
+        Some((i, _)) => format!("{}…", &one_line[..i]),
+        None => one_line,
+    }
+}
+
+/// Members matching a half-typed `@name`, closest first: display name
+/// starting with it, then a word of it, then the user id, then anywhere.
+fn best_members(members: &[(OwnedUserId, String)], q: &str) -> Vec<(OwnedUserId, String)> {
+    let q = q.to_lowercase();
+    let mut scored: Vec<(u8, usize, &(OwnedUserId, String))> = members
+        .iter()
+        .filter_map(|m| {
+            let name = m.1.to_lowercase();
+            let local = m.0.localpart().to_lowercase();
+            let score = if name.starts_with(&q) {
+                0
+            } else if name.split_whitespace().any(|w| w.starts_with(&q)) {
+                1
+            } else if local.starts_with(&q) {
+                2
+            } else if name.contains(&q) || local.contains(&q) {
+                3
+            } else {
+                return None;
+            };
+            Some((score, name.chars().count(), m))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then_with(|| a.2.1.cmp(&b.2.1)));
+    scored.into_iter().map(|(_, _, m)| m.clone()).collect()
+}
+
 /// The word at the end of `text` (what's being typed).
 fn last_word(text: &str) -> &str {
     let start = text.rfind(char::is_whitespace).map_or(0, |i| i + text[i..].chars().next().map_or(1, char::len_utf8));
     &text[start..]
-}
-
-/// `text` with each picked mention's name made a link to that person, and
-/// the people actually still mentioned.
-fn with_mentions(text: &str, picked: &[(String, OwnedUserId)]) -> (String, Vec<OwnedUserId>) {
-    let mut out = text.to_owned();
-    let mut users = Vec::new();
-    for (name, user) in picked {
-        if users.contains(user) {
-            continue;
-        }
-        if let Some(i) = out.find(name.as_str()) {
-            let link = format!("[{}](https://matrix.to/#/{user})", name.replace(['[', ']'], ""));
-            out.replace_range(i..i + name.len(), &link);
-            users.push(user.clone());
-        }
-    }
-    (out, users)
 }
 
 /// Our own Matrix name (localpart), for spotting mentions.
@@ -3168,7 +3289,17 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
             c.spawn(async move { c2.detect_api(id, url, key).await });
         });
     }
-    ui.on_open_link(|l| open_link(&l));
+    {
+        // Mentions link to matrix.to: open that person's profile instead.
+        let c = ctl.clone();
+        ui.on_open_link(move |l| match l.strip_prefix("https://matrix.to/#/").filter(|u| u.starts_with('@')) {
+            Some(user) => {
+                let (c2, user) = (c.clone(), user.to_owned());
+                c.spawn(async move { c2.profile_requested(user).await });
+            }
+            None => open_link(&l),
+        });
+    }
     {
         let c = ctl.clone();
         ui.on_filter_tag(move |t| c.cycle_tag(t.to_string()));
@@ -3251,6 +3382,7 @@ mod tests {
             notice: member.is_some(),
             member: member.map(|(joined, guessed)| MemberChange { user: OwnedUserId::try_from(format!("@{who}:x")).unwrap(), joined, guessed }),
             thread: None,
+            pills: Vec::new(),
         };
         let mut msgs = vec![
             item("join1", "nully", Some((true, true))),
@@ -3267,15 +3399,26 @@ mod tests {
     }
 
     #[test]
-    fn mentions_become_links() {
+    fn closest_member_first() {
+        let m = |id: &str, name: &str| (OwnedUserId::try_from(id).unwrap(), name.to_owned());
+        let list = [m("@zed:x", "Annabelle"), m("@bob:x", "Bob Ann"), m("@ann:x", "Ann"), m("@xan:x", "Roxanne"), m("@q:x", "Quinn")];
+        let names: Vec<String> = best_members(&list, "ann").into_iter().map(|x| x.1).collect();
+        assert_eq!(names, ["Ann", "Annabelle", "Bob Ann", "Roxanne"]);
+        assert_eq!(best_members(&list, "zed")[0].1, "Annabelle");
+    }
+
+    #[test]
+    fn test_replies_are_short() {
+        assert_eq!(short_reply("<think>long\nthoughts</think>\n\nHi  there!"), "Hi there!");
+        assert_eq!(short_reply(&"a".repeat(400)).chars().count(), 301);
+    }
+
+    #[test]
+    fn last_words() {
         assert_eq!(last_word("hi @bo"), "@bo");
         assert_eq!(last_word("x :cat"), ":cat");
         assert_eq!(last_word("é😀"), "é😀");
         assert_eq!(last_word("a\n@z"), "@z");
-        let bob = OwnedUserId::try_from("@bob:x").unwrap();
-        let (t, u) = with_mentions("Bob Smith hi Bob Smith", &[("Bob Smith".into(), bob.clone()), ("Gone".into(), OwnedUserId::try_from("@g:x").unwrap())]);
-        assert_eq!(t, "[Bob Smith](https://matrix.to/#/@bob:x) hi Bob Smith");
-        assert_eq!(u, [bob]);
     }
 
     #[test]

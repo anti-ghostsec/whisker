@@ -177,3 +177,13 @@ async fn name_changes_in_sync_are_not_joins() {
     let item = timeline::notice_item(&room, &st, &mut Default::default()).await.unwrap();
     assert_eq!(item.body, "Old is now New");
 }
+
+#[test]
+fn mentions_round_trip() {
+    let bob = matrix_sdk::ruma::OwnedUserId::try_from("@bob:x").unwrap();
+    let (linked, users) = timeline::link_mentions("Bob Smith hi Bob Smith", &[("Bob Smith".into(), bob.clone()), ("Gone".into(), "@g:x".try_into().unwrap())]);
+    assert_eq!(linked, "[Bob Smith](https://matrix.to/#/@bob:x) hi Bob Smith");
+    assert_eq!(users, [bob]);
+    let html = r#"hi <a href="https://matrix.to/#/%40bob%3Ax">Bob &amp; co</a>, <a href="https://example.com">site</a> <a href='matrix:u/amy:x'>Amy</a>"#;
+    assert_eq!(timeline::mention_names(html), [("Bob & co".to_owned(), "@bob:x".to_owned()), ("Amy".to_owned(), "@amy:x".to_owned())]);
+}

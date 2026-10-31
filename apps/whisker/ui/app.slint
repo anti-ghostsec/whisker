@@ -72,6 +72,8 @@ export struct ReactionChip {
     count: int,
     mine: bool,
     who: string,
+    // The emoji as a colour picture (empty: draw the key as text).
+    picture: image,
 }
 
 // A room in the "Forward to…" list.
@@ -91,10 +93,18 @@ export struct Suggestion {
     detail: string,
     insert: string,
     kind: int,
+    // For emoji: its colour picture.
+    picture: image,
+}
+
+// An emoji in the picker, with its colour picture.
+export struct EmojiCell {
+    symbol: string,
+    picture: image,
 }
 
 export struct EmojiRow {
-    items: [string],
+    items: [EmojiCell],
 }
 
 export struct MessageItem {
@@ -126,6 +136,8 @@ export struct MessageItem {
     // Animated GIF/WebP: every frame, shown in turn (looping).
     frames: [image],
     frame-ms: int,
+    // A message of only emoji: their pictures, drawn big instead of the text.
+    big-emoji: [image],
     picture-width: length,
     picture-height: length,
     links: [string],
@@ -444,7 +456,12 @@ component MessageRow inherits Rectangle {
                             }
                         }
                     }
-                    if root.item.media == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } }
+                    if root.item.big-emoji.length > 0: HorizontalLayout {
+                        alignment: start;
+                        spacing: 4px;
+                        for pic in root.item.big-emoji: Image { source: pic; width: 40px; height: 40px; }
+                    }
+                    if root.item.media == 0 && root.item.big-emoji.length == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } }
                     if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
                     if root.item.thread-replies > 0: Rectangle {
                         height: 26px;
@@ -477,7 +494,8 @@ component MessageRow inherits Rectangle {
                             chip := HorizontalLayout {
                                 x: 7px;
                                 spacing: 4px;
-                                Text { text: r.key; font-size: 13px; vertical-alignment: center; }
+                                if r.picture.width > 0: Image { source: r.picture; width: 16px; height: 16px; y: (parent.height - self.height) / 2; }
+                                if r.picture.width == 0: Text { text: r.key; font-size: 13px; vertical-alignment: center; }
                                 Text { text: r.count; font-size: 11px; font-weight: 700; color: r.mine ? Theme.accent : Theme.muted; vertical-alignment: center; }
                             }
                             chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("react:" + r.key, root.item.id); } }
@@ -1427,7 +1445,8 @@ export component AppWindow inherits Window {
                                     padding-left: 8px;
                                     padding-right: 8px;
                                     spacing: 10px;
-                                    Text { text: g.label; color: Theme.text; font-size: g.kind == 1 ? 18px : 13px; font-weight: 600; vertical-alignment: center; }
+                                    if g.picture.width > 0: VerticalLayout { alignment: center; Image { source: g.picture; width: 20px; height: 20px; } }
+                                    if g.picture.width == 0: Text { text: g.label; color: Theme.text; font-size: g.kind == 1 ? 18px : 13px; font-weight: 600; vertical-alignment: center; }
                                     Text { text: g.detail; color: Theme.muted; font-size: 11px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                                     if i == 0: Text { text: "Tab"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
                                 }
@@ -1942,14 +1961,15 @@ export component AppWindow inherits Window {
                                 height: 38px;
                                 border-radius: 8px;
                                 background: eta.has-hover ? Theme.hover : transparent;
-                                Text { text: e; font-size: 22px; }
+                                if e.picture.width > 0: Image { source: e.picture; width: 26px; height: 26px; }
+                                if e.picture.width == 0: Text { text: e.symbol; font-size: 22px; }
                                 eta := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => {
                                         if root.emoji-for == "" {
-                                            root.draft = root.draft + e;
+                                            root.draft = root.draft + e.symbol;
                                         } else {
-                                            root.message-action("react:" + e, root.emoji-for);
+                                            root.message-action("react:" + e.symbol, root.emoji-for);
                                             root.emoji-open = false;
                                         }
                                     }

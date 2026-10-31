@@ -1,6 +1,35 @@
 //! The emoji offered by the picker, with words to search them by. A short,
 //! hand-picked list (the everyday ones) rather than all of Unicode.
 
+mod pictures {
+    include!(concat!(env!("OUT_DIR"), "/emoji_pictures.rs"));
+}
+
+/// The bundled picture (72×72 PNG, Noto Emoji) for an emoji, if there is one.
+pub fn picture(emoji: &str) -> Option<&'static [u8]> {
+    let stem = format!("emoji_u{}", emoji.chars().filter(|c| *c != '\u{fe0f}').map(|c| format!("{:x}", c as u32)).collect::<Vec<_>>().join("_"));
+    pictures::PICTURES.binary_search_by(|(n, _)| (*n).cmp(stem.as_str())).ok().map(|i| pictures::PICTURES[i].1)
+}
+
+/// The emoji in `text` when it's nothing but (at most `max`) emoji we have
+/// pictures for, so the message can show them big.
+pub fn only_emoji(text: &str, max: usize) -> Option<Vec<&'static str>> {
+    let mut rest = text.trim();
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        // The longest known emoji at the start (sequences before their parts).
+        let e = ALL.iter().map(|(e, _)| *e).filter(|e| rest.starts_with(*e) || rest.starts_with(e.trim_end_matches('\u{fe0f}'))).max_by_key(|e| e.len())?;
+        let len = if rest.starts_with(e) { e.len() } else { e.trim_end_matches('\u{fe0f}').len() };
+        picture(e)?;
+        out.push(e);
+        rest = rest[len..].trim_start_matches('\u{fe0f}').trim_start();
+        if out.len() > max {
+            return None;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// Shown first when reacting from a message's menu.
 pub const QUICK: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🎉"];
 
@@ -602,6 +631,27 @@ mod tests {
         assert_eq!(replace_shortcodes("time 10:30:00 :nope: a:b"), "time 10:30:00 :nope: a:b");
         assert_eq!(replace_shortcodes("```\n:smile:\n```\n:smile:"), "```\n:smile:\n```\n😄");
         assert_eq!(replace_open_shortcodes("nice :smile and :tada: :zzzq"), "nice 😄 and 🎉 :zzzq");
+    }
+
+    #[test]
+    fn every_emoji_has_a_picture() {
+        let missing: Vec<&str> = ALL.iter().map(|(e, _)| *e).filter(|e| picture(e).is_none()).collect();
+        assert!(missing.is_empty(), "no picture for {missing:?}");
+        assert!(picture("a").is_none());
+        for (_, png) in pictures::PICTURES {
+            assert!(png.starts_with(b"\x89PNG"));
+        }
+    }
+
+    #[test]
+    fn emoji_only_messages() {
+        assert_eq!(only_emoji(" 😀😂 ", 8), Some(vec!["😀", "😂"]));
+        assert_eq!(only_emoji("❤️ 👍", 8), Some(vec!["❤️", "👍"]));
+        assert_eq!(only_emoji("❤", 8), Some(vec!["❤️"]));
+        assert_eq!(only_emoji("🧑‍💻", 8), Some(vec!["🧑‍💻"]));
+        assert_eq!(only_emoji("hi 😀", 8), None);
+        assert_eq!(only_emoji("", 8), None);
+        assert_eq!(only_emoji("😀😀😀", 2), None);
     }
 
     #[test]

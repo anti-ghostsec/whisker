@@ -51,8 +51,10 @@ operating system and the **Wisp** browser.
   Shift+Enter adds a line); and an **attach** button for images and files (up to 100 MB).
 - **Emoji and reactions.** The ☺ button next to Send opens a searchable emoji picker.
   Reactions show under messages with a count (hover to see who); click one to add or take
-  back your own, or right-click a message → *React*. Emoji need an emoji font on your
-  system (on Debian/Ubuntu: `fonts-noto-color-emoji`), or they show as boxes.
+  back your own, or right-click a message → *React*. The picker, reactions, suggestions and
+  messages that are only emoji use colour pictures built into Whisker (Noto Emoji, see
+  `apps/whisker/assets/emoji`); emoji inside ordinary text come from your system's fonts
+  (on Debian/Ubuntu install `fonts-noto-color-emoji` for those).
 - **Forward** any message from its right-click menu to one or more of your rooms. Images
   and files are re-posted as the same file (nothing is downloaded or uploaded again);
   replies lose their reply link. Forwarding from an encrypted room into an unencrypted

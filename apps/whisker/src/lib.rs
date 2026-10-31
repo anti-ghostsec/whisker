@@ -2185,19 +2185,32 @@ impl Ctl {
             return;
         }
         self.st.lock().unwrap().draft = text.clone();
-        let mut out: Vec<Suggestion> = Vec::new();
+        // (label, detail, insert, kind); built into Slint rows on the UI thread.
+        let mut out: Vec<(String, String, String, i32)> = Vec::new();
         if let Some(q) = word.strip_prefix('@').filter(|q| !q.is_empty()) {
             if let Some((key, room)) = self.current_room().await {
                 for (user, name) in best_members(&self.members(&key, &room).await, q).into_iter().take(6) {
-                    out.push(Suggestion { label: s(&name), detail: s(user.as_str()), insert: s(&name), kind: 0 });
+                    out.push((name.clone(), user.to_string(), name, 0));
                 }
             }
         } else if let Some(q) = word.strip_prefix(':').filter(|q| !q.is_empty() && !q.contains(':')) {
             for e in emoji::suggest(q).into_iter().take(8) {
-                out.push(Suggestion { label: s(e), detail: s(format!(":{}:", emoji::name_of(e))), insert: s(e), kind: 1 });
+                out.push((e.to_owned(), format!(":{}:", emoji::name_of(e)), e.to_owned(), 1));
             }
         }
-        self.ui(move |u| u.set_suggestions(ModelRc::new(VecModel::from(out))));
+        self.ui(move |u| {
+            let rows: Vec<Suggestion> = out
+                .iter()
+                .map(|(label, detail, insert, kind)| Suggestion {
+                    picture: if *kind == 1 { ui::emoji_image(label) } else { Image::default() },
+                    label: s(label),
+                    detail: s(detail),
+                    insert: s(insert),
+                    kind: *kind,
+                })
+                .collect();
+            u.set_suggestions(ModelRc::new(VecModel::from(rows)));
+        });
         self.composing(text.is_empty()).await;
     }
 
@@ -3131,7 +3144,10 @@ fn safe_file_name(name: &str) -> String {
 
 /// Emoji in rows of eight, for the picker grid.
 fn emoji_rows(list: &[&str]) -> ModelRc<EmojiRow> {
-    let rows: Vec<EmojiRow> = list.chunks(8).map(|c| EmojiRow { items: ModelRc::new(VecModel::from(c.iter().map(s).collect::<Vec<_>>())) }).collect();
+    let rows: Vec<EmojiRow> = list
+        .chunks(8)
+        .map(|c| EmojiRow { items: ModelRc::new(VecModel::from(c.iter().map(|e| EmojiCell { symbol: s(e), picture: ui::emoji_image(e) }).collect::<Vec<_>>())) })
+        .collect();
     ModelRc::new(VecModel::from(rows))
 }
 

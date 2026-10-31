@@ -157,6 +157,29 @@ pub fn initial_hue(name: &str) -> (SharedString, i32) {
 }
 
 thread_local! {
+    static EMOJI: RefCell<HashMap<String, Image>> = RefCell::new(HashMap::new());
+}
+
+/// The colour picture for an emoji (decoded once), or an empty image when
+/// there's none (the UI then falls back to the font).
+pub fn emoji_image(emoji: &str) -> Image {
+    EMOJI.with(|c| {
+        if let Some(i) = c.borrow().get(emoji) {
+            return i.clone();
+        }
+        let img = crate::emoji::picture(emoji)
+            .and_then(|png| image::load_from_memory(png).ok())
+            .map(|i| {
+                let i = i.to_rgba8();
+                Image::from_rgba8(Pixels::clone_from_slice(i.as_raw(), i.width(), i.height()))
+            })
+            .unwrap_or_default();
+        c.borrow_mut().insert(emoji.to_owned(), img.clone());
+        img
+    })
+}
+
+thread_local! {
     /// Rich text (styled, not selectable) instead of selectable plain text.
     pub static RICH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -293,7 +316,7 @@ impl Models {
             thread_replies: r.thread.as_ref().map_or(0, |t| t.0 as i32),
             thread_last: s(r.thread.as_ref().map(|t| t.1.as_str()).unwrap_or_default()),
             reactions: ModelRc::new(VecModel::from(
-                r.reactions.iter().map(|(key, n, mine, who)| ReactionChip { key: s(key), count: *n as i32, mine: *mine, who: s(who) }).collect::<Vec<_>>(),
+                r.reactions.iter().map(|(key, n, mine, who)| ReactionChip { key: s(key), count: *n as i32, mine: *mine, who: s(who), picture: emoji_image(key) }).collect::<Vec<_>>(),
             )),
             mine: r.mine,
             time: if local { s("Sending…") } else { s(crate::fmt_time(r.item.ts)) },
@@ -314,6 +337,14 @@ impl Models {
                 r.frames.as_ref().map(|f| f.0.iter().map(|p| Image::from_rgba8(p.clone())).collect::<Vec<_>>()).unwrap_or_default(),
             )),
             frame_ms: r.frames.as_ref().map_or(0, |f| f.1 as i32),
+            // A message of only a few emoji shows them as big pictures.
+            big_emoji: ModelRc::new(VecModel::from(
+                (r.item.media.is_none() && !r.item.notice)
+                    .then(|| crate::emoji::only_emoji(&r.item.body, 10))
+                    .flatten()
+                    .map(|list| list.iter().map(|e| emoji_image(e)).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )),
             picture_width: pw,
             picture_height: ph,
         }

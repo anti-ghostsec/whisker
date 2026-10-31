@@ -1,6 +1,9 @@
 import { ListView, ScrollView, Palette, TextEdit, Switch, ComboBox } from "std-widgets.slint";
 import { Theme, Prefs, Avatar, Btn, IconBtn, Input, Pill } from "theme.slint";
 import { SettingsPage, AccountForm, AgentForm, NavItem } from "settings.slint";
+// Colour emoji for all text (a trimmed Noto Color Emoji: no letters, digits
+// or spaces, so text still comes from the normal fonts). See assets/fonts.
+import "../assets/fonts/WhiskerEmoji.ttf";
 
 export { AccountForm, AgentForm, NavItem, Prefs }
 
@@ -849,6 +852,9 @@ component LoginDialog inherits Overlay {
 
 export component AppWindow inherits Window {
     title: "Whisker";
+    // Emoji first: otherwise a text font with plain black-and-white emoji
+    // shapes (DejaVu Sans has some) wins over the colour emoji font.
+    default-font-family: "Whisker Emoji";
     preferred-width: 1100px;
     preferred-height: 720px;
     min-width: 320px;

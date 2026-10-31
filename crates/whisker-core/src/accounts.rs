@@ -7,7 +7,7 @@
 
 use crate::events::ClientEvent;
 use crate::profile::{AccountId, AccountKind, AccountRecord, Profile, normalize_tag};
-use crate::vault::{Vault, VaultError, random_secret};
+use crate::vault::{self, Vault, VaultError, random_secret};
 use anyhow::{Context, Result, anyhow, bail};
 use matrix_sdk::config::SyncSettings;
 use crate::timeline::{self, HistoryItem};
@@ -101,8 +101,20 @@ pub struct LoginRequest<'a> {
 impl AccountManager {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         let (events, _) = broadcast::channel(1024);
+        let data_dir: PathBuf = data_dir.into();
+        // Owner-only, including folders and files made by older versions.
+        for d in [data_dir.clone(), data_dir.join("vaults"), data_dir.join("stores")] {
+            if d.is_dir() {
+                vault::owner_only(&d, true);
+            }
+        }
+        for sub in ["vaults", "stores"] {
+            for e in std::fs::read_dir(data_dir.join(sub)).into_iter().flatten().flatten() {
+                vault::owner_only(&e.path(), e.path().is_dir());
+            }
+        }
         Self {
-            data_dir: data_dir.into(),
+            data_dir,
             inner: Arc::default(),
             latest: Arc::default(),
             events,
@@ -128,7 +140,37 @@ impl AccountManager {
     }
 
     fn store_dir(&self, id: AccountId) -> PathBuf {
-        self.data_dir.join("stores").join(id.to_string())
+        let stores = self.data_dir.join("stores");
+        let _ = std::fs::create_dir_all(&stores);
+        vault::owner_only(&self.data_dir, true);
+        vault::owner_only(&stores, true);
+        stores.join(id.to_string())
+    }
+
+    /// Adds `n` decoy vault files (see [`vault::write_decoy`]).
+    fn add_decoys(dir: &Path, n: u8) -> Result<(), VaultError> {
+        for _ in 0..n {
+            vault::write_decoy(&dir.join(format!("{}.vault", &random_secret()[..16])))?;
+        }
+        Ok(())
+    }
+
+    /// Keeps the decoy count unpredictable: tops a folder up to at least a
+    /// few files (first run, or an install from before decoys), and now and
+    /// then adds one more, so files don't only appear when a vault is made.
+    fn stir_decoys(dir: &Path, created_vault: bool) -> Result<(), VaultError> {
+        let count = std::fs::read_dir(dir)?.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "vault")).count();
+        let r = random_byte();
+        let n = if count < 4 {
+            4 + r % 5 - count as u8
+        } else if created_vault {
+            1 + r % 2
+        } else if r.is_multiple_of(10) && count < 32 {
+            1
+        } else {
+            0
+        };
+        Self::add_decoys(dir, n)
     }
 
     /// True if no vault exists yet (first run).
@@ -145,8 +187,9 @@ impl AccountManager {
         let pass = passphrase.to_owned();
         let profile = Profile::default();
         let vault = tokio::task::spawn_blocking(move || -> Result<Vault, VaultError> {
-            let v = Vault::create(path, &pass)?;
+            let v = Vault::create(&path, &pass)?;
             v.save(&Profile::default())?;
+            Self::stir_decoys(path.parent().unwrap(), true)?;
             Ok(v)
         })
         .await??;
@@ -173,18 +216,46 @@ impl AccountManager {
         }
 
         let pass = passphrase.to_owned();
+        let dir = self.vaults_dir();
         let opened = tokio::task::spawn_blocking(move || {
-            files
-                .into_iter()
-                .filter_map(|(id, p)| match Vault::open::<Profile>(p, &pass) {
-                    Ok((v, prof)) => Some((id, v, prof)),
-                    Err(VaultError::Decrypt) => None,
-                    Err(e) => {
-                        tracing::warn!("skipping vault {id}: {e}");
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
+            // Every file is tried (decoys included), a few at once: 64 MiB each.
+            let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
+            let chunk = files.len().div_ceil(threads).max(1);
+            let opened: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = files
+                    .chunks(chunk)
+                    .map(|part| {
+                        let pass = &pass;
+                        s.spawn(move || {
+                            part.iter()
+                                .filter_map(|(id, p)| match Vault::open::<Profile>(p, pass) {
+                                    Ok((v, prof)) => Some((id.clone(), p.clone(), v, prof)),
+                                    Err(VaultError::Decrypt) => None,
+                                    Err(e) => {
+                                        tracing::warn!("skipping vault {id}: {e}");
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+            });
+            // Bring vaults from before padding to the common size.
+            for (_, p, v, prof) in &opened {
+                if std::fs::metadata(p).is_ok_and(|m| (m.len() as usize) < vault::padded_len(0))
+                    && let Err(e) = v.save(prof)
+                {
+                    tracing::warn!("could not re-pad vault: {e}");
+                }
+            }
+            if !opened.is_empty()
+                && let Err(e) = Self::stir_decoys(&dir, false)
+            {
+                tracing::warn!("could not add decoy: {e}");
+            }
+            opened.into_iter().map(|(id, _, v, prof)| (id, v, prof)).collect::<Vec<_>>()
         })
         .await?;
 
@@ -821,4 +892,10 @@ async fn discover(record: &AccountRecord) -> Option<String> {
     let v: serde_json::Value = http.build().ok()?.get(url).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
     let base = v.get("m.homeserver")?.get("base_url")?.as_str()?.trim_end_matches('/');
     base.starts_with("http").then(|| base.to_owned())
+}
+
+fn random_byte() -> u8 {
+    let mut b = [0u8; 1];
+    let _ = getrandom::fill(&mut b);
+    b[0]
 }

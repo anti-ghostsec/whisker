@@ -4,6 +4,12 @@
 //!
 //! Format: `MAGIC | salt(16) | m_cost(u32 le) | t_cost(u32 le) | nonce(24) | ciphertext`.
 //! The header is authenticated as AAD, so the KDF cost can't be lowered.
+//!
+//! Hidden vaults only stay hidden if nothing on disk tells vaults apart or
+//! counts them. So every vault is padded to the same size, the folder also
+//! holds decoy files ([`write_decoy`]) that look exactly like vaults, and
+//! after any write every file in the folder is rewritten (same bytes) with
+//! the same timestamps ([`blend`]), so nothing shows which one changed.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -17,6 +23,11 @@ const HEADER_LEN: usize = 8 + 16 + 4 + 4 + 24;
 /// 64 MiB, 3 passes: the same cost Enclave uses.
 const M_COST: u32 = 64 * 1024;
 const T_COST: u32 = 3;
+/// Plaintext is padded to a multiple of this, so vaults (and decoys) are
+/// all the same size unless one holds an unusual amount of data.
+const PAD: usize = 64 * 1024;
+/// Every vault file's timestamps are set to this (2020-01-01 UTC).
+const FIXED_TIME_SECS: u64 = 1_577_836_800;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
@@ -88,7 +99,10 @@ impl Vault {
 
     /// Encrypts `value` and atomically replaces the vault file.
     pub fn save<T: Serialize>(&self, value: &T) -> Result<(), VaultError> {
-        let plain = Zeroizing::new(serde_json::to_vec(value)?);
+        let mut plain = Zeroizing::new(serde_json::to_vec(value)?);
+        // Trailing spaces are valid JSON whitespace, so padding needs no format change.
+        let padded = plain.len().div_ceil(PAD).max(1) * PAD;
+        plain.resize(padded, b' ');
         let mut nonce = [0u8; 24];
         getrandom::fill(&mut nonce).map_err(|e| VaultError::Kdf(e.to_string()))?;
 
@@ -105,12 +119,10 @@ impl Vault {
             .map_err(|_| VaultError::Decrypt)?;
         out.extend_from_slice(&ct);
 
+        replace(&self.path, &out)?;
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
+            blend(dir)?;
         }
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &out)?;
-        std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
 
@@ -124,6 +136,87 @@ impl Vault {
         self.key = derive(new_passphrase, &self.salt, self.m_cost, self.t_cost)?;
         self.save(value)
     }
+}
+
+/// Size of a vault file whose JSON is `plain_len` bytes.
+pub fn padded_len(plain_len: usize) -> usize {
+    HEADER_LEN + plain_len.div_ceil(PAD).max(1) * PAD + 16
+}
+
+/// Writes a decoy: a file shaped exactly like a vault (same header, KDF
+/// cost and padded size) whose contents are random, so no passphrase opens
+/// it and nothing distinguishes it from a real vault.
+pub fn write_decoy(path: &Path) -> Result<(), VaultError> {
+    let mut out = Vec::with_capacity(HEADER_LEN + PAD + 16);
+    out.extend_from_slice(MAGIC);
+    let mut salt = [0u8; 16];
+    let mut nonce = [0u8; 24];
+    let mut body = vec![0u8; PAD + 16];
+    for b in [&mut salt[..], &mut nonce[..], &mut body[..]] {
+        getrandom::fill(b).map_err(|e| VaultError::Kdf(e.to_string()))?;
+    }
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&M_COST.to_le_bytes());
+    out.extend_from_slice(&T_COST.to_le_bytes());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&body);
+    replace(path, &out)?;
+    if let Some(dir) = path.parent() {
+        blend(dir)?;
+    }
+    Ok(())
+}
+
+/// Makes every vault file in `dir` look equally fresh: each is rewritten
+/// with its own bytes (new inode and creation time, like a saved vault),
+/// made owner-only, and given the same fixed timestamps. Locked vaults are
+/// only copied, never changed.
+pub fn blend(dir: &Path) -> Result<(), VaultError> {
+    let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(FIXED_TIME_SECS);
+    let times = std::fs::FileTimes::new().set_accessed(fixed).set_modified(fixed);
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "vault") {
+            let bytes = std::fs::read(&p)?;
+            replace(&p, &bytes)?;
+            std::fs::OpenOptions::new().write(true).open(&p)?.set_times(times)?;
+        }
+    }
+    owner_only(dir, true);
+    Ok(())
+}
+
+/// Atomically replaces `path` with `bytes`, readable only by the owner.
+fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        owner_only(dir, true);
+    }
+    let tmp = path.with_extension("tmp");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(&tmp)?;
+    // `mode` only applies when the file is new; a leftover tmp keeps its old bits.
+    owner_only(&tmp, false);
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)
+}
+
+/// Unix: 0700 for folders, 0600 for files. Elsewhere the per-user profile
+/// folder's own access control applies.
+pub fn owner_only(path: &Path, dir: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(if dir { 0o700 } else { 0o600 }));
+    }
+    #[cfg(not(unix))]
+    let _ = (path, dir);
 }
 
 fn derive(
@@ -164,6 +257,29 @@ mod tests {
             Vault::open::<Vec<String>>(&path, "wrong").err().unwrap(),
             VaultError::Decrypt
         ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn vaults_and_decoys_look_alike() {
+        let dir = std::env::temp_dir().join(format!("whisker-vault-{}", random_secret()));
+        let real = dir.join("a.vault");
+        Vault::create(&real, "pw").unwrap().save(&vec!["one account".to_string()]).unwrap();
+        write_decoy(&dir.join("b.vault")).unwrap();
+        Vault::create(dir.join("c.vault"), "other").unwrap().save(&Vec::<String>::new()).unwrap();
+
+        let meta: Vec<_> = ["a", "b", "c"].iter().map(|n| std::fs::metadata(dir.join(format!("{n}.vault"))).unwrap()).collect();
+        for m in &meta {
+            assert_eq!(m.len(), meta[0].len(), "sizes differ");
+            assert_eq!(m.modified().unwrap(), meta[0].modified().unwrap(), "mtimes differ");
+            #[cfg(unix)]
+            assert_eq!(std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777, 0o600);
+        }
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&dir).unwrap().permissions()) & 0o777, 0o700);
+        // Blending rewrote the other files without changing them.
+        assert_eq!(Vault::open::<Vec<String>>(&real, "pw").unwrap().1, vec!["one account"]);
+        assert!(matches!(Vault::open::<Vec<String>>(dir.join("b.vault"), "pw").err().unwrap(), VaultError::Decrypt));
         std::fs::remove_dir_all(dir).ok();
     }
 

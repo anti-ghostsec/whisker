@@ -707,6 +707,17 @@ impl Ctl {
             return self.show_messages().await;
         }
         self.ui(|u| u.set_current_invite(false));
+        // Encrypted rooms need the full member list before the first send;
+        // fetch it now so pressing Enter doesn't wait for it.
+        if room.encryption_state().is_encrypted() {
+            let r = room.clone();
+            tokio::spawn(async move {
+                let started = Instant::now();
+                if r.sync_members().await.is_ok() {
+                    tracing::debug!(room = %r.room_id(), ms = started.elapsed().as_millis() as u64, "members fetched ahead of sending");
+                }
+            });
+        }
         {
             let mut st = self.st.lock().unwrap();
             st.room = Some(room_id.clone());
@@ -1220,7 +1231,7 @@ impl Ctl {
         if text.is_empty() {
             return;
         }
-        let Some((_, room)) = self.current_room().await else { return };
+        let Some((key, room)) = self.current_room().await else { return };
         let (reply_to, editing) = {
             let mut st = self.st.lock().unwrap();
             (st.reply_to.take(), st.editing.take())
@@ -1247,9 +1258,83 @@ impl Ctl {
             }
             return;
         }
-        if let Err(e) = timeline::send_text(&room, &text, reply_to.as_deref()).await {
-            self.status(format!("Not sent: {e:#}"));
+        // Show it straight away (dimmed), then swap in the server's copy.
+        let me = room.own_user_id().to_owned();
+        let account = self.mgr.accounts().await.into_iter().find(|a| a.id == key.0);
+        let local = OwnedEventId::try_from(format!("{}{}", timeline::LOCAL_ECHO, &whisker_core::vault::random_secret()[..12]))
+            .expect("valid local event id");
+        let item = HistoryItem {
+            event_id: local.clone(),
+            sender: me,
+            sender_name: account.as_ref().and_then(|a| a.profile_name.clone()),
+            sender_avatar: account.and_then(|a| a.avatar),
+            body: text.clone(),
+            ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch::now(),
+            reply_to: reply_to.clone(),
+            media: None,
+            edited: false,
+        };
+        self.merge(&key, vec![item]);
+        self.ui(|u| u.set_stick_bottom(true));
+        self.append_last(&key).await;
+
+        match timeline::send_text(&room, &text, reply_to.as_deref()).await {
+            Ok(real) => self.settle_echo(&key, &local, Some(real)).await,
+            Err(e) => {
+                self.settle_echo(&key, &local, None).await;
+                self.status(format!("Not sent: {e:#}"));
+                // Give the text back so nothing is lost.
+                self.ui(move |u| {
+                    if u.get_draft().is_empty() {
+                        u.set_draft(s(text));
+                    }
+                });
+            }
         }
+    }
+
+    /// Replaces a locally shown message with the server's copy (`real`), or
+    /// drops it (`None`: sending failed, or the copy arrived through sync first).
+    async fn settle_echo(&self, key: &RoomKey, local: &OwnedEventId, real: Option<OwnedEventId>) {
+        let keep = {
+            let mut st = self.st.lock().unwrap();
+            let Some(list) = st.messages.get_mut(key) else { return };
+            let synced = real.as_ref().is_some_and(|r| list.iter().any(|m| &m.event_id == r));
+            match (real, synced) {
+                (Some(real), false) => {
+                    if let Some(m) = list.iter_mut().find(|m| &m.event_id == local) {
+                        m.event_id = real.clone();
+                    }
+                    Some(real)
+                }
+                _ => {
+                    list.retain(|m| &m.event_id != local);
+                    None
+                }
+            }
+        };
+        if self.current().as_ref() != Some(key) {
+            return;
+        }
+        let row = match &keep {
+            Some(real) => self.rows(key).await.into_iter().find(|r| &r.item.event_id == real),
+            None => None,
+        };
+        let (px, local) = (self.avatars.clone(), local.to_string());
+        self.ui(move |_| {
+            ui::with(|m| {
+                let Some(i) = ui::index_of(&m.messages, &local) else { return };
+                match &row {
+                    Some(r) => {
+                        let item = m.message(r, &px);
+                        m.messages.set_row_data(i, item);
+                    }
+                    None => {
+                        m.messages.remove(i);
+                    }
+                }
+            });
+        });
     }
 
     async fn attach(&self) {

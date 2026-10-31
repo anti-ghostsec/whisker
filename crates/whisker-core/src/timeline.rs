@@ -302,7 +302,11 @@ pub async fn thumbnail(client: &Client, mxc: &MxcUri, size: u32) -> Result<Vec<u
 }
 
 /// Sends Markdown text, optionally as a reply.
-pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>) -> Result<()> {
+/// Prefix of the ids we give messages shown before the server has them.
+pub const LOCAL_ECHO: &str = "$whisker-local-";
+
+/// Sends a message and returns the id the server gave it.
+pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>) -> Result<OwnedEventId> {
     let content = RoomMessageEventContentWithoutRelation::text_markdown(text);
     let content = match reply_to {
         Some(id) => room
@@ -311,8 +315,14 @@ pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>) -> R
             .map_err(|e| anyhow!("couldn't build the reply: {e}"))?,
         None => content.with_relation(None),
     };
-    room.send(content).await?;
-    Ok(())
+    let started = std::time::Instant::now();
+    // The SDK retries failed requests forever by default; give up instead,
+    // so the message isn't stuck at "Sending…" (retries reuse the
+    // transaction id, so they can't post it twice).
+    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
+    let sent = room.send(content).with_request_config(config).await?;
+    tracing::debug!(room = %room.room_id(), ms = started.elapsed().as_millis() as u64, "message sent (incl. encryption setup)");
+    Ok(sent.response.event_id)
 }
 
 /// Replaces the text of one of our own messages.

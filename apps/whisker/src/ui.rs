@@ -159,6 +159,8 @@ impl Models {
     pub fn message(&mut self, r: &MsgRow, pixels: &PixelCache) -> MessageItem {
         let name = r.item.sender_label().to_owned();
         let (initial, hue) = initial_hue(&name);
+        // Shown before the server has it (see `Ctl::send`).
+        let local = r.item.event_id.as_str().starts_with(whisker_core::timeline::LOCAL_ECHO);
         let (media, media_name, media_info, (pw, ph)) = match &r.item.media {
             Some(m) => (
                 match m.kind {
@@ -182,13 +184,13 @@ impl Models {
             blocks: blocks(&r.item.body),
             links: ModelRc::new(VecModel::from(format::links(&r.item.body).iter().map(s).collect::<Vec<_>>())),
             mine: r.mine,
-            time: s(crate::fmt_time(r.item.ts)),
+            time: if local { s("Sending…") } else { s(crate::fmt_time(r.item.ts)) },
             initial,
             hue,
             avatar: self.avatar(&r.item.sender_avatar, pixels),
             first: r.first,
             day: s(&r.day),
-            faint: r.item.body == UNDECRYPTABLE,
+            faint: local || r.item.body == UNDECRYPTABLE,
             edited: r.item.edited,
             reply_name: s(reply_name),
             reply_text: s(reply_text),

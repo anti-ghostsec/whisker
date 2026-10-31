@@ -35,7 +35,7 @@ impl Theme {
 /// Choices offered by the auto-lock dropdown, in minutes (0 = never).
 pub const AUTO_LOCK_MINUTES: [u64; 4] = [0, 5, 15, 60];
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
     pub theme: Theme,
@@ -47,6 +47,22 @@ pub struct AppSettings {
     /// Show joins, leaves, renames and other room events in the timeline.
     #[serde(default)]
     pub show_events: bool,
+    /// Notifications: 0 off, 1 just "New message", 2 sender and room, 3 with text.
+    #[serde(default = "two")]
+    pub notify_level: i32,
+    /// Tell others when you're typing (off: it's metadata the server sees).
+    #[serde(default)]
+    pub send_typing: bool,
+}
+
+fn two() -> i32 {
+    2
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("defaults")
+    }
 }
 
 impl AppSettings {
@@ -87,7 +103,7 @@ Between you and the server
 Rooms without it (most public rooms) can be read by every server in them.
 • Servers always see metadata: which rooms you're in, who you talk to and when, display names \
 and avatars.
-• Whisker doesn't send read receipts or typing notifications.
+• Whisker doesn't send public read receipts, and sends typing notifications only if you turn them on.
 • Devices aren't verified yet, so other people see your Whisker login as an unverified device.
 
 AI accounts

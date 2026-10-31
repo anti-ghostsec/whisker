@@ -8431,6 +8431,7 @@ dependencies = [
  "tracing-subscriber",
  "whisker-agent",
  "whisker-core",
+ "zbus",
 ]
 
 [[package]]

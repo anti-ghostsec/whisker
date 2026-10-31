@@ -4,13 +4,15 @@
 
 mod agent_form;
 mod emoji;
+mod notify;
 mod format;
 mod settings;
+mod spaces;
 mod ui;
 
 use anyhow::Result;
 use matrix_sdk::ruma::events::room::MediaSource;
-use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId};
+use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, UInt};
 use settings::{AUTO_LOCK_MINUTES, AppSettings, ENCRYPTION_SUMMARY, Theme};
 use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel, Weak};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -54,6 +56,24 @@ struct State {
     refresh_pending: bool,
     synced: HashSet<AccountId>,
     detected: HashMap<AccountId, Detected>,
+    /// The last notification shown per room, so a new one replaces it.
+    notified: HashMap<RoomKey, (u32, Instant)>,
+    /// Who's typing, per room.
+    typing: HashMap<RoomKey, Vec<OwnedUserId>>,
+    /// When we last told the server we're typing (it times out after a few seconds).
+    typing_sent: Option<(RoomKey, Instant)>,
+    /// Room members for @-suggestions: (when fetched, (user, name)).
+    members_cache: HashMap<RoomKey, (Instant, Vec<(OwnedUserId, String)>)>,
+    /// The draft as last typed, and the people picked from @-suggestions.
+    draft: String,
+    mentions: Vec<(String, OwnedUserId)>,
+    /// You picked the account yourself (so it isn't switched for you when
+    /// the top account finishes loading after unlock).
+    account_chosen: bool,
+    /// The thread open in the side panel (its first message), in the open room.
+    thread: Option<OwnedEventId>,
+    /// Spaces shown folded (their rooms hidden), per account.
+    closed_spaces: HashSet<OwnedRoomId>,
     /// Character cards imported (or removed: `None`) on an AI's settings
     /// page but not saved yet, with their PNG picture.
     pending_cards: HashMap<AccountId, Option<CardAndPicture>>,
@@ -146,11 +166,34 @@ fn open_link(url: &str) {
     }
 }
 
+/// Where played videos and audio go: the RAM folder, wiped on lock and quit.
+fn media_dir(data_dir: &std::path::Path) -> PathBuf {
+    whisker_core::stores::runtime_root(data_dir).join("media")
+}
+
+/// Opens a downloaded file in the app the system picks for it.
+fn open_file(path: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    let r = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    let r: std::io::Result<()> = Ok(());
+    if let Err(e) = r {
+        tracing::warn!("couldn't open the file: {e}");
+    }
+}
+
 struct AccountRow {
     a: AccountSummary,
     unread: u64,
 }
 struct RoomRowData {
+    depth: usize,
+    space: bool,
+    open: bool,
     pinned: bool,
     id: String,
     name: String,
@@ -352,6 +395,7 @@ impl Ctl {
             a.abort();
         }
         self.mgr.lock_all().await;
+        let _ = std::fs::remove_dir_all(media_dir(self.mgr.data_dir()));
         *self.st.lock().unwrap() = State::default();
         self.avatars.lock().unwrap().clear();
         self.ui(|u| {
@@ -383,7 +427,10 @@ impl Ctl {
 
         let current = {
             let mut st = self.st.lock().unwrap();
-            if st.account.is_none_or(|a| !list.iter().any(|x| x.id == a)) {
+            // Accounts come online one by one after unlock: until you pick
+            // one, show the top one, even if another was ready first.
+            let auto = !st.account_chosen && st.room.is_none() && list.first().map(|a| a.id) != st.account;
+            if auto || st.account.is_none_or(|a| !list.iter().any(|x| x.id == a)) {
                 st.account = list.first().map(|a| a.id);
                 st.room = None;
             }
@@ -473,10 +520,30 @@ impl Ctl {
             st.cleared.retain(|(a, r), n| *a != account || rooms.iter().any(|x| &x.room_id == r && x.unread == *n));
             st.cleared.clone()
         };
-        let rows: Vec<RoomRowData> = rooms
-            .iter()
-            .filter(|r| search.is_empty() || r.name.to_lowercase().contains(&search))
-            .map(|r| {
+        let closed = self.st.lock().unwrap().closed_spaces.clone();
+        let rows: Vec<RoomRowData> = spaces::tree(&rooms, &closed, &search)
+            .into_iter()
+            .map(|line| {
+                let r = line.room;
+                if r.is_space {
+                    return RoomRowData {
+                        depth: line.depth,
+                        space: true,
+                        open: line.open,
+                        pinned: r.pinned,
+                        id: r.room_id.to_string(),
+                        name: r.name.clone(),
+                        invite: false,
+                        avatar: r.avatar.clone(),
+                        preview: match line.rooms {
+                            1 => "1 room".into(),
+                            n => format!("{n} rooms"),
+                        },
+                        time: String::new(),
+                        unread: line.unread,
+                        encrypted: false,
+                    };
+                }
                 let preview = r
                     .latest
                     .as_ref()
@@ -490,6 +557,9 @@ impl Ctl {
                     .unwrap_or_else(|| if r.encrypted { "Encrypted room".into() } else { String::new() });
                 let read = room.as_ref() == Some(&r.room_id) || cleared.contains_key(&(account, r.room_id.clone()));
                 RoomRowData {
+                    depth: line.depth,
+                    space: false,
+                    open: false,
                     pinned: r.pinned,
                     id: r.room_id.to_string(),
                     name: r.name.clone(),
@@ -525,6 +595,9 @@ impl Ctl {
                             unread: r.unread.min(999) as i32,
                             encrypted: r.encrypted,
                             pinned: r.pinned,
+                            depth: r.depth as i32,
+                            space: r.space,
+                            open: r.open,
                         }
                     })
                     .collect();
@@ -540,8 +613,15 @@ impl Ctl {
 
     // ---- messages ----
 
-    /// Builds display rows for a room's cached messages.
+    /// Builds display rows for a room's cached messages (thread replies
+    /// left out: they show in the thread panel).
     async fn rows(&self, key: &RoomKey) -> Vec<MsgRow> {
+        self.rows_for(key, None).await
+    }
+
+    /// Rows for the main timeline (`thread` None) or for one thread: its
+    /// first message and the replies.
+    async fn rows_for(&self, key: &RoomKey, thread: Option<&OwnedEventId>) -> Vec<MsgRow> {
         let client = self.mgr.client(key.0).await;
         let me: Option<OwnedUserId> = client.as_ref().and_then(|c| c.user_id().map(ToOwned::to_owned));
         let marks = match client.and_then(|c| c.get_room(&key.1)) {
@@ -551,6 +631,19 @@ impl Ctl {
         let show_events = self.settings.lock().unwrap().show_events;
         let st = self.st.lock().unwrap();
         let mut msgs = st.messages.get(key).cloned().unwrap_or_default();
+        // Thread replies: how many each thread has, and the newest.
+        let mut threads: HashMap<OwnedEventId, (usize, String)> = HashMap::new();
+        for m in &msgs {
+            if let Some(root) = &m.thread {
+                let t = threads.entry(root.clone()).or_default();
+                t.0 += 1;
+                t.1 = format!("{}: {}", m.sender_label(), m.body.lines().find(|l| !l.trim().is_empty()).unwrap_or_default());
+            }
+        }
+        match thread {
+            None => msgs.retain(|m| m.thread.is_none()),
+            Some(root) => msgs.retain(|m| &m.event_id == root || m.thread.as_ref() == Some(root)),
+        }
         drop_repeat_joins(&mut msgs);
         if !show_events {
             msgs.retain(|m| !m.notice);
@@ -610,6 +703,7 @@ impl Ctl {
                     reply,
                     readers: readers.remove(&i).unwrap_or_default(),
                     reactions: reactions.remove(&m.event_id).unwrap_or_default(),
+                    thread: if thread.is_none() { threads.remove(&m.event_id) } else { None },
                     item: m.clone(),
                 }
             })
@@ -664,6 +758,7 @@ impl Ctl {
             if c.current().as_ref() != Some(&key) {
                 return;
             }
+            c.show_thread().await;
             let rows = c.rows(&key).await;
             let Some(row) = rows.into_iter().find(|r| r.item.event_id == id) else { return };
             let px = c.avatars.clone();
@@ -707,6 +802,7 @@ impl Ctl {
         let Ok(id) = id.parse::<AccountId>() else { return };
         {
             let mut st = self.st.lock().unwrap();
+            st.account_chosen = true;
             if st.account == Some(id) {
                 return;
             }
@@ -792,8 +888,10 @@ impl Ctl {
             st.room = Some(room_id.clone());
             st.reply_to = None;
             st.editing = None;
+            st.thread = None;
         }
         self.ui(move |u| {
+            u.set_thread_open(false);
             u.set_loading_history(true);
             u.set_reply_to(s(""));
             u.set_editing(s(""));
@@ -801,6 +899,7 @@ impl Ctl {
         });
         // What we already have goes up first; the rest follows.
         self.show_messages().await;
+        self.show_typing(&key).await;
         // Can our account kick/ban/delete others' messages here?
         let can_moderate = match (room.power_levels().await, client.user_id()) {
             (Ok(pl), Some(me)) => pl.user_can_kick(me) || pl.user_can_ban(me) || pl.user_can_redact_event_of_other(me),
@@ -865,6 +964,15 @@ impl Ctl {
         let Some(room) = self.mgr.client(account).await.and_then(|c| c.get_room(&room_id)) else { return };
         let key = (account, room_id.clone());
         match action.as_str() {
+            "toggle" => {
+                {
+                    let mut st = self.st.lock().unwrap();
+                    if !st.closed_spaces.remove(&room_id) {
+                        st.closed_spaces.insert(room_id);
+                    }
+                }
+                self.refresh_rooms().await;
+            }
             "pin" | "unpin" => match room.set_is_favourite(action == "pin", None).await {
                 Ok(()) => self.schedule_rooms(),
                 Err(e) => self.status(format!("Couldn't change pin: {e}")),
@@ -1358,6 +1466,10 @@ impl Ctl {
             return;
         }
         let Some((key, room)) = self.current_room().await else { return };
+        if self.st.lock().unwrap().typing_sent.take().is_some() {
+            let r = room.clone();
+            tokio::spawn(async move { r.typing_notice(false).await });
+        }
         let (reply_to, editing) = {
             let mut st = self.st.lock().unwrap();
             (st.reply_to.take(), st.editing.take())
@@ -1401,12 +1513,17 @@ impl Ctl {
             edited: false,
             notice: false,
             member: None,
+            thread: None,
         };
         self.merge(&key, vec![item]);
         self.ui(|u| u.set_stick_bottom(true));
         self.append_last(&key).await;
 
-        match timeline::send_text(&room, &text, reply_to.as_deref()).await {
+        // Picked @-mentions become links (pills in other apps) and are
+        // listed in the message so those people get notified.
+        let picked = std::mem::take(&mut self.st.lock().unwrap().mentions);
+        let (text, mentioned) = with_mentions(&text, &picked);
+        match timeline::send_text(&room, &text, reply_to.as_deref(), mentioned).await {
             Ok(real) => self.settle_echo(&key, &local, Some(real)).await,
             Err(e) => {
                 self.settle_echo(&key, &local, None).await;
@@ -1537,8 +1654,10 @@ impl Ctl {
             }
             "profile" => self.open_profile(&key, m.sender.clone()).await,
             "save" => self.save_media(&key, m).await,
+            "play" => self.play_media(&key, m).await,
             "view" => self.view_image(&key, m).await,
             "forward" => self.open_forward(key, m.event_id).await,
+            "thread" => self.open_thread(m.thread.clone().unwrap_or(m.event_id)).await,
             a if a.starts_with("react:") => self.toggle_reaction(&key, &room, &m.event_id, &a[6..]).await,
             _ => {}
         }
@@ -1681,6 +1800,32 @@ impl Ctl {
         {
             let _ = (key, m);
             self.status("Saving files isn't available on Android yet.");
+        }
+    }
+
+    /// Opens a video or audio file in the system's player. The file goes
+    /// to the RAM folder (wiped when you lock), not the disk.
+    async fn play_media(&self, key: &RoomKey, m: HistoryItem) {
+        let Some(media) = m.media else { return };
+        let Some(client) = self.mgr.client(key.0).await else { return };
+        self.status("Loading…");
+        let dir = media_dir(self.mgr.data_dir());
+        let ext = std::path::Path::new(&media.name).extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 5 && e.chars().all(char::is_alphanumeric)).unwrap_or("bin").to_owned();
+        let path = dir.join(format!("{}.{ext}", &whisker_core::vault::random_secret()[..16]));
+        let r = async {
+            let bytes = timeline::download(&client, &media.source, None).await?;
+            whisker_core::stores::make_private_dir(&dir)?;
+            tokio::fs::write(&path, bytes).await?;
+            whisker_core::vault::owner_only(&path, false);
+            anyhow::Ok(())
+        }
+        .await;
+        match r {
+            Ok(()) => {
+                self.status("");
+                open_file(&path);
+            }
+            Err(e) => self.status(format!("Couldn't open it: {e:#}")),
         }
     }
 
@@ -1868,6 +2013,191 @@ impl Ctl {
         }
     }
 
+    fn set_notify_level(&self, level: i32) {
+        let mut st = self.settings.lock().unwrap();
+        st.notify_level = level.clamp(0, 3);
+        let _ = st.save(self.mgr.data_dir());
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_notify_level(st.notify_level);
+        }
+    }
+
+    fn set_send_typing(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.send_typing = on;
+        let _ = st.save(self.mgr.data_dir());
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_send_typing(on);
+        }
+    }
+
+    /// Shows a desktop notification for a new message when it should:
+    /// not our own (or our other accounts'), not old, not in the room you're
+    /// looking at, not for an AI account, and following the room's setting
+    /// (all messages, mentions only, or muted; by default DMs and mentions).
+    async fn maybe_notify(&self, account: AccountId, room_id: OwnedRoomId, sender: OwnedUserId, sender_name: Option<String>, body: String, ts: MilliSecondsSinceUnixEpoch) {
+        use matrix_sdk::notification_settings::RoomNotificationMode as Mode;
+        let detail = notify::Detail::from_index(self.settings.lock().unwrap().notify_level);
+        if detail == notify::Detail::Off || !self.st.lock().unwrap().synced.contains(&account) {
+            return;
+        }
+        let age = MilliSecondsSinceUnixEpoch::now().get().saturating_sub(ts.get());
+        if age > UInt::from(120_000u32) {
+            return;
+        }
+        let key = (account, room_id.clone());
+        let looking = {
+            let st = self.st.lock().unwrap();
+            st.account == Some(account) && st.room.as_ref() == Some(&room_id) && st.last_activity.is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+        };
+        let accounts = self.mgr.accounts().await;
+        let me = accounts.iter().find(|a| a.id == account);
+        if looking || me.is_none_or(|a| a.kind == AccountKind::Agent) || accounts.iter().any(|a| a.user_id == sender.as_str()) {
+            return;
+        }
+        let Some(client) = self.mgr.client(account).await else { return };
+        let Some(room) = client.get_room(&room_id) else { return };
+        let direct = room.is_direct().await.unwrap_or(false) || room.joined_members_count() <= 2;
+        let mut names = vec![sender_of_me(&client), me.map(|a| a.display_name.clone()).unwrap_or_default()];
+        names.retain(|n| n.chars().count() > 1);
+        let mentioned = whisker_agent::memory::mentioned(&body, &names);
+        let mode = room.notification_mode().await;
+        let wanted = match mode {
+            Some(Mode::Mute) => false,
+            Some(Mode::AllMessages) => true,
+            Some(Mode::MentionsAndKeywordsOnly) => mentioned,
+            None => direct || mentioned,
+        };
+        if !wanted {
+            return;
+        }
+        let who = sender_name.unwrap_or_else(|| sender.localpart().to_owned());
+        let room_name = timeline::room_name(&room).await;
+        let text = if body == UNDECRYPTABLE { "Encrypted message".to_owned() } else { body };
+        let Some((summary, text)) = notify::content(detail, &who, &room_name, direct, &text) else { return };
+        // One notification per room: a newer message replaces it.
+        let replaces = self.st.lock().unwrap().notified.get(&key).filter(|(_, t)| t.elapsed() < Duration::from_secs(300)).map_or(0, |n| n.0);
+        if let Ok(Some(id)) = tokio::task::spawn_blocking(move || notify::show(&summary, &text, replaces)).await {
+            self.st.lock().unwrap().notified.insert(key, (id, Instant::now()));
+        }
+    }
+
+    /// "Bob is typing…" under the open room.
+    async fn show_typing(&self, key: &RoomKey) {
+        let users = self.st.lock().unwrap().typing.get(key).cloned().unwrap_or_default();
+        let room = self.mgr.client(key.0).await.and_then(|c| c.get_room(&key.1));
+        let mut names = Vec::new();
+        for u in &users {
+            let n = match &room {
+                Some(r) => timeline::member_profile(r, u).await.0,
+                None => None,
+            };
+            names.push(n.unwrap_or_else(|| u.localpart().to_owned()));
+        }
+        let text = match names.as_slice() {
+            [] => String::new(),
+            [a] => format!("{a} is typing…"),
+            [a, b] => format!("{a} and {b} are typing…"),
+            [a, b, rest @ ..] => format!("{a}, {b} and {} more are typing…", rest.len()),
+        };
+        self.ui(move |u| u.set_typing_text(s(text)));
+    }
+
+    /// The draft changed: offer @-mentions or :emoji: for the word being
+    /// typed, and say we're typing if that's on.
+    async fn draft_edited(&self, text: String) {
+        self.st.lock().unwrap().draft = text.clone();
+        let word = last_word(&text);
+        let mut out: Vec<Suggestion> = Vec::new();
+        if let Some(q) = word.strip_prefix('@').filter(|q| !q.is_empty()) {
+            if let Some((key, room)) = self.current_room().await {
+                let q = q.to_lowercase();
+                for (user, name) in self.members(&key, &room).await {
+                    if name.to_lowercase().split_whitespace().any(|w| w.starts_with(&q)) || user.localpart().to_lowercase().starts_with(&q) {
+                        out.push(Suggestion { label: s(&name), detail: s(user.as_str()), insert: s(&name), kind: 0 });
+                    }
+                    if out.len() >= 6 {
+                        break;
+                    }
+                }
+            }
+        } else if let Some(q) = word.strip_prefix(':').filter(|q| q.chars().count() >= 2 && !q.contains(':')) {
+            for e in emoji::search(q).into_iter().take(8) {
+                let name = emoji::ALL.iter().find(|(x, _)| *x == e).map(|(_, k)| k.split(' ').next().unwrap_or_default()).unwrap_or_default();
+                out.push(Suggestion { label: s(e), detail: s(format!(":{name}:")), insert: s(e), kind: 1 });
+            }
+        }
+        self.ui(move |u| u.set_suggestions(ModelRc::new(VecModel::from(out))));
+        self.composing(text.is_empty()).await;
+    }
+
+    /// Puts a picked suggestion in place of the word being typed.
+    fn pick_suggestion(&self, insert: String, user: String) {
+        let new = {
+            let mut st = self.st.lock().unwrap();
+            let word = last_word(&st.draft).len();
+            let keep = st.draft.len() - word;
+            let mut new = st.draft[..keep].to_owned();
+            new.push_str(&insert);
+            new.push(' ');
+            if let Ok(u) = OwnedUserId::try_from(user) {
+                st.mentions.push((insert.clone(), u));
+            }
+            st.draft = new.clone();
+            new
+        };
+        self.ui(move |u| {
+            u.set_suggestions(ModelRc::default());
+            u.set_draft(s(&new));
+            u.set_cursor_at(new.len() as i32);
+            u.set_cursor_request(u.get_cursor_request() + 1);
+        });
+    }
+
+    /// Joined members of a room, fetched at most once a minute.
+    async fn members(&self, key: &RoomKey, room: &matrix_sdk::Room) -> Vec<(OwnedUserId, String)> {
+        if let Some((t, m)) = self.st.lock().unwrap().members_cache.get(key)
+            && t.elapsed() < Duration::from_secs(60)
+        {
+            return m.clone();
+        }
+        let me = room.own_user_id().to_owned();
+        let list: Vec<(OwnedUserId, String)> = room
+            .members_no_sync(matrix_sdk::RoomMemberships::JOIN)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.user_id() != me)
+            .map(|m| (m.user_id().to_owned(), m.display_name().unwrap_or(m.user_id().localpart()).to_owned()))
+            .collect();
+        self.st.lock().unwrap().members_cache.insert(key.clone(), (Instant::now(), list.clone()));
+        list
+    }
+
+    /// The draft changed: tell the room we're typing, if that's turned on.
+    async fn composing(&self, empty: bool) {
+        if !self.settings.lock().unwrap().send_typing {
+            return;
+        }
+        let Some((key, room)) = self.current_room().await else { return };
+        // The server shows it for a few seconds; refresh at most every 3.
+        let due = {
+            let mut st = self.st.lock().unwrap();
+            let fresh = st.typing_sent.as_ref().is_some_and(|(k, t)| *k == key && t.elapsed() < Duration::from_secs(3));
+            if empty {
+                st.typing_sent.take().is_some()
+            } else if fresh {
+                false
+            } else {
+                st.typing_sent = Some((key.clone(), Instant::now()));
+                true
+            }
+        };
+        if due && let Err(e) = room.typing_notice(!empty).await {
+            tracing::debug!("typing notice failed: {e}");
+        }
+    }
+
     fn set_show_events(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.show_events = on;
@@ -1899,8 +2229,76 @@ impl Ctl {
         }
         if self.current().as_ref() == Some(key) {
             let c = self.clone();
-            self.spawn(async move { c.show_messages().await });
+            self.spawn(async move {
+                c.show_messages().await;
+                c.show_thread().await;
+            });
         }
+    }
+
+    /// Redraws the thread panel, if a thread is open.
+    async fn show_thread(&self) {
+        let (Some(key), Some(root)) = (self.current(), self.st.lock().unwrap().thread.clone()) else { return };
+        let rows = self.rows_for(&key, Some(&root)).await;
+        self.fetch_avatars(key.0, rows.iter().filter_map(|r| r.item.sender_avatar.clone()));
+        let items: Vec<HistoryItem> = rows.iter().map(|r| r.item.clone()).collect();
+        self.fetch_pictures(&key, &items);
+        let px = self.avatars.clone();
+        self.ui(move |_| {
+            ui::with(|m| {
+                let items: Vec<MessageItem> = rows.iter().map(|r| m.message(r, &px)).collect();
+                ui::sync_rows(&m.thread, items, |a, b| a.id == b.id);
+            });
+        });
+    }
+
+    async fn open_thread(&self, root: OwnedEventId) {
+        self.st.lock().unwrap().thread = Some(root);
+        self.ui(|u| {
+            ui::with(|m| m.thread.set_vec(Vec::new()));
+            u.set_profile_open(false);
+            u.set_room_info_open(false);
+            u.set_thread_open(true);
+        });
+        self.show_thread().await;
+    }
+
+    /// Sends `text` into the open thread.
+    async fn thread_send(&self, text: String) {
+        let text = text.trim().to_owned();
+        let (Some((key, room)), Some(root)) = (self.current_room().await, self.st.lock().unwrap().thread.clone()) else { return };
+        if text.is_empty() {
+            return;
+        }
+        let latest = self.rows_for(&key, Some(&root)).await.last().map(|r| r.item.event_id.clone()).unwrap_or_else(|| root.clone());
+        let me = room.own_user_id().to_owned();
+        let account = self.mgr.accounts().await.into_iter().find(|a| a.id == key.0);
+        let Ok(local) = OwnedEventId::try_from(format!("{}{}", timeline::LOCAL_ECHO, &whisker_core::vault::random_secret()[..12])) else { return };
+        let item = HistoryItem {
+            event_id: local.clone(),
+            sender: me,
+            sender_name: account.as_ref().and_then(|a| a.profile_name.clone()),
+            sender_avatar: account.and_then(|a| a.avatar),
+            body: text.clone(),
+            ts: MilliSecondsSinceUnixEpoch::now(),
+            reply_to: None,
+            media: None,
+            edited: false,
+            notice: false,
+            member: None,
+            thread: Some(root.clone()),
+        };
+        self.merge(&key, vec![item]);
+        self.show_thread().await;
+        self.update_message(&key, &root);
+        match timeline::send_in_thread(&room, &root, &latest, &text).await {
+            Ok(real) => self.settle_echo(&key, &local, Some(real)).await,
+            Err(e) => {
+                self.settle_echo(&key, &local, None).await;
+                self.status(format!("Not sent: {e:#}"));
+            }
+        }
+        self.show_thread().await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2321,6 +2719,20 @@ impl Ctl {
         }
     }
 
+    /// Narrows the AI page's model list to names containing `q`.
+    async fn filter_models(&self, q: String) {
+        let Some(id) = self.settings_account() else { return };
+        let q = q.trim().to_lowercase();
+        let all = self.st.lock().unwrap().detected.get(&id).map(|d| d.models.clone()).unwrap_or_default();
+        // The exact name picked: show the whole list again.
+        let models: Vec<SharedString> = if q.is_empty() || all.iter().any(|m| m.to_lowercase() == q) {
+            all.iter().map(s).collect()
+        } else {
+            all.iter().filter(|m| m.to_lowercase().contains(&q)).map(s).collect()
+        };
+        self.ui(move |u| u.set_models(ModelRc::new(VecModel::from(models))));
+    }
+
     async fn test_agent(&self, f: AgentForm) {
         self.ui(|u| u.set_test_status(s("Asking the model…")));
         let msg = match self.agent_config(&f).await {
@@ -2401,15 +2813,24 @@ impl Ctl {
                         self.schedule_rooms();
                     }
                 }
-                ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, .. } => {
+                ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, thread, .. } => {
+                    {
+                        let c = self.clone();
+                        let (room_id, sender, name, body) = (room_id.clone(), sender.clone(), sender_name.clone(), body.clone());
+                        self.spawn(async move { c.maybe_notify(account, room_id, sender, name, body, origin_server_ts).await });
+                    }
                     let key = (account, room_id);
-                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None };
+                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone() };
                     // Only keep live messages for rooms we've opened; others load on open.
                     let opened = self.st.lock().unwrap().older.contains_key(&key);
                     if opened {
                         self.merge(&key, vec![item]);
                         if self.current().as_ref() == Some(&key) {
-                            self.append_last(&key).await;
+                            // A thread reply updates its thread, not the timeline's end.
+                            match &thread {
+                                Some(root) => self.update_message(&key, root),
+                                None => self.append_last(&key).await,
+                            }
                             let c = self.clone();
                             let k = key.clone();
                             self.spawn(async move { c.mark_read(&k).await });
@@ -2426,6 +2847,13 @@ impl Ctl {
                         if self.current().as_ref() == Some(&key) && self.settings.lock().unwrap().show_events {
                             self.append_last(&key).await;
                         }
+                    }
+                }
+                ClientEvent::Typing { account, room_id, users } => {
+                    let key = (account, room_id);
+                    self.st.lock().unwrap().typing.insert(key.clone(), users);
+                    if self.current().as_ref() == Some(&key) {
+                        self.show_typing(&key).await;
                     }
                 }
                 ClientEvent::Receipts { account, room_id } => {
@@ -2498,6 +2926,35 @@ fn drop_repeat_joins(msgs: &mut Vec<HistoryItem>) {
             true
         }
     });
+}
+
+/// The word at the end of `text` (what's being typed).
+fn last_word(text: &str) -> &str {
+    let start = text.rfind(char::is_whitespace).map_or(0, |i| i + text[i..].chars().next().map_or(1, char::len_utf8));
+    &text[start..]
+}
+
+/// `text` with each picked mention's name made a link to that person, and
+/// the people actually still mentioned.
+fn with_mentions(text: &str, picked: &[(String, OwnedUserId)]) -> (String, Vec<OwnedUserId>) {
+    let mut out = text.to_owned();
+    let mut users = Vec::new();
+    for (name, user) in picked {
+        if users.contains(user) {
+            continue;
+        }
+        if let Some(i) = out.find(name.as_str()) {
+            let link = format!("[{}](https://matrix.to/#/{user})", name.replace(['[', ']'], ""));
+            out.replace_range(i..i + name.len(), &link);
+            users.push(user.clone());
+        }
+    }
+    (out, users)
+}
+
+/// Our own Matrix name (localpart), for spotting mentions.
+fn sender_of_me(client: &matrix_sdk::Client) -> String {
+    client.user_id().map(|u| u.localpart().to_owned()).unwrap_or_default()
 }
 
 /// Reads a file the user picks (desktop only).
@@ -2597,6 +3054,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.set_encryption_summary(ENCRYPTION_SUMMARY.into());
     ui.global::<Prefs>().set_rich_text(prefs.rich_text);
     ui.global::<Prefs>().set_show_events(prefs.show_events);
+    ui.global::<Prefs>().set_notify_level(prefs.notify_level);
+    ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     let servers: Vec<SharedString> = SUGGESTED_SERVERS.iter().map(s).chain([s("Other server…")]).collect();
     ui.set_login_servers(slint::ModelRc::new(slint::VecModel::from(servers)));
     ui::RICH.set(prefs.rich_text);
@@ -2693,6 +3152,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_save_agent, |f| save_agent);
     on!(on_test_agent, |f| test_agent);
     on!(on_card_action, |a, f| card_action);
+    on!(on_filter_models, |q| filter_models);
     on!(on_change_passphrase, |o, n| change_passphrase);
     on!(on_attach, attach);
     on!(on_load_older, load_older);
@@ -2731,6 +3191,20 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     }
     {
         let c = ctl.clone();
+        ui.on_set_notify_level(move |i| c.set_notify_level(i));
+    }
+    {
+        let c = ctl.clone();
+        ui.on_set_send_typing(move |b| c.set_send_typing(b));
+    }
+    on!(on_draft_edited, |t| draft_edited);
+    on!(on_thread_send, |t| thread_send);
+    {
+        let c = ctl.clone();
+        ui.on_pick_suggestion(move |insert, user| c.pick_suggestion(insert.to_string(), user.to_string()));
+    }
+    {
+        let c = ctl.clone();
         ui.on_activity(move || c.touch());
     }
 
@@ -2738,6 +3212,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     rt.spawn(ctl.clone().auto_lock_loop());
     ui.run()?;
     rt.block_on(ctl.mgr.lock_all());
+    let _ = std::fs::remove_dir_all(media_dir(ctl.mgr.data_dir()));
     Ok(())
 }
 
@@ -2775,6 +3250,7 @@ mod tests {
             edited: false,
             notice: member.is_some(),
             member: member.map(|(joined, guessed)| MemberChange { user: OwnedUserId::try_from(format!("@{who}:x")).unwrap(), joined, guessed }),
+            thread: None,
         };
         let mut msgs = vec![
             item("join1", "nully", Some((true, true))),
@@ -2788,6 +3264,18 @@ mod tests {
         drop_repeat_joins(&mut msgs);
         let left: Vec<&str> = msgs.iter().map(|m| m.body.as_str()).collect();
         assert_eq!(left, ["join1", "hi", "left", "join3", "join4"]);
+    }
+
+    #[test]
+    fn mentions_become_links() {
+        assert_eq!(last_word("hi @bo"), "@bo");
+        assert_eq!(last_word("x :cat"), ":cat");
+        assert_eq!(last_word("é😀"), "é😀");
+        assert_eq!(last_word("a\n@z"), "@z");
+        let bob = OwnedUserId::try_from("@bob:x").unwrap();
+        let (t, u) = with_mentions("Bob Smith hi Bob Smith", &[("Bob Smith".into(), bob.clone()), ("Gone".into(), OwnedUserId::try_from("@g:x").unwrap())]);
+        assert_eq!(t, "[Bob Smith](https://matrix.to/#/@bob:x) hi Bob Smith");
+        assert_eq!(u, [bob]);
     }
 
     #[test]

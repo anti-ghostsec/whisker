@@ -58,7 +58,22 @@ operating system and the **Wisp** browser.
   replies lose their reply link. Forwarding from an encrypted room into an unencrypted
   one makes that file readable to the new room.
 - **Images and videos:** right-click the picture or video itself to save it; the full-size
-  viewer has Save / Forward / Close buttons and its own right-click menu.
+  viewer has Save / Forward / Close buttons and its own right-click menu. Click a video or
+  audio file to **play** it in your system's player; the copy goes to the RAM folder and is
+  deleted when you lock or quit (your player may still list it under recent files).
+- **Spaces** show as folders in the room list, holding their rooms and sub-spaces (click to
+  fold or unfold; a folded space shows the unread count of everything inside).
+- **Threads:** replies in a thread are tucked under the message that started it ("3
+  replies"); click that, or right-click → *Reply in thread*, to read and answer in the side panel.
+- **Mentions and emoji shortcodes:** type `@` and part of a name, or `:` and part of an
+  emoji name, and pick from the list (Tab or Enter takes the first). Picked people become
+  proper mentions, so they're notified.
+- **Notifications** (Linux desktops) for direct messages, mentions, and rooms you've set to
+  notify, never for the room you're looking at or for messages from your own accounts.
+  Settings → *Notifications and typing* picks how much they say: nothing, who and where
+  (the default), or the message too.
+- **Typing:** "Bob is typing…" shows above the composer. Whisker only tells others that
+  *you're* typing if you turn that on.
 - **Drag to select** any part of a message and copy it with Ctrl+C (turn on *Rich message
   text* in Settings for bold/italic/clickable links instead; rich text can't be selected).
   Click a **name** to reply to that message; click an **avatar** to open the person's
@@ -229,7 +244,10 @@ when someone mentions it and to every DM (`--trigger every` makes it read every 
 
 ## Status
 
-This is an early version. It already does: vaults, signing in to several accounts at once,
-tags, hidden vaults, a settings page, sync, room list and history, sending messages, moderation commands,
-AI agents, and plugin discovery. Still to do: cross-signing and device verification, media, threads, notifications,
-UI for plugin features, and an Android package that has been tested on a device.
+This is an early version. It already does: vaults and hidden vaults, many accounts at once
+with tags, spaces, rooms, history, threads, replies, edits, reactions, forwarding, media,
+mentions, notifications, typing, read receipts, session verification, moderation, AI accounts
+with character cards, and plugin discovery. Still to do: cross-signing beyond verifying
+sessions, video and audio playback inside the app, notifications on Windows and macOS,
+joining a space's rooms you aren't in yet from the folder, UI for plugin features, and an
+Android package that has been tested on a device.

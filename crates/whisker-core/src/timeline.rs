@@ -36,6 +36,10 @@ pub struct RoomSummary {
     /// Favourite ("pinned") rooms sort first. Stored as the standard
     /// `m.favourite` tag, so other clients see it too.
     pub pinned: bool,
+    /// A space: a folder of rooms rather than a chat.
+    pub is_space: bool,
+    /// For spaces: the rooms (and spaces) it lists, in its order.
+    pub children: Vec<OwnedRoomId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +79,8 @@ pub struct HistoryItem {
     pub notice: bool,
     /// For join/leave notices: whose membership changed and how.
     pub member: Option<MemberChange>,
+    /// A reply in a thread: the message that started it.
+    pub thread: Option<OwnedEventId>,
 }
 
 /// Someone's membership after a room event.
@@ -96,7 +102,7 @@ impl HistoryItem {
 /// What a message event means for the timeline.
 pub enum Parsed {
     /// A new message: body, whether it's real text, reply target, attachment.
-    New { body: String, is_text: bool, reply_to: Option<OwnedEventId>, media: Option<Media> },
+    New { body: String, is_text: bool, reply_to: Option<OwnedEventId>, media: Option<Media>, thread: Option<OwnedEventId> },
     /// An edit of an earlier message.
     Edit { target: OwnedEventId, body: String },
 }
@@ -183,15 +189,16 @@ pub fn parse(content: &RoomMessageEventContent) -> Parsed {
         Some(Relation::Replacement(r)) => Parsed::Edit { target: r.event_id.clone(), body: message_body(&r.new_content.msgtype).0 },
         rel => {
             let (mut body, is_text) = message_body(&content.msgtype);
-            let reply_to = match rel {
-                Some(Relation::Reply(r)) => Some(r.in_reply_to.event_id.clone()),
-                Some(Relation::Thread(t)) => t.in_reply_to.as_ref().map(|r| r.event_id.clone()),
-                _ => None,
+            let (reply_to, thread) = match rel {
+                Some(Relation::Reply(r)) => (Some(r.in_reply_to.event_id.clone()), None),
+                // In a thread, `in_reply_to` is only a real reply when it isn't the fallback.
+                Some(Relation::Thread(t)) => (t.in_reply_to.as_ref().filter(|_| !t.is_falling_back).map(|r| r.event_id.clone()), Some(t.event_id.clone())),
+                _ => (None, None),
             };
-            if reply_to.is_some() {
+            if reply_to.is_some() || thread.is_some() {
                 body = strip_reply_fallback(&body);
             }
-            Parsed::New { body, is_text, reply_to, media: media_of(&content.msgtype) }
+            Parsed::New { body, is_text, reply_to, media: media_of(&content.msgtype), thread }
         }
     }
 }
@@ -204,7 +211,10 @@ pub async fn rooms(client: &Client) -> Vec<RoomSummary> {
         .map(|r| (r, true))
         .chain(client.joined_rooms().into_iter().map(|r| (r, false)))
     {
+        let is_space = room.is_space();
         out.push(RoomSummary {
+            is_space,
+            children: if is_space { space_children(&room).await } else { Vec::new() },
             room_id: room.room_id().to_owned(),
             name: room_name(&room).await,
             invite,
@@ -218,6 +228,32 @@ pub async fn rooms(client: &Client) -> Vec<RoomSummary> {
         });
     }
     out
+}
+
+/// The rooms a space lists (`m.space.child` events that still have a
+/// `via`; an empty one means the room was taken out), by their `order`.
+pub async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
+    use matrix_sdk::deserialized_responses::SyncOrStrippedState;
+    use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
+    let Ok(events) = space.get_state_events_static::<SpaceChildEventContent>().await else { return Vec::new() };
+    let mut kids: Vec<(Option<String>, MilliSecondsSinceUnixEpoch, OwnedRoomId)> = events
+        .into_iter()
+        .filter_map(|raw| match raw.deserialize().ok()? {
+            SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) if !e.content.via.is_empty() => {
+                let order = e.content.order.as_ref().map(|o| o.as_str().to_owned()).filter(|o| o.len() <= 50 && o.bytes().all(|b| (0x20..=0x7e).contains(&b)));
+                Some((order, e.origin_server_ts, e.state_key))
+            }
+            _ => None,
+        })
+        .collect();
+    // Ordered ones first, by `order`; the rest by when they were added.
+    kids.sort_by(|a, b| match (&a.0, &b.0) {
+        (Some(x), Some(y)) => x.cmp(y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.cmp(&b.1),
+    });
+    kids.into_iter().map(|k| k.2).collect()
 }
 
 /// The room's name; uses the name cached by the last sync when there is one
@@ -344,7 +380,8 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     for ev in &msgs.chunk {
         let m = match ev.raw().deserialize() {
             Ok(AnySyncTimelineEvent::MessageLike(m)) => m,
-            Ok(AnySyncTimelineEvent::State(st)) => {
+            Ok(AnySyncTimelineEvent::State(_)) => {
+                let Some(st) = state_event(ev.raw()) else { continue };
                 at_start |= matches!(st, AnySyncStateEvent::RoomCreate(_));
                 if let Some(item) = notice_item(room, &st, &mut profiles).await {
                     out.push(item);
@@ -365,16 +402,16 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
                 m.event_id,
                 m.sender,
                 m.origin_server_ts,
-                Parsed::New { body: UNDECRYPTABLE.to_owned(), is_text: false, reply_to: None, media: None },
+                Parsed::New { body: UNDECRYPTABLE.to_owned(), is_text: false, reply_to: None, media: None, thread: None },
             ),
             _ => continue,
         };
-        let (body, reply_to, media) = match parsed {
+        let (body, reply_to, media, thread) = match parsed {
             Parsed::Edit { target, body } => {
                 edits.entry(target).or_insert(body);
                 continue;
             }
-            Parsed::New { body, reply_to, media, .. } => (body, reply_to, media),
+            Parsed::New { body, reply_to, media, thread, .. } => (body, reply_to, media, thread),
         };
         if !profiles.contains_key(&sender) {
             profiles.insert(sender.clone(), member_profile(room, &sender).await);
@@ -393,10 +430,30 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             media,
             notice: false,
             member: None,
+            thread,
         });
     }
     out.reverse();
     Ok((out, reactions, if at_start { None } else { msgs.end }))
+}
+
+/// A room (state) event from the timeline. Reads `prev_content` from the top
+/// of the event too (where older servers put it) when `unsigned` has none:
+/// without it, every name or picture change looks like a fresh join.
+pub fn state_event(raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>) -> Option<AnySyncStateEvent> {
+    let parsed = match raw.deserialize().ok()? {
+        AnySyncTimelineEvent::State(st) => st,
+        AnySyncTimelineEvent::MessageLike(_) => return None,
+    };
+    let needs_prev = matches!(&parsed, AnySyncStateEvent::RoomMember(SyncStateEvent::Original(e)) if e.prev_content().is_none());
+    if !needs_prev {
+        return Some(parsed);
+    }
+    let mut v: serde_json::Value = serde_json::from_str(raw.json().get()).ok()?;
+    let Some(prev) = v.get("prev_content").cloned() else { return Some(parsed) };
+    let unsigned = v.as_object_mut()?.entry("unsigned").or_insert_with(|| serde_json::json!({}));
+    unsigned.as_object_mut()?.insert("prev_content".into(), prev);
+    serde_json::from_value(v).ok().or(Some(parsed))
 }
 
 /// A room event as a timeline notice ("Alice joined"), if it's worth one.
@@ -442,6 +499,7 @@ pub async fn notice_item(
         edited: false,
         notice: true,
         member,
+        thread: None,
     })
 }
 
@@ -467,8 +525,12 @@ pub async fn thumbnail(client: &Client, mxc: &MxcUri, size: u32) -> Result<Vec<u
 pub const LOCAL_ECHO: &str = "$whisker-local-";
 
 /// Sends a message and returns the id the server gave it.
-pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>) -> Result<OwnedEventId> {
-    let content = RoomMessageEventContentWithoutRelation::text_markdown(text);
+/// `mentions` are the people the message mentions (so they're notified).
+pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>, mentions: Vec<OwnedUserId>) -> Result<OwnedEventId> {
+    let mut content = RoomMessageEventContentWithoutRelation::text_markdown(text);
+    if !mentions.is_empty() {
+        content = content.add_mentions(matrix_sdk::ruma::events::Mentions::with_user_ids(mentions));
+    }
     let content = match reply_to {
         Some(id) => room
             .make_reply_event(content, Reply { event_id: id.to_owned(), enforce_thread: EnforceThread::MaybeThreaded, add_mentions: AddMentions::Yes })
@@ -484,6 +546,16 @@ pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>) -> R
     let sent = room.send(content).with_request_config(config).await?;
     tracing::debug!(room = %room.room_id(), ms = started.elapsed().as_millis() as u64, "message sent (incl. encryption setup)");
     Ok(sent.response.event_id)
+}
+
+/// Posts `text` as a reply in the thread started by `root`; `latest` is
+/// the thread's newest message (for clients without thread support).
+pub async fn send_in_thread(room: &Room, root: &EventId, latest: &EventId, text: &str) -> Result<OwnedEventId> {
+    use matrix_sdk::ruma::events::relation::Thread;
+    let mut content = RoomMessageEventContent::text_markdown(text);
+    content.relates_to = Some(Relation::Thread(Thread::plain(root.to_owned(), latest.to_owned())));
+    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
+    Ok(room.send(content).with_request_config(config).await?.response.event_id)
 }
 
 /// Replaces the text of one of our own messages.

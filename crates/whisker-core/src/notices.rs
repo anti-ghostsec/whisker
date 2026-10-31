@@ -90,3 +90,35 @@ pub fn describe(ev: &AnySyncStateEvent, name: impl Fn(&str) -> String) -> Option
     };
     Some(text)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::timeline::state_event;
+    use matrix_sdk::ruma::serde::Raw;
+
+    fn describe_json(v: serde_json::Value) -> Option<String> {
+        let raw: Raw<matrix_sdk::ruma::events::AnySyncTimelineEvent> = serde_json::from_value(v).unwrap();
+        super::describe(&state_event(&raw).unwrap(), |id| id.trim_start_matches('@').split(':').next().unwrap().to_owned())
+    }
+
+    /// `prev_content` in `unsigned` (the spec) or at the top (older servers):
+    /// either way a rename is a rename, not a join.
+    #[test]
+    fn renames_are_not_joins() {
+        let ev = |unsigned: bool| {
+            let mut v = serde_json::json!({
+                "type": "m.room.member", "state_key": "@nully:x", "sender": "@nully:x", "event_id": "$e", "origin_server_ts": 1,
+                "content": {"membership": "join", "displayname": "New"}
+            });
+            let prev = serde_json::json!({"membership": "join", "displayname": "Old"});
+            if unsigned { v["unsigned"] = serde_json::json!({"prev_content": prev}); } else { v["prev_content"] = prev; }
+            v
+        };
+        assert_eq!(describe_json(ev(true)).as_deref(), Some("Old is now New"));
+        assert_eq!(describe_json(ev(false)).as_deref(), Some("Old is now New"));
+        // Nothing changed at all: no line.
+        let mut same = ev(true);
+        same["unsigned"]["prev_content"]["displayname"] = "New".into();
+        assert_eq!(describe_json(same), None);
+    }
+}

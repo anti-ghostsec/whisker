@@ -169,6 +169,8 @@ component GeneralPage inherits VerticalLayout {
     in-out property <int> theme;
     callback set-rich-text(bool);
     callback set-show-events(bool);
+    callback set-notify-level(int);
+    callback set-send-typing(bool);
     in-out property <int> auto-lock;
     in property <string> encryption-summary;
     callback set-theme(int);
@@ -225,6 +227,34 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.show-events;
                 toggled => { root.set-show-events(self.checked); }
+            }
+        }
+    }
+    Card {
+        title: "Notifications and typing";
+        Field {
+            label: "Desktop notifications";
+            hint: "For direct messages, mentions and rooms set to notify. Notification text can stay on screen and in your desktop's notification history.";
+            ComboBox {
+                model: ["Off", "Just \"New message\"", "Who sent it and where", "Who, where and the message"];
+                current-index: Prefs.notify-level;
+                selected => { root.set-notify-level(self.current-index); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Let others see when I'm typing"; color: Theme.text; }
+                Text {
+                    text: "Others' typing always shows. Off by default: the server and everyone in the room learn when you're active.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.send-typing;
+                toggled => { root.set-send-typing(self.checked); }
             }
         }
     }
@@ -363,6 +393,7 @@ component AgentPage inherits VerticalLayout {
     callback save-agent(AgentForm);
     callback test-agent(AgentForm);
     callback remove-agent();
+    callback filter-models(string);
     in property <image> card-picture;
     callback card-action(string, AgentForm);
 
@@ -476,16 +507,45 @@ component AgentPage inherits VerticalLayout {
             Btn { text: "Connect"; enabled: root.a-url != ""; clicked => { root.detect-api(root.a-url, root.a-key); } }
             Text { text: root.detect-status; color: Theme.muted; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
         }
-        if root.models.length > 0: Field {
-            label: "Model";
-            ComboBox {
-                model: root.models;
-                selected(v) => { root.a-model = v; }
-            }
-        }
         Field {
-            label: root.models.length > 0 ? "Model name (picked above, or type one)" : "Model name";
-            Input { text <=> root.a-model; placeholder: "e.g. meta-llama/llama-3.3-70b-instruct"; }
+            label: "Model";
+            hint: root.models.length > 0 ? "Type to narrow the list, then click one (or type any name)." : "";
+            Input { text <=> root.a-model; placeholder: "e.g. meta-llama/llama-3.3-70b-instruct"; edited(t) => { root.filter-models(t); } }
+        }
+        // A plain list, not a dropdown: no popup to get stuck, and long
+        // model lists can be narrowed by typing.
+        if root.models.length > 0: Rectangle {
+            height: min(220px, root.models.length * 30px + 8px);
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.raised;
+            msv := ScrollView {
+                x: 4px;
+                y: 4px;
+                width: parent.width - 8px;
+                height: parent.height - 8px;
+                content-width: self.visible-width;
+                content-height: mlist.preferred-height;
+                mlist := VerticalLayout {
+                    width: msv.visible-width;
+                    for name in root.models: Rectangle {
+                        height: 30px;
+                        border-radius: 6px;
+                        background: name == root.a-model ? Theme.accent-soft : mta.has-hover ? Theme.hover : transparent;
+                        Text {
+                            x: 8px;
+                            width: parent.width - 16px;
+                            text: name;
+                            color: name == root.a-model ? Theme.accent : Theme.text;
+                            font-size: 12px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        mta := TouchArea { mouse-cursor: pointer; clicked => { root.a-model = name; } }
+                    }
+                }
+            }
         }
         Number { text: "Longest reply (tokens)"; minimum: 64; maximum: 32000; value <=> root.a-max-tokens; }
         Text {
@@ -641,6 +701,8 @@ export component SettingsPage inherits Rectangle {
     callback set-auto-lock(int);
     callback set-rich-text(bool);
     callback set-show-events(bool);
+    callback set-notify-level(int);
+    callback set-send-typing(bool);
     callback save-account(AccountForm);
     callback profile-edit(string, string, string);
     callback recover(string);
@@ -652,6 +714,7 @@ export component SettingsPage inherits Rectangle {
     callback remove-agent();
     in property <image> card-picture;
     callback card-action(string, AgentForm);
+    callback filter-models(string);
     callback change-passphrase(string, string);
     callback unlock-hidden(string);
     callback create-hidden(string);
@@ -721,6 +784,8 @@ export component SettingsPage inherits Rectangle {
                             set-auto-lock(i) => { root.set-auto-lock(i); }
                             set-rich-text(b) => { root.set-rich-text(b); }
                             set-show-events(b) => { root.set-show-events(b); }
+                            set-notify-level(i) => { root.set-notify-level(i); }
+                            set-send-typing(b) => { root.set-send-typing(b); }
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }
                             unlock-hidden(p) => { root.unlock-hidden(p); }
                             create-hidden(p) => { root.create-hidden(p); }
@@ -744,6 +809,7 @@ export component SettingsPage inherits Rectangle {
                             remove-agent => { root.remove-agent(); }
                             card-picture: root.card-picture;
                             card-action(a, f) => { root.card-action(a, f); }
+                            filter-models(q) => { root.filter-models(q); }
                         }
                     }
                 }

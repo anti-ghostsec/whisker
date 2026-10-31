@@ -130,3 +130,50 @@ async fn room_admins_may_change_the_picture() {
     assert!(d.can_set_avatar, "admin can't change the picture");
     assert!(d.can_edit);
 }
+
+#[tokio::test]
+async fn name_changes_in_history_are_not_joins() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room = server.sync_joined_room(&client, room_id!("!names:localhost")).await;
+    let member = |id: &str, old: &str, new: &str, ts: u64| {
+        json!({"type": "m.room.member", "state_key": "@nully:localhost", "sender": "@nully:localhost", "event_id": id,
+               "origin_server_ts": ts, "content": {"membership": "join", "displayname": new},
+               "unsigned": {"prev_content": {"membership": "join", "displayname": old}}})
+    };
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "start": "t0",
+            "chunk": [member("$n3", "B", "C", 3), member("$n2", "A", "B", 2), member("$n1", "nully", "A", 1)]
+        })))
+        .mount(server.server())
+        .await;
+    let page = timeline::history(&room, None, 50).await.unwrap();
+    let lines: Vec<&str> = page.items.iter().map(|i| i.body.as_str()).collect();
+    assert_eq!(lines, ["nully is now A", "A is now B", "B is now C"]);
+}
+
+#[tokio::test]
+async fn name_changes_in_sync_are_not_joins() {
+    use matrix_sdk::config::SyncSettings;
+    use matrix_sdk::ruma::events::{AnySyncStateEvent, AnySyncTimelineEvent};
+    use matrix_sdk::ruma::serde::Raw;
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let id = room_id!("!live:localhost");
+    let ev: Raw<AnySyncTimelineEvent> = serde_json::from_value(json!({
+        "type": "m.room.member", "state_key": "@nully:localhost", "sender": "@nully:localhost", "event_id": "$n1",
+        "origin_server_ts": 1, "content": {"membership": "join", "displayname": "New"},
+        "unsigned": {"prev_content": {"membership": "join", "displayname": "Old"}}
+    })).unwrap();
+    server.mock_sync().ok(move |b| { b.add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(id).add_timeline_event(ev.clone())); }).mount().await;
+    let resp = client.sync_once(SyncSettings::default()).await.unwrap();
+    let room = client.get_room(id).unwrap();
+    let events = &resp.rooms.joined[id].timeline.events;
+    println!("raw: {}", events[0].raw().json().get());
+    let Ok(AnySyncTimelineEvent::State(st)) = events[0].raw().deserialize() else { panic!("not state") };
+    let st: AnySyncStateEvent = st;
+    let item = timeline::notice_item(&room, &st, &mut Default::default()).await.unwrap();
+    assert_eq!(item.body, "Old is now New");
+}

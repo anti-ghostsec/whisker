@@ -515,9 +515,9 @@ impl AccountManager {
                     timeline::Parsed::Edit { target, body } => {
                         let _ = tx.send(ClientEvent::Edited { account, room_id: room.room_id().to_owned(), target, body });
                     }
-                    timeline::Parsed::New { body, is_text, reply_to, media } => {
+                    timeline::Parsed::New { body, is_text, reply_to, media, thread } => {
                         let is_notice = matches!(ev.content.msgtype, matrix_sdk::ruma::events::room::message::MessageType::Notice(_));
-                        let m = Msg { body, is_text, is_notice, reply_to, media };
+                        let m = Msg { body, is_text, is_notice, reply_to, media, thread };
                         publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
                     }
                 }
@@ -555,6 +555,15 @@ impl AccountManager {
             }
         });
         let tx = self.events.clone();
+        client.add_event_handler(move |ev: matrix_sdk::ruma::events::typing::SyncTypingEvent, room: Room| {
+            let tx = tx.clone();
+            async move {
+                let me = room.own_user_id().to_owned();
+                let users = ev.content.user_ids.into_iter().filter(|u| *u != me).collect();
+                let _ = tx.send(ClientEvent::Typing { account, room_id: room.room_id().to_owned(), users });
+            }
+        });
+        let tx = self.events.clone();
         client.add_event_handler(move |_: matrix_sdk::ruma::events::receipt::SyncReceiptEvent, room: Room| {
             let tx = tx.clone();
             async move {
@@ -567,7 +576,7 @@ impl AccountManager {
         client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
             let (tx, latest) = (tx.clone(), latest.clone());
             async move {
-                let m = Msg { body: timeline::UNDECRYPTABLE.into(), is_text: false, is_notice: false, reply_to: None, media: None };
+                let m = Msg { body: timeline::UNDECRYPTABLE.into(), is_text: false, is_notice: false, reply_to: None, media: None, thread: None };
                 publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
             }
         });
@@ -595,7 +604,7 @@ impl AccountManager {
                                 let Some(room) = c.get_room(room_id) else { continue };
                                 let mut profiles = HashMap::new();
                                 for ev in &update.timeline.events {
-                                    let Ok(matrix_sdk::ruma::events::AnySyncTimelineEvent::State(st)) = ev.raw().deserialize() else { continue };
+                                    let Some(st) = timeline::state_event(ev.raw()) else { continue };
                                     if let Some(item) = timeline::notice_item(&room, &st, &mut profiles).await {
                                         let _ = tx.send(ClientEvent::Notice { account, room_id: room_id.clone(), item: Box::new(item) });
                                     }
@@ -965,6 +974,7 @@ struct Msg {
     is_notice: bool,
     reply_to: Option<matrix_sdk::ruma::OwnedEventId>,
     media: Option<timeline::Media>,
+    thread: Option<matrix_sdk::ruma::OwnedEventId>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -978,7 +988,7 @@ async fn publish(
     msg: Msg,
     ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch,
 ) {
-    let Msg { body, is_text, is_notice, reply_to, media } = msg;
+    let Msg { body, is_text, is_notice, reply_to, media, thread } = msg;
     let (sender_name, sender_avatar) = timeline::member_profile(room, sender).await;
     let item = HistoryItem {
         event_id: event_id.clone(),
@@ -992,6 +1002,7 @@ async fn publish(
         edited: false,
         notice: false,
         member: None,
+        thread: thread.clone(),
     };
     {
         let mut l = latest.lock().unwrap();
@@ -1013,6 +1024,7 @@ async fn publish(
         is_notice,
         reply_to,
         media: media.map(Box::new),
+        thread,
     });
 }
 

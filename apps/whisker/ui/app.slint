@@ -29,6 +29,11 @@ export struct RoomItem {
     unread: int,
     encrypted: bool,
     pinned: bool,
+    // Spaces are folders: `space` rows hold the rooms below them (shown when
+    // `open`); `depth` is how deep in folders a row is.
+    depth: int,
+    space: bool,
+    open: bool,
 }
 
 // A room in a public directory.
@@ -78,6 +83,14 @@ export struct ForwardItem {
 }
 
 // One row of the emoji picker.
+// An @-mention or :emoji: suggestion above the composer.
+export struct Suggestion {
+    label: string,
+    detail: string,
+    insert: string,
+    kind: int,
+}
+
 export struct EmojiRow {
     items: [string],
 }
@@ -115,6 +128,9 @@ export struct MessageItem {
     readers: [Reader],
     more-readers: int,
     reactions: [ReactionChip],
+    // A thread's first message: how many replies, and the newest ("Bob: hi").
+    thread-replies: int,
+    thread-last: string,
 }
 
 export struct MemberItem {
@@ -269,20 +285,23 @@ component MessageRow inherits Rectangle {
     cm := ContextMenuArea {
         Menu {
             if root.item.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.item.id); } }
+            if root.item.media == 2 || root.item.media == 3: MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
             if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
+            if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
             if root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
-            if root.item.media == 1 || root.item.media == 2: MenuSeparator {}
+            if root.item.media > 0 && root.item.media < 4: MenuSeparator {}
             Menu {
                 title: "React";
                 for e in root.quick-reactions: MenuItem { title: e; activated => { root.action("react:" + e, root.item.id); } }
                 MenuItem { title: "More emoji…"; activated => { root.pick-reaction(); } }
             }
             MenuItem { title: "Reply"; activated => { root.action("reply", root.item.id); } }
+            MenuItem { title: "Reply in thread"; activated => { root.action("thread", root.item.id); } }
             MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
             MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
             MenuItem { title: "Copy text"; activated => { root.copy(root.item.body); } }
             MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
-            if root.item.media > 2: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
+            if root.item.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
             for l in root.item.links: MenuItem { title: "Open " + l; activated => { root.link(l); } }
             MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); } }
             if root.item.mine && root.item.media == 0: MenuItem { title: "Edit"; activated => { root.action("edit", root.item.id); } }
@@ -353,9 +372,11 @@ component MessageRow inherits Rectangle {
                         Text { text: root.item.reply-name; font-size: 12px; font-weight: 700; color: Theme.muted; }
                         Text { text: root.item.reply-text; font-size: 12px; color: Theme.muted; overflow: elide; horizontal-stretch: 1; }
                     }
+                    // Narrow chat (side panel open): shrink, keeping the shape.
                     if root.item.media == 1: Rectangle {
-                        width: root.item.picture-width;
-                        height: root.item.picture-height;
+                        property <float> fit: min(1, max(60px, root.width - 100px) / max(1px, root.item.picture-width));
+                        width: root.item.picture-width * self.fit;
+                        height: root.item.picture-height * self.fit;
                         border-radius: 8px;
                         clip: true;
                         background: Theme.raised;
@@ -385,8 +406,8 @@ component MessageRow inherits Rectangle {
                                 border-radius: 6px;
                                 background: Theme.accent-soft;
                                 Text {
-                                    text: root.item.media == 2 ? "VID" : root.item.media == 3 ? "AUD" : "FILE";
-                                    font-size: 9px; font-weight: 800; color: Theme.accent;
+                                    text: root.item.media == 2 || root.item.media == 3 ? "▶" : "FILE";
+                                    font-size: root.item.media == 2 || root.item.media == 3 ? 16px : 9px; font-weight: 800; color: Theme.accent;
                                 }
                             }
                             VerticalLayout {
@@ -397,7 +418,8 @@ component MessageRow inherits Rectangle {
                         }
                         TouchArea {
                             mouse-cursor: pointer;
-                            clicked => { root.action("save", root.item.id); }
+                            // Videos and audio play; other files save.
+                            clicked => { root.action(root.item.media == 2 || root.item.media == 3 ? "play" : "save", root.item.id); }
                             pointer-event(e) => {
                                 if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
                             }
@@ -405,6 +427,23 @@ component MessageRow inherits Rectangle {
                     }
                     if root.item.media == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } }
                     if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
+                    if root.item.thread-replies > 0: Rectangle {
+                        height: 26px;
+                        width: min(th.preferred-width + 16px, 360px);
+                        border-radius: 8px;
+                        background: th-ta.has-hover ? Theme.hover : Theme.raised;
+                        th := HorizontalLayout {
+                            x: 8px;
+                            width: parent.width - 16px;
+                            spacing: 6px;
+                            Text {
+                                text: root.item.thread-replies == 1 ? "1 reply" : root.item.thread-replies + " replies";
+                                font-size: 12px; font-weight: 700; color: Theme.accent; vertical-alignment: center;
+                            }
+                            Text { text: root.item.thread-last; font-size: 12px; color: Theme.muted; overflow: elide; vertical-alignment: center; }
+                        }
+                        th-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("thread", root.item.id); } }
+                    }
                     if root.item.reactions.length > 0: HorizontalLayout {
                         alignment: start;
                         spacing: 4px;
@@ -552,20 +591,47 @@ component RoomRow inherits Rectangle {
         Menu {
             if root.item.invite: MenuItem { title: "Accept invitation"; activated => { root.menu("accept"); } }
             if root.item.invite: MenuItem { title: "Decline invitation"; activated => { root.menu("leave"); } }
-            if !root.item.invite: MenuItem { title: root.item.pinned ? "Unpin" : "Pin to top"; activated => { root.menu(root.item.pinned ? "unpin" : "pin"); } }
-            if !root.item.invite: MenuItem { title: "Mark as read"; activated => { root.menu("read"); } }
-            if !root.item.invite: MenuItem { title: "Room info"; activated => { root.menu("info"); } }
-            if !root.item.invite: MenuItem { title: "Invite people…"; activated => { root.menu("info"); } }
-            MenuItem { title: "Copy room address"; activated => { root.menu("copy"); } }
+            if root.item.space: MenuItem { title: root.item.open ? "Fold" : "Unfold"; activated => { root.menu("toggle"); } }
+            if !root.item.invite && !root.item.space: MenuItem { title: root.item.pinned ? "Unpin" : "Pin to top"; activated => { root.menu(root.item.pinned ? "unpin" : "pin"); } }
+            if !root.item.invite && !root.item.space: MenuItem { title: "Mark as read"; activated => { root.menu("read"); } }
+            if !root.item.invite && !root.item.space: MenuItem { title: "Room info"; activated => { root.menu("info"); } }
+            if !root.item.invite && !root.item.space: MenuItem { title: "Invite people…"; activated => { root.menu("info"); } }
+            MenuItem { title: root.item.space ? "Copy space address" : "Copy room address"; activated => { root.menu("copy"); } }
             if !root.item.invite: MenuSeparator {}
-            if !root.item.invite: MenuItem { title: "Leave room"; activated => { root.menu("leave"); } }
+            if !root.item.invite: MenuItem { title: root.item.space ? "Leave space" : "Leave room"; activated => { root.menu("leave"); } }
         }
     }
-    height: 58px;
+    height: root.item.space ? 44px : 58px;
     border-radius: 10px;
     background: selected ? Theme.active : ta.has-hover ? Theme.hover : transparent;
-    HorizontalLayout {
-        padding-left: 8px;
+    // Rooms in a space hang off a line under the folder.
+    for d in root.item.depth: Rectangle { x: 20px + d * 16px; width: 1px; background: Theme.border; }
+    if root.item.space: HorizontalLayout {
+        padding-left: 8px + root.item.depth * 16px;
+        padding-right: 10px;
+        spacing: 8px;
+        Text { text: root.item.open ? "▾" : "▸"; width: 12px; color: Theme.muted; font-size: 13px; vertical-alignment: center; }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 28px; height: 28px; border-radius: 7px; clip: true;
+                Avatar { initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; size: 28px; }
+            }
+        }
+        Text {
+            text: root.item.name;
+            overflow: elide;
+            horizontal-stretch: 1;
+            color: Theme.text;
+            font-weight: 700;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+        if !root.item.open || root.item.unread == 0: Text { text: root.item.preview; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+        if !root.item.open && root.item.unread > 0: VerticalLayout { alignment: center; Pill { text: root.item.unread > 99 ? "99+" : root.item.unread; strong: true; } }
+    }
+    if !root.item.space: HorizontalLayout {
+        padding-left: 8px + root.item.depth * 16px;
         padding-right: 10px;
         spacing: 10px;
         VerticalLayout { alignment: center; Avatar { initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; size: 40px; } }
@@ -790,6 +856,16 @@ export component AppWindow inherits Window {
     in property <string> reply-label;
     in-out property <string> editing;
     in-out property <bool> stick-bottom: true;
+    // "Bob is typing…" for the open room, or "".
+    in property <string> typing-text;
+    // Offered while typing @name or :emoji (kind 0 person, 1 emoji).
+    in property <[Suggestion]> suggestions;
+    callback draft-edited(string);
+    callback pick-suggestion(string, string);
+    // Bumping `cursor-request` puts the composer's cursor at byte
+    // `cursor-at` (after Rust changes the draft).
+    in-out property <int> cursor-request;
+    in-out property <int> cursor-at;
 
     // Overlays
     in-out property <string> select-text;
@@ -815,7 +891,11 @@ export component AppWindow inherits Window {
     property <length> rail-drag-dy;
     in-out property <bool> profile-open;
     in-out property <bool> room-info-open;
-    property <bool> panel-open: root.profile-open || root.room-info-open;
+    property <bool> panel-open: root.profile-open || root.room-info-open || root.thread-open;
+    // Thread panel: the thread's messages, and sending into it.
+    in-out property <bool> thread-open;
+    in property <[MessageItem]> thread-messages;
+    callback thread-send(string);
     in-out property <string> confirm-mod;
     // Verification
     in-out property <bool> verify-open;
@@ -903,6 +983,7 @@ export component AppWindow inherits Window {
     callback room-avatar(string);
     in property <image> card-picture;
     callback card-action(string, AgentForm);
+    callback filter-models(string);
     callback create-room(string, string, bool, string, bool, string);
 
     // Opens a profile card at once with what we already know; Rust fills in the rest.
@@ -915,6 +996,8 @@ export component AppWindow inherits Window {
     }
     callback set-rich-text(bool);
     callback set-show-events(bool);
+    callback set-notify-level(int);
+    callback set-send-typing(bool);
 
     function apply-theme() {
         Palette.color-scheme = root.theme == 0 ? ColorScheme.dark : root.theme == 1 ? ColorScheme.light : ColorScheme.unknown;
@@ -1072,7 +1155,14 @@ export component AppWindow inherits Window {
                         RoomRow {
                             item: r;
                             selected: r.id == root.current-room && !root.exploring;
-                            clicked => { root.activity(); root.exploring = false; root.current-room = r.id; root.select-room(r.id); root.pane = 2; root.stick-bottom = true; }
+                            clicked => {
+                                root.activity();
+                                if r.space {
+                                    root.room-menu("toggle", r.id);
+                                } else {
+                                    root.exploring = false; root.current-room = r.id; root.select-room(r.id); root.pane = 2; root.stick-bottom = true;
+                                }
+                            }
                             menu(action) => { root.activity(); root.room-menu(action, r.id); }
                         }
                     }
@@ -1290,6 +1380,40 @@ export component AppWindow inherits Window {
                     Text { text: "Pick a room"; horizontal-alignment: center; color: Theme.muted; }
                 }
 
+                if root.typing-text != "" && root.current-room != "": HorizontalLayout {
+                    padding-left: 18px;
+                    padding-right: 18px;
+                    Text { text: root.typing-text; font-size: 11px; font-italic: true; color: Theme.muted; overflow: elide; }
+                }
+
+                if root.suggestions.length > 0 && root.current-room != "": HorizontalLayout {
+                    padding-left: 60px;
+                    padding-right: 120px;
+                    Rectangle {
+                        background: Theme.panel;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding: 4px;
+                            for g[i] in root.suggestions: Rectangle {
+                                height: 30px;
+                                border-radius: 6px;
+                                background: i == 0 ? Theme.accent-soft : sg-ta.has-hover ? Theme.hover : transparent;
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    spacing: 10px;
+                                    Text { text: g.label; color: Theme.text; font-size: g.kind == 1 ? 18px : 13px; font-weight: 600; vertical-alignment: center; }
+                                    Text { text: g.detail; color: Theme.muted; font-size: 11px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                    if i == 0: Text { text: "Tab"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+                                }
+                                sg-ta := TouchArea { mouse-cursor: pointer; clicked => { root.pick-suggestion(g.insert, g.kind == 0 ? g.detail : ""); } }
+                            }
+                        }
+                    }
+                }
+
                 // Reply / edit bar
                 if root.reply-to != "" || root.editing != "": HorizontalLayout {
                     padding-left: 16px;
@@ -1333,7 +1457,17 @@ export component AppWindow inherits Window {
                                 font-size: 14px;
                                 enabled: root.current-room != "";
                                 selection-background-color: Theme.accent-soft;
+                                edited => { root.draft-edited(self.text); }
+                                property <int> cursor-wanted: root.cursor-request;
+                                changed cursor-wanted => {
+                                    self.set-selection-offsets(root.cursor-at, root.cursor-at);
+                                    self.focus();
+                                }
                                 key-pressed(e) => {
+                                    if root.suggestions.length > 0 && (e.text == Key.Tab || (e.text == Key.Return && !e.modifiers.shift)) {
+                                        root.pick-suggestion(root.suggestions[0].insert, root.suggestions[0].kind == 0 ? root.suggestions[0].detail : "");
+                                        return accept;
+                                    }
                                     if e.text == Key.Return && !e.modifiers.shift {
                                         root.do-send();
                                         return accept;
@@ -1397,12 +1531,12 @@ export component AppWindow inherits Window {
                             IconBtn { icon: "‹"; clicked => { root.profile-open = false; } }
                         }
                         Text {
-                            text: root.profile-open ? "Profile" : "Room info";
+                            text: root.profile-open ? "Profile" : root.room-info-open ? "Room info" : "Thread";
                             font-size: 16px; font-weight: 800; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1;
                         }
                         VerticalLayout {
                             alignment: center;
-                            IconBtn { icon: "✕"; clicked => { root.profile-open = false; root.room-info-open = false; root.info-editing = false; } }
+                            IconBtn { icon: "✕"; clicked => { root.profile-open = false; root.room-info-open = false; root.info-editing = false; root.thread-open = false; } }
                         }
                     }
                     Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
@@ -1485,6 +1619,41 @@ export component AppWindow inherits Window {
                                 text: "Ignore this user";
                                 font-size: 11px; color: Theme.muted; horizontal-alignment: center;
                                 TouchArea { mouse-cursor: pointer; clicked => { root.profile-action("ignore", root.profile.user-id); } }
+                            }
+                        }
+
+                        // ---- a thread ----
+                        if !root.profile-open && !root.room-info-open && root.thread-open: VerticalLayout {
+                            alignment: start;
+                            spacing: 6px;
+                            for m in root.thread-messages: MessageRow {
+                                item: m;
+                                can-moderate: root.can-moderate;
+                                room-id: root.current-room;
+                                quick-reactions: root.quick-reactions;
+                                pick-reaction => { root.emoji-for = m.id; root.emoji-search(""); root.emoji-open = true; }
+                                action(a, id) => {
+                                    root.activity();
+                                    if a == "profile" {
+                                        root.show-profile(m.sender, m.name, m.initial, m.hue, m.avatar);
+                                    } else if a != "thread" {
+                                        root.message-action(a, id);
+                                    }
+                                }
+                                copy(t) => { root.copy-text(t); }
+                                link(l) => { root.open-link(l); }
+                            }
+                            if root.thread-messages.length <= 1: Text {
+                                text: "No replies yet.";
+                                font-size: 12px; color: Theme.muted; horizontal-alignment: center;
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                treply := Input {
+                                    placeholder: "Reply in thread";
+                                    accepted(t) => { root.activity(); root.thread-send(t); self.text = ""; }
+                                }
+                                Btn { text: "Send"; primary: true; enabled: treply.text != ""; clicked => { root.activity(); root.thread-send(treply.text); treply.text = ""; } }
                             }
                         }
 
@@ -1619,6 +1788,8 @@ export component AppWindow inherits Window {
         set-auto-lock(i) => { root.set-auto-lock(i); }
         set-rich-text(b) => { root.set-rich-text(b); }
         set-show-events(b) => { root.set-show-events(b); }
+        set-notify-level(i) => { root.set-notify-level(i); }
+        set-send-typing(b) => { root.set-send-typing(b); }
         save-account(f) => { root.activity(); root.save-account(f); }
         profile-edit(a, id, v) => { root.activity(); root.profile-edit(a, id, v); }
         recover(k) => { root.activity(); root.recover(k); }
@@ -1630,6 +1801,7 @@ export component AppWindow inherits Window {
         remove-agent => { root.remove-agent(); }
         card-picture: root.card-picture;
         card-action(a, f) => { root.activity(); root.card-action(a, f); }
+        filter-models(q) => { root.filter-models(q); }
         change-passphrase(o, n) => { root.activity(); root.change-passphrase(o, n); }
         unlock-hidden(p) => { root.unlock-more(p); }
         create-hidden(p) => { root.create-hidden(p); }

@@ -66,30 +66,41 @@ operating system and the **Wisp** browser.
 - **Settings page** (⚙): dark (the default), light or follow-system theme; auto-lock after
   5/15/60 minutes idle; change a vault's passphrase; nickname, tags and proxy per account;
   a full AI agent setup form (model, API key, effort, permissions, commanders, audit room).
-- **End-to-end encryption.** Built on matrix-rust-sdk. Each account's local store is
-  encrypted with a random key kept in the vault.
+- **End-to-end encryption.** Built on matrix-rust-sdk. Each account's local store
+  (room state and encryption keys) is kept *inside its vault file*, not in a folder of
+  its own: while a vault is unlocked the store runs from RAM, and it is packed back into
+  the vault every 10 minutes and when you lock or quit. Caches (timeline, media) stay
+  in RAM and are rebuilt from the server.
 - **Owner-only files.** On Linux and Android the data folder and everything in it are
-  readable by your user only (folders 0700, vault files 0600), including installs made
-  by older versions.
+  readable by your user only (folders 0700, files 0600), including installs made by
+  older versions. Older versions kept stores in a `stores` folder; each one moves into
+  its vault (and is deleted) the first time that vault is unlocked.
 
 ## Hidden vaults on disk
 
+On disk, Whisker keeps nothing but `settings.json` (theme and lock timer) and the
+`vaults` folder. Each vault file holds its accounts *and* their Matrix stores, so there
+is no per-account file or folder to count.
+
 The `vaults` folder always holds more files than you have vaults. Whisker adds *decoys*
 on first run, whenever a vault is created, and now and then on unlock. A decoy has the
-same header, key-derivation cost and size as a real vault; its contents are random, so
+same header and key-derivation cost as a real vault and a size from the same steps
+(powers of two from 64 KiB; decoys go up to 16 MiB); its contents are random, so
 without a passphrase nobody can tell it from a vault, and "Whisker made those" is always
-a true answer. Every vault is padded to the same size (64 KiB steps), and each time any
-vault is saved, *every* file in the folder is rewritten byte-for-byte and given the same
-timestamps, so nothing shows which file is in use. Unlocking tries every file, so the
-time it takes doesn't reveal anything either.
+a true answer. A vault is rewritten in place, so it keeps its creation time, and after
+every write all files get the same timestamps, so nothing shows which one is in use.
+Unlocking tries every file, so the time it takes doesn't reveal anything either.
+
+While a vault is unlocked, its stores run from a RAM-backed folder (`$XDG_RUNTIME_DIR`
+or `/dev/shm` on Linux), which is wiped when you lock. If Whisker crashes, that copy
+stays in RAM until you log out or reboot, and is used on the next unlock so nothing is
+lost. On Windows the running copy is on disk while unlocked (wiped on lock); on Android
+it is in the app's private storage.
 
 What this doesn't hide:
 
-- **Account stores.** Each account keeps its encrypted Matrix store in its own folder
-  under `stores/`. Those folders can be counted, so someone with your disk can see how
-  many accounts this device has used, though not their names, servers or which vault
-  they belong to. If they also have your main passphrase, more store folders than main
-  accounts suggests other vaults.
+- **Size.** A vault whose accounts are in many big rooms can grow past the largest decoy
+  size (16 MiB), and an unusually large file is probably a real vault.
 - **Deep forensics.** Filesystem journals, SSD wear-levelling, backups and snapshots can
   keep older copies or timings that no app can control. Use full-disk encryption.
 - **Your servers.** A homeserver knows which accounts log in from the same IP unless you

@@ -7,7 +7,8 @@
 
 use crate::events::ClientEvent;
 use crate::profile::{AccountId, AccountKind, AccountRecord, Profile, normalize_tag};
-use crate::vault::{self, Vault, VaultError, random_secret};
+use crate::stores;
+use crate::vault::{self, Attachments, Vault, VaultError, random_secret};
 use anyhow::{Context, Result, anyhow, bail};
 use matrix_sdk::config::SyncSettings;
 use crate::timeline::{self, HistoryItem};
@@ -29,7 +30,17 @@ pub type VaultId = String;
 struct OpenVault {
     vault: Vault,
     profile: Profile,
+    /// Packed stores of this vault's accounts (see [`stores`]), keyed
+    /// `store/<account id>`.
+    attachments: Attachments,
 }
+
+fn store_key(id: AccountId) -> String {
+    format!("store/{id}")
+}
+
+/// How often running stores are packed into their vault.
+const SNAPSHOT_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 struct LiveAccount {
     record: AccountRecord,
@@ -82,6 +93,10 @@ pub struct AccountManager {
     events: broadcast::Sender<ClientEvent>,
     /// Device name shown to servers and other users. Deliberately generic.
     device_name: Arc<str>,
+    /// RAM-backed folder the running stores live in (see [`stores`]).
+    runtime: PathBuf,
+    /// Whether the periodic store snapshot task is running.
+    snapshotter: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct LoginRequest<'a> {
@@ -113,7 +128,10 @@ impl AccountManager {
                 vault::owner_only(&e.path(), e.path().is_dir());
             }
         }
+        vault::recover(&data_dir.join("vaults"));
         Self {
+            runtime: stores::runtime_root(&data_dir),
+            snapshotter: Arc::default(),
             data_dir,
             inner: Arc::default(),
             latest: Arc::default(),
@@ -139,12 +157,110 @@ impl AccountManager {
         self.data_dir.join("vaults")
     }
 
+    /// The running store of an account (RAM-backed, see [`stores`]).
     fn store_dir(&self, id: AccountId) -> PathBuf {
-        let stores = self.data_dir.join("stores");
-        let _ = std::fs::create_dir_all(&stores);
-        vault::owner_only(&self.data_dir, true);
-        vault::owner_only(&stores, true);
-        stores.join(id.to_string())
+        self.runtime.join(id.to_string()).join("store")
+    }
+
+    fn cache_dir(&self, id: AccountId) -> PathBuf {
+        self.runtime.join(id.to_string()).join("cache")
+    }
+
+    /// Where versions before stores moved into vaults kept them.
+    fn legacy_store_dir(&self, id: AccountId) -> PathBuf {
+        self.data_dir.join("stores").join(id.to_string())
+    }
+
+    /// Readies `record`'s running store: one left by a crash wins (it's
+    /// newer), else the vault's snapshot, else an old on-disk store, which is
+    /// copied. Returns true when it copied an old store.
+    fn prepare_store(&self, record: &AccountRecord, packed: Option<&[u8]>) -> Result<bool> {
+        let store = self.store_dir(record.id);
+        if stores::has_store(&store) {
+            return Ok(false);
+        }
+        stores::make_private_dir(&self.runtime)?;
+        stores::make_private_dir(&self.runtime.join(record.id.to_string()))?;
+        if let Some(packed) = packed {
+            stores::unpack(packed, &store)?;
+            return Ok(false);
+        }
+        let legacy = self.legacy_store_dir(record.id);
+        if stores::has_store(&legacy) {
+            stores::copy_legacy(&legacy, &store)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Packs the running stores of `vault`'s accounts into it and saves it
+    /// if anything changed. Old on-disk stores of those accounts are then
+    /// deleted, now that the vault holds them.
+    pub async fn persist(&self, vault: &str) -> Result<()> {
+        let ids: Vec<AccountId> = {
+            let inner = self.inner.read().await;
+            let Some(ov) = inner.vaults.get(vault) else { return Ok(()) };
+            ov.profile.accounts.iter().map(|a| a.id).collect()
+        };
+        let dirs: Vec<(AccountId, PathBuf)> = ids.iter().map(|id| (*id, self.store_dir(*id))).collect();
+        let packed = tokio::task::spawn_blocking(move || {
+            dirs.into_iter()
+                .filter(|(_, d)| stores::has_store(d))
+                .filter_map(|(id, d)| match stores::snapshot(&d) {
+                    Ok(p) => Some((id, p)),
+                    Err(e) => {
+                        tracing::warn!("could not snapshot store of {id}: {e:#}");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .await?;
+        {
+            let mut inner = self.inner.write().await;
+            let Some(ov) = inner.vaults.get_mut(vault) else { return Ok(()) };
+            let mut changed = false;
+            for (id, p) in packed {
+                if ov.attachments.get(&store_key(id)) != Some(&p) {
+                    ov.attachments.insert(store_key(id), p);
+                    changed = true;
+                }
+            }
+            let keep: BTreeSet<String> = ov.profile.accounts.iter().map(|a| store_key(a.id)).collect();
+            let before = ov.attachments.len();
+            ov.attachments.retain(|k, _| keep.contains(k));
+            changed |= ov.attachments.len() != before;
+            if changed {
+                ov.vault.save_with(&ov.profile, &ov.attachments)?;
+            }
+        }
+        for id in ids {
+            let legacy = self.legacy_store_dir(id);
+            if legacy.exists() && self.inner.read().await.vaults.get(vault).is_some_and(|ov| ov.attachments.contains_key(&store_key(id))) {
+                let _ = tokio::fs::remove_dir_all(&legacy).await;
+            }
+        }
+        // Drop the old folder once nothing is left in it.
+        let _ = std::fs::remove_dir(self.data_dir.join("stores"));
+        Ok(())
+    }
+
+    /// Starts the periodic store snapshot task (once).
+    fn ensure_snapshotter(&self) {
+        if self.snapshotter.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SNAPSHOT_EVERY).await;
+                for v in mgr.open_vaults().await {
+                    if let Err(e) = mgr.persist(&v).await {
+                        tracing::warn!("could not save stores: {e:#}");
+                    }
+                }
+            }
+        });
     }
 
     /// Adds `n` decoy vault files (see [`vault::write_decoy`]).
@@ -193,7 +309,8 @@ impl AccountManager {
             Ok(v)
         })
         .await??;
-        self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile });
+        self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile, attachments: Attachments::new() });
+        self.ensure_snapshotter();
         Ok(id)
     }
 
@@ -228,8 +345,8 @@ impl AccountManager {
                         let pass = &pass;
                         s.spawn(move || {
                             part.iter()
-                                .filter_map(|(id, p)| match Vault::open::<Profile>(p, pass) {
-                                    Ok((v, prof)) => Some((id.clone(), p.clone(), v, prof)),
+                                .filter_map(|(id, p)| match Vault::open_with::<Profile>(p, pass) {
+                                    Ok((v, prof, att)) => Some((id.clone(), p.clone(), v, prof, att)),
                                     Err(VaultError::Decrypt) => None,
                                     Err(e) => {
                                         tracing::warn!("skipping vault {id}: {e}");
@@ -242,10 +359,10 @@ impl AccountManager {
                     .collect();
                 handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
             });
-            // Bring vaults from before padding to the common size.
-            for (_, p, v, prof) in &opened {
-                if std::fs::metadata(p).is_ok_and(|m| (m.len() as usize) < vault::padded_len(0))
-                    && let Err(e) = v.save(prof)
+            // Bring vaults from older versions to the common size steps.
+            for (_, p, v, prof, att) in &opened {
+                if std::fs::metadata(p).is_ok_and(|m| !vault::is_stepped(m.len()))
+                    && let Err(e) = v.save_with(prof, att)
                 {
                     tracing::warn!("could not re-pad vault: {e}");
                 }
@@ -255,14 +372,21 @@ impl AccountManager {
             {
                 tracing::warn!("could not add decoy: {e}");
             }
-            opened.into_iter().map(|(id, _, v, prof)| (id, v, prof)).collect::<Vec<_>>()
+            opened.into_iter().map(|(id, _, v, prof, att)| (id, v, prof, att)).collect::<Vec<_>>()
         })
         .await?;
 
         let mut ids = Vec::new();
-        for (id, vault, profile) in opened {
+        for (id, vault, profile, attachments) in opened {
             let records = profile.accounts.clone();
-            self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile });
+            let mut migrated = false;
+            for rec in &records {
+                match self.prepare_store(rec, attachments.get(&store_key(rec.id)).map(Vec::as_slice)) {
+                    Ok(m) => migrated |= m,
+                    Err(e) => tracing::warn!("could not prepare store of {}: {e:#}", rec.user_id),
+                }
+            }
+            self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile, attachments });
             // All at once: one slow account shouldn't hold up the rest.
             futures_util::future::join_all(records.into_iter().map(|rec| {
                 let id = &id;
@@ -277,24 +401,54 @@ impl AccountManager {
                 }
             }))
             .await;
+            // Stores copied from the old per-account folders: move them into
+            // the vault now, so those folders can go.
+            if migrated && let Err(e) = self.persist(&id).await {
+                tracing::warn!("could not move stores into the vault: {e:#}");
+            }
             ids.push(id);
         }
+        self.ensure_snapshotter();
         Ok(ids)
     }
 
     /// Stops every account in `vault` and forgets its key. Its accounts
     /// vanish from the UI until the vault is unlocked again.
     pub async fn lock_vault(&self, vault: &str) {
-        let mut inner = self.inner.write().await;
-        inner.live.retain(|_, a| a.vault != vault);
-        inner.vaults.remove(vault);
-        let _ = self.events.send(ClientEvent::AccountsChanged);
+        self.lock(Some(vault)).await;
     }
 
     pub async fn lock_all(&self) {
-        let mut inner = self.inner.write().await;
-        inner.live.clear();
-        inner.vaults.clear();
+        self.lock(None).await;
+    }
+
+    /// Stops the vault's accounts (all vaults for `None`), packs their
+    /// stores into their vaults, wipes the running copies and forgets the keys.
+    async fn lock(&self, only: Option<&str>) {
+        let vaults: Vec<VaultId> = self.open_vaults().await.into_iter().filter(|v| only.is_none_or(|o| o == v)).collect();
+        // Stop the clients first, so the snapshot catches their last writes.
+        let stopped: Vec<LiveAccount> = {
+            let mut inner = self.inner.write().await;
+            let ids: Vec<AccountId> = inner.live.iter().filter(|(_, a)| vaults.contains(&a.vault)).map(|(id, _)| *id).collect();
+            ids.iter().filter_map(|id| inner.live.remove(id)).collect()
+        };
+        drop(stopped);
+        for v in &vaults {
+            if let Err(e) = self.persist(v).await {
+                tracing::warn!("could not save stores of vault: {e:#}");
+            }
+        }
+        let ids: Vec<AccountId> = {
+            let mut inner = self.inner.write().await;
+            let ids = vaults.iter().filter_map(|v| inner.vaults.get(v)).flat_map(|ov| ov.profile.accounts.iter().map(|a| a.id)).collect();
+            for v in &vaults {
+                inner.vaults.remove(v);
+            }
+            ids
+        };
+        for id in ids {
+            let _ = tokio::fs::remove_dir_all(self.runtime.join(id.to_string())).await;
+        }
         let _ = self.events.send(ClientEvent::AccountsChanged);
     }
 
@@ -308,7 +462,7 @@ impl AccountManager {
     async fn build_client(&self, id: AccountId, homeserver: &str, known: bool, store_pass: &str, proxy: Option<&str>) -> Result<Client> {
         let mut b = Client::builder();
         b = if known { b.homeserver_url(homeserver) } else { b.server_name_or_homeserver_url(homeserver) };
-        let mut b = b.sqlite_store(self.store_dir(id), Some(store_pass));
+        let mut b = b.sqlite_store_with_cache_path(self.store_dir(id), self.cache_dir(id), Some(store_pass));
         if let Some(p) = proxy {
             b = b.proxy(p);
         }
@@ -508,6 +662,16 @@ impl AccountManager {
         };
         self.mutate_profile(req.vault, |p| p.accounts.push(record.clone())).await?;
         self.go_live(req.vault, record, client).await;
+        // Save the new device's keys into the vault right away, and again
+        // once the first sync has settled.
+        if let Err(e) = self.persist(req.vault).await {
+            tracing::warn!("could not save the new account's store: {e:#}");
+        }
+        let (mgr, vault) = (self.clone(), req.vault.to_owned());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let _ = mgr.persist(&vault).await;
+        });
         Ok(id)
     }
 
@@ -602,16 +766,25 @@ impl AccountManager {
             (live, vault)
         };
         if let Some(vault) = vault {
-            self.mutate_profile(&vault, |p| p.accounts.retain(|a| a.id != id)).await?;
+            self.mutate_profile(&vault, |p| {
+                p.accounts.retain(|a| a.id != id);
+            })
+            .await?;
+            if let Some(ov) = self.inner.write().await.vaults.get_mut(&vault)
+                && ov.attachments.remove(&store_key(id)).is_some()
+            {
+                ov.vault.save_with(&ov.profile, &ov.attachments)?;
+            }
         }
         let _ = self.events.send(ClientEvent::AccountsChanged);
-        let store = self.store_dir(id);
+        let (running, legacy) = (self.runtime.join(id.to_string()), self.legacy_store_dir(id));
         tokio::spawn(async move {
             if let Some(live) = live {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(20), live.client.logout()).await;
                 drop(live);
             }
-            let _ = tokio::fs::remove_dir_all(store).await;
+            let _ = tokio::fs::remove_dir_all(running).await;
+            let _ = tokio::fs::remove_dir_all(legacy).await;
         });
         Ok(())
     }
@@ -620,7 +793,7 @@ impl AccountManager {
         let mut inner = self.inner.write().await;
         let ov = inner.vaults.get_mut(vault).ok_or_else(|| anyhow!("vault is locked"))?;
         f(&mut ov.profile);
-        ov.vault.save(&ov.profile)?;
+        ov.vault.save_with(&ov.profile, &ov.attachments)?;
         Ok(())
     }
 
@@ -679,9 +852,9 @@ impl AccountManager {
             })?;
         let mut inner = self.inner.write().await;
         let ov = inner.vaults.get_mut(vault).ok_or_else(|| anyhow!("vault is locked"))?;
-        let profile = ov.profile.clone();
+        let (profile, attachments) = (ov.profile.clone(), ov.attachments.clone());
         let vault_ref = &mut ov.vault;
-        tokio::task::block_in_place(|| vault_ref.change_passphrase(&new_, &profile))?;
+        tokio::task::block_in_place(|| vault_ref.change_passphrase(&new_, &profile, &attachments))?;
         Ok(())
     }
 

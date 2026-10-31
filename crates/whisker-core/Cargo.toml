@@ -10,7 +10,10 @@ argon2.workspace = true
 chacha20poly1305.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
+flate2 = "1.1.10"
 mime_guess = "2.0.5"
+# Same version matrix-sdk-sqlite uses, for consistent snapshots of its databases.
+rusqlite = { version = "0.40.2", default-features = false }
 matrix-sdk.workspace = true
 reqwest.workspace = true
 serde.workspace = true

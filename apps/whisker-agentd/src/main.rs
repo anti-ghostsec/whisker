@@ -119,6 +119,7 @@ async fn main() -> Result<()> {
         None => default_data_dir()?,
     });
 
+    let result: Result<()> = async {
     match cli.cmd {
         Cmd::Init => {
             let a = passphrase("New vault passphrase: ")?;
@@ -235,8 +236,12 @@ async fn main() -> Result<()> {
             }
             println!("{} agent(s) running; Ctrl-C to stop", handles.len());
             tokio::signal::ctrl_c().await?;
-            mgr.lock_all().await;
         }
     }
     Ok(())
+    }
+    .await;
+    // Locking packs each account's store into its vault and wipes the running copy.
+    mgr.lock_all().await;
+    result
 }

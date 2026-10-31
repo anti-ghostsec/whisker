@@ -43,8 +43,12 @@ strip = true
 
 # Debug builds: optimise dependencies (Argon2, crypto, SQLite, Slint) so the
 # app is usable while developing. Our own crates stay quick to compile.
+# Debug info: file and line numbers for our code, none for dependencies,
+# or the build folder grows by tens of gigabytes a day.
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3
+debug = false

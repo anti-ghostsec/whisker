@@ -241,7 +241,11 @@ pub async fn rooms(client: &Client) -> Vec<RoomSummary> {
         .map(|r| (r, true))
         .chain(client.joined_rooms().into_iter().map(|r| (r, false)))
     {
-        let is_space = room.is_space();
+        if !invite && room.create_content().is_none() {
+            let r = room.clone();
+            tokio::spawn(async move { check_room_type(&r).await });
+        }
+        let is_space = is_space(&room);
         out.push(RoomSummary {
             is_space,
             children: if is_space { space_children(&room).await } else { Vec::new() },
@@ -258,6 +262,111 @@ pub async fn rooms(client: &Client) -> Vec<RoomSummary> {
         });
     }
     out
+}
+
+/// Rooms known to be spaces although their own state doesn't say so (yet):
+/// right after joining, or when the server never sent the creation event.
+static SPACES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<OwnedRoomId>>> = std::sync::LazyLock::new(Default::default);
+
+/// Whether a room is a space (a folder of rooms) rather than a chat.
+pub fn is_space(room: &Room) -> bool {
+    room.is_space() || SPACES.lock().unwrap().contains(room.room_id())
+}
+
+/// Asks the server what kind of room this is, when the local store has no
+/// creation event for it (once per room). Spaces are remembered.
+pub async fn check_room_type(room: &Room) {
+    use matrix_sdk::ruma::api::client::state::get_state_event_for_key::v3::Request;
+    use matrix_sdk::ruma::events::StateEventType;
+    static ASKED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<OwnedRoomId>>> = std::sync::LazyLock::new(Default::default);
+    if room.is_space() || !ASKED.lock().unwrap().insert(room.room_id().to_owned()) {
+        return;
+    }
+    let req = Request::new(room.room_id().to_owned(), StateEventType::RoomCreate, String::new());
+    let Ok(resp) = room.client().send(req).await else { return };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(resp.event_or_content.get()) else { return };
+    // The content, or (with `format=event`) a whole event holding it.
+    let content = v.get("content").filter(|c| c.is_object()).unwrap_or(&v);
+    if content.get("type").and_then(|t| t.as_str()) == Some("m.space") {
+        SPACES.lock().unwrap().insert(room.room_id().to_owned());
+    }
+}
+
+/// A room listed in a space, from the server.
+#[derive(Debug, Clone)]
+pub struct SpaceRoom {
+    pub room_id: OwnedRoomId,
+    pub name: String,
+    pub topic: Option<String>,
+    pub members: u64,
+    pub avatar: Option<OwnedMxcUri>,
+    pub is_space: bool,
+    /// Servers that can help us join it.
+    pub via: Vec<matrix_sdk::ruma::OwnedServerName>,
+}
+
+/// The rooms (and sub-spaces) a space lists, joined or not, in the space's
+/// order. Uses the server's space hierarchy; if the server can't give it,
+/// the space's own list (names unknown for rooms we aren't in).
+pub async fn space_rooms(space: &Room) -> Vec<SpaceRoom> {
+    use matrix_sdk::ruma::api::client::space::get_hierarchy::v1::Request;
+    let order = read_space_children_via(space).await;
+    let mut req = Request::new(space.room_id().to_owned());
+    req.max_depth = Some(UInt::from(1u32));
+    req.limit = Some(UInt::from(200u32));
+    let mut found: HashMap<OwnedRoomId, SpaceRoom> = HashMap::new();
+    match space.client().send(req).await {
+        Ok(resp) => {
+            for chunk in resp.rooms {
+                let r = chunk.summary;
+                if r.room_id == space.room_id() {
+                    continue;
+                }
+                let is_space = r.room_type == Some(matrix_sdk::ruma::room::RoomType::Space);
+                if is_space {
+                    SPACES.lock().unwrap().insert(r.room_id.clone());
+                }
+                let name = r.name.clone().or_else(|| r.canonical_alias.as_ref().map(|a| a.to_string())).unwrap_or_else(|| r.room_id.to_string());
+                found.insert(r.room_id.clone(), SpaceRoom { name, topic: r.topic, members: r.num_joined_members.into(), avatar: r.avatar_url, is_space, via: Vec::new(), room_id: r.room_id });
+            }
+        }
+        Err(e) => tracing::debug!(space = %space.room_id(), "no space hierarchy: {e}"),
+    }
+    let client = space.client();
+    let mut out = Vec::new();
+    for (id, via) in order {
+        let mut r = found.remove(&id).unwrap_or_else(|| {
+            // Not in the hierarchy: what we know locally.
+            let local = client.get_room(&id);
+            SpaceRoom {
+                name: local.as_ref().and_then(|r| r.cached_display_name().map(|n| n.to_string())).unwrap_or_else(|| id.to_string()),
+                topic: local.as_ref().and_then(|r| r.topic()),
+                members: local.as_ref().map_or(0, |r| r.joined_members_count()),
+                avatar: local.as_ref().and_then(|r| r.avatar_url()),
+                is_space: local.as_ref().is_some_and(is_space),
+                via: Vec::new(),
+                room_id: id.clone(),
+            }
+        });
+        r.via = via;
+        out.push(r);
+    }
+    // Rooms the hierarchy lists that our copy of the space doesn't yet.
+    out.extend(found.into_values());
+    out
+}
+
+/// Joins a room listed in a space, through the servers the space gave.
+pub async fn join_listed(client: &Client, room: &SpaceRoom) -> Result<Room> {
+    let mut via = room.via.clone();
+    if let Some(s) = room.room_id.server_name() {
+        via.push(s.to_owned());
+    }
+    via.dedup();
+    let target: &matrix_sdk::ruma::RoomOrAliasId = (&*room.room_id).into();
+    let joined = client.join_room_by_id_or_alias(target, &via).await?;
+    check_room_type(&joined).await;
+    Ok(joined)
 }
 
 /// The rooms a space lists, remembered for a little while: the room list
@@ -280,15 +389,21 @@ async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
 /// The rooms a space lists (`m.space.child` events that still have a
 /// `via`; an empty one means the room was taken out), by their `order`.
 pub async fn read_space_children(space: &Room) -> Vec<OwnedRoomId> {
+    read_space_children_via(space).await.into_iter().map(|(id, _)| id).collect()
+}
+
+/// [`read_space_children`] with each room's `via` servers.
+async fn read_space_children_via(space: &Room) -> Vec<(OwnedRoomId, Vec<matrix_sdk::ruma::OwnedServerName>)> {
     use matrix_sdk::deserialized_responses::SyncOrStrippedState;
     use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
     let Ok(events) = space.get_state_events_static::<SpaceChildEventContent>().await else { return Vec::new() };
-    let mut kids: Vec<(Option<String>, MilliSecondsSinceUnixEpoch, OwnedRoomId)> = events
+    type Kid = (Option<String>, MilliSecondsSinceUnixEpoch, OwnedRoomId, Vec<matrix_sdk::ruma::OwnedServerName>);
+    let mut kids: Vec<Kid> = events
         .into_iter()
         .filter_map(|raw| match raw.deserialize().ok()? {
             SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) if !e.content.via.is_empty() => {
                 let order = e.content.order.as_ref().map(|o| o.as_str().to_owned()).filter(|o| o.len() <= 50 && o.bytes().all(|b| (0x20..=0x7e).contains(&b)));
-                Some((order, e.origin_server_ts, e.state_key))
+                Some((order, e.origin_server_ts, e.state_key, e.content.via))
             }
             _ => None,
         })
@@ -300,7 +415,7 @@ pub async fn read_space_children(space: &Room) -> Vec<OwnedRoomId> {
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => a.1.cmp(&b.1),
     });
-    kids.into_iter().map(|k| k.2).collect()
+    kids.into_iter().map(|k| (k.2, k.3)).collect()
 }
 
 /// The room's name; uses the name cached by the last sync when there is one
@@ -806,5 +921,7 @@ pub async fn join(client: &Client, id_or_alias: &str) -> Result<Room> {
     let target: OwnedRoomOrAliasId = id_or_alias.trim().try_into().map_err(|_| anyhow!("that isn't a room address like #room:server"))?;
     // Ask the room's own server to help us in, as well as ours.
     let via: Vec<OwnedServerName> = target.server_name().map(ToOwned::to_owned).into_iter().collect();
-    Ok(client.join_room_by_id_or_alias(&target, &via).await?)
+    let room = client.join_room_by_id_or_alias(&target, &via).await?;
+    check_room_type(&room).await;
+    Ok(room)
 }

@@ -80,6 +80,20 @@ export struct ReactionChip {
 }
 
 // A room in the "Forward to…" list.
+// A room listed in a space (the space page): joined or one you can join.
+export struct SpaceRoomItem {
+    id: string,
+    name: string,
+    topic: string,
+    members: string,
+    initial: string,
+    hue: int,
+    avatar: image,
+    joined: bool,
+    space: bool,
+    busy: bool,
+}
+
 export struct ForwardItem {
     id: string,
     name: string,
@@ -661,7 +675,8 @@ component RoomRow inherits Rectangle {
             if !root.item.invite && !root.item.space: MenuItem { title: root.item.pinned ? "Unpin" : "Pin to top"; activated => { root.menu(root.item.pinned ? "unpin" : "pin"); } }
             if !root.item.invite && !root.item.space: MenuItem { title: "Mark as read"; activated => { root.menu("read"); } }
             if !root.item.invite && !root.item.space: MenuItem { title: "Room info"; activated => { root.menu("info"); } }
-            if !root.item.invite && !root.item.space: MenuItem { title: "Invite people…"; activated => { root.menu("info"); } }
+            if !root.item.invite: MenuItem { title: "Invite people…"; activated => { root.menu("info"); } }
+            if !root.item.invite && root.item.space: MenuItem { title: "Space info"; activated => { root.menu("info"); } }
             MenuItem { title: root.item.space ? "Copy space address" : "Copy room address"; activated => { root.menu("copy"); } }
             if !root.item.invite: MenuSeparator {}
             if !root.item.invite: MenuItem { title: root.item.space ? "Leave space" : "Leave room"; activated => { root.menu("leave"); } }
@@ -956,6 +971,12 @@ export component AppWindow inherits Window {
     in property <[ForwardItem]> forward-rooms;
     callback forward-search(string);
     callback forward-to(string);
+    // The open room is a space: its page lists the rooms in it.
+    in property <bool> current-space;
+    in property <[SpaceRoomItem]> space-rooms;
+    in property <bool> space-loading;
+    in property <string> space-status;
+    callback space-join(string);
     // Sharing files or text from another app: pick an account (step 0),
     // then a room (step 1). The rooms are `forward-rooms`.
     in-out property <bool> share-open;
@@ -1089,6 +1110,7 @@ export component AppWindow inherits Window {
     callback set-show-events(bool);
     callback set-notify-level(int);
     callback set-send-typing(bool);
+    callback set-autocorrect(bool);
 
     function apply-theme() {
         Palette.color-scheme = root.theme == 0 ? ColorScheme.dark : root.theme == 1 ? ColorScheme.light : ColorScheme.unknown;
@@ -1249,11 +1271,7 @@ export component AppWindow inherits Window {
                             selected: r.id == root.current-room && !root.exploring;
                             clicked => {
                                 root.activity();
-                                if r.space {
-                                    root.room-menu("toggle", r.id);
-                                } else {
-                                    root.exploring = false; root.current-room = r.id; root.select-room(r.id); root.pane = 2; root.stick-bottom = true;
-                                }
+                                root.exploring = false; root.current-room = r.id; root.select-room(r.id); root.pane = 2; root.stick-bottom = true;
                             }
                             menu(action) => { root.activity(); root.room-menu(action, r.id); }
                         }
@@ -1398,7 +1416,66 @@ export component AppWindow inherits Window {
                         Btn { text: "Decline"; clicked => { root.activity(); root.room-menu("leave", root.current-room); } }
                     }
                 }
-                if root.current-room != "" && !root.current-invite: Rectangle {
+                if root.current-room != "" && !root.current-invite && root.current-space: VerticalLayout {
+                    vertical-stretch: 1;
+                    padding: 16px;
+                    spacing: 12px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Rooms in this space"; font-size: 14px; font-weight: 700; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; }
+                        Btn { text: "Invite people…"; clicked => { root.activity(); root.open-room-info(); } }
+                        Btn { text: "Space info"; clicked => { root.activity(); root.open-room-info(); } }
+                    }
+                    if root.space-status != "": Text { text: root.space-status; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                    if root.space-loading && root.space-rooms.length == 0: Text { text: "Loading rooms…"; color: Theme.muted; }
+                    if !root.space-loading && root.space-rooms.length == 0: Text { text: "This space has no rooms yet."; color: Theme.muted; }
+                    spsv := ScrollView {
+                        vertical-stretch: 1;
+                        content-width: self.visible-width;
+                        content-height: splist.preferred-height;
+                        splist := VerticalLayout {
+                            width: spsv.visible-width;
+                            alignment: start;
+                            spacing: 4px;
+                            for sr in root.space-rooms: Rectangle {
+                                height: 60px;
+                                border-radius: 10px;
+                                background: spta.has-hover ? Theme.hover : transparent;
+                                spta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.activity();
+                                        if sr.joined { root.current-room = sr.id; root.select-room(sr.id); root.stick-bottom = true; }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    spacing: 10px;
+                                    VerticalLayout { alignment: center; Avatar { initial: sr.initial; hue: sr.hue; image: sr.avatar; size: 40px; } }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            alignment: start;
+                                            Text { text: sr.name; color: Theme.text; font-weight: 600; overflow: elide; }
+                                            if sr.space: Text { text: "Space"; color: Theme.accent; font-size: 11px; vertical-alignment: center; }
+                                        }
+                                        Text { text: sr.topic != "" ? sr.members + " · " + sr.topic : sr.members; color: Theme.muted; font-size: 12px; overflow: elide; }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        if sr.joined: Btn { text: "Open"; clicked => { root.activity(); root.current-room = sr.id; root.select-room(sr.id); root.stick-bottom = true; } }
+                                        if !sr.joined: Btn { text: sr.busy ? "Joining…" : "Join"; primary: true; enabled: !sr.busy; clicked => { root.activity(); root.space-join(sr.id); } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if root.current-room != "" && !root.current-invite && !root.current-space: Rectangle {
                     vertical-stretch: 1;
                     if root.loading-history && root.messages.length == 0: Text { text: "Loading messages…"; color: Theme.muted; }
                     if !root.loading-history && root.messages.length == 0: Text { text: "No messages yet. Say hi!"; color: Theme.muted; }
@@ -1522,7 +1599,7 @@ export component AppWindow inherits Window {
                 }
 
                 // Composer
-                HorizontalLayout {
+                if !root.current-space || root.current-room == "": HorizontalLayout {
                     padding: 12px;
                     spacing: 8px;
                     alignment: stretch;
@@ -1542,35 +1619,44 @@ export component AppWindow inherits Window {
                             padding-right: 14px;
                             padding-top: 10px;
                             padding-bottom: 10px;
-                            compose := TextInput {
-                                text <=> root.draft;
-                                single-line: false;
-                                wrap: word-wrap;
-                                color: Theme.text;
-                                font-size: 14px;
-                                enabled: root.current-room != "";
-                                selection-background-color: Theme.accent-soft;
-                                edited => { root.draft-edited(self.text); }
-                                property <int> cursor-wanted: root.cursor-request;
-                                changed cursor-wanted => {
-                                    self.set-selection-offsets(root.cursor-at, root.cursor-at);
-                                    self.focus();
+                            ContextMenuArea {
+                                Menu {
+                                    MenuItem { title: "Cut"; activated => { compose.cut(); root.draft-edited(compose.text); } }
+                                    MenuItem { title: "Copy"; activated => { compose.copy(); } }
+                                    MenuItem { title: "Paste"; activated => { compose.paste(); root.draft-edited(compose.text); } }
+                                    MenuSeparator {}
+                                    MenuItem { title: "Select all"; activated => { compose.focus(); compose.select-all(); } }
                                 }
-                                key-pressed(e) => {
-                                    if root.suggestions.length > 0 && (e.text == Key.Tab || (e.text == Key.Return && !e.modifiers.shift)) {
-                                        root.pick-suggestion(root.suggestions[0].insert, root.suggestions[0].kind == 0 ? root.suggestions[0].detail : "");
-                                        return accept;
+                                compose := TextInput {
+                                    text <=> root.draft;
+                                    single-line: false;
+                                    wrap: word-wrap;
+                                    color: Theme.text;
+                                    font-size: 14px;
+                                    enabled: root.current-room != "";
+                                    selection-background-color: Theme.accent-soft;
+                                    edited => { root.draft-edited(self.text); }
+                                    property <int> cursor-wanted: root.cursor-request;
+                                    changed cursor-wanted => {
+                                        self.set-selection-offsets(root.cursor-at, root.cursor-at);
+                                        self.focus();
                                     }
-                                    if e.text == Key.Return && !e.modifiers.shift {
-                                        root.do-send();
-                                        return accept;
+                                    key-pressed(e) => {
+                                        if root.suggestions.length > 0 && (e.text == Key.Tab || (e.text == Key.Return && !e.modifiers.shift)) {
+                                            root.pick-suggestion(root.suggestions[0].insert, root.suggestions[0].kind == 0 ? root.suggestions[0].detail : "");
+                                            return accept;
+                                        }
+                                        if e.text == Key.Return && !e.modifiers.shift {
+                                            root.do-send();
+                                            return accept;
+                                        }
+                                        if e.text == Key.Escape {
+                                            root.reply-to = "";
+                                            if root.editing != "" { root.editing = ""; root.draft = ""; }
+                                            return accept;
+                                        }
+                                        return reject;
                                     }
-                                    if e.text == Key.Escape {
-                                        root.reply-to = "";
-                                        if root.editing != "" { root.editing = ""; root.draft = ""; }
-                                        return accept;
-                                    }
-                                    return reject;
                                 }
                             }
                         }
@@ -1624,7 +1710,7 @@ export component AppWindow inherits Window {
                             IconBtn { icon: "‹"; clicked => { root.profile-open = false; } }
                         }
                         Text {
-                            text: root.profile-open ? "Profile" : root.room-info-open ? "Room info" : "Thread";
+                            text: root.profile-open ? "Profile" : root.room-info-open ? (root.current-space ? "Space info" : "Room info") : "Thread";
                             font-size: 16px; font-weight: 800; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1;
                         }
                         VerticalLayout {
@@ -1650,10 +1736,16 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             HorizontalLayout { alignment: center; Avatar { initial: root.profile.initial; hue: root.profile.hue; image: root.profile.avatar; size: 112px; } }
                             Text { text: root.profile.name; font-size: 20px; font-weight: 800; color: Theme.text; horizontal-alignment: center; wrap: char-wrap; }
-                            TextInput {
-                                text: root.profile.user-id;
-                                read-only: true; horizontal-alignment: center; font-size: 13px; color: Theme.muted; vertical-stretch: 0;
-                                selection-background-color: Theme.accent.transparentize(0.55);
+                            ContextMenuArea {
+                                Menu {
+                                    MenuItem { title: "Copy"; activated => { puid.copy(); } }
+                                    MenuItem { title: "Select all"; activated => { puid.focus(); puid.select-all(); } }
+                                }
+                                puid := TextInput {
+                                    text: root.profile.user-id;
+                                    read-only: true; horizontal-alignment: center; font-size: 13px; color: Theme.muted; vertical-stretch: 0;
+                                    selection-background-color: Theme.accent.transparentize(0.55);
+                                }
                             }
                             HorizontalLayout {
                                 alignment: center;
@@ -1791,9 +1883,15 @@ export component AppWindow inherits Window {
                                 if root.room-details.avatar.width > 0: Btn { text: "Remove"; clicked => { root.room-avatar("remove"); } }
                             }
                             Text { text: root.room-details.name; font-size: 20px; font-weight: 800; color: Theme.text; horizontal-alignment: center; wrap: char-wrap; }
-                            if root.room-details.alias != "": TextInput {
-                                text: root.room-details.alias; read-only: true; horizontal-alignment: center; font-size: 12px; color: Theme.muted; vertical-stretch: 0;
-                                selection-background-color: Theme.accent.transparentize(0.55);
+                            if root.room-details.alias != "": ContextMenuArea {
+                                Menu {
+                                    MenuItem { title: "Copy"; activated => { ralias.copy(); } }
+                                    MenuItem { title: "Select all"; activated => { ralias.focus(); ralias.select-all(); } }
+                                }
+                                ralias := TextInput {
+                                    text: root.room-details.alias; read-only: true; horizontal-alignment: center; font-size: 12px; color: Theme.muted; vertical-stretch: 0;
+                                    selection-background-color: Theme.accent.transparentize(0.55);
+                                }
                             }
                             HorizontalLayout {
                                 spacing: 6px;
@@ -1805,10 +1903,16 @@ export component AppWindow inherits Window {
                             if !root.info-editing: VerticalLayout {
                                 spacing: 4px;
                                 Text { text: "DESCRIPTION"; font-size: 10px; font-weight: 800; color: Theme.muted; }
-                                TextInput {
-                                    text: root.room-details.topic == "" ? "No description." : root.room-details.topic;
-                                    read-only: true; single-line: false; wrap: word-wrap; color: Theme.text;
-                                    selection-background-color: Theme.accent.transparentize(0.55);
+                                ContextMenuArea {
+                                    Menu {
+                                        MenuItem { title: "Copy"; activated => { rtopic.copy(); } }
+                                        MenuItem { title: "Select all"; activated => { rtopic.focus(); rtopic.select-all(); } }
+                                    }
+                                    rtopic := TextInput {
+                                        text: root.room-details.topic == "" ? "No description." : root.room-details.topic;
+                                        read-only: true; single-line: false; wrap: word-wrap; color: Theme.text;
+                                        selection-background-color: Theme.accent.transparentize(0.55);
+                                    }
                                 }
                             }
                             if root.room-details.history != "" && !root.info-editing: Text { text: root.room-details.history; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
@@ -1821,7 +1925,13 @@ export component AppWindow inherits Window {
                                     VerticalLayout {
                                         padding: 8px;
                                         Text { text: p.who; font-size: 11px; font-weight: 700; color: Theme.muted; }
-                                        TextInput { text: p.text; read-only: true; single-line: false; wrap: word-wrap; color: Theme.text; selection-background-color: Theme.accent.transparentize(0.55); }
+                                        ContextMenuArea {
+                                            Menu {
+                                                MenuItem { title: "Copy"; activated => { ptext.copy(); } }
+                                                MenuItem { title: "Select all"; activated => { ptext.focus(); ptext.select-all(); } }
+                                            }
+                                            ptext := TextInput { text: p.text; read-only: true; single-line: false; wrap: word-wrap; color: Theme.text; selection-background-color: Theme.accent.transparentize(0.55); }
+                                        }
                                     }
                                 }
                             }
@@ -1872,7 +1982,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Rectangle { height: 6px; }
-                            Btn { text: "Leave room"; danger: true; clicked => { root.room-menu("leave", root.room-details.id); root.room-info-open = false; } }
+                            Btn { text: root.current-space ? "Leave space" : "Leave room"; danger: true; clicked => { root.room-menu("leave", root.room-details.id); root.room-info-open = false; } }
                         }
                     }
                 }
@@ -1901,6 +2011,7 @@ export component AppWindow inherits Window {
         set-show-events(b) => { root.set-show-events(b); }
         set-notify-level(i) => { root.set-notify-level(i); }
         set-send-typing(b) => { root.set-send-typing(b); }
+        set-autocorrect(b) => { root.set-autocorrect(b); }
         save-account(f) => { root.activity(); root.save-account(f); }
         profile-edit(a, id, v) => { root.activity(); root.profile-edit(a, id, v); }
         recover(k) => { root.activity(); root.recover(k); }

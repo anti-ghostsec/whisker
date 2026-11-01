@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 
 mod agent_form;
+mod autocorrect;
 mod emoji;
 mod notify;
 mod format;
@@ -58,6 +59,15 @@ struct State {
     /// picked to send them.
     sharing: Vec<share::Shared>,
     share_account: Option<AccountId>,
+    /// The last typo fixed in the composer: (draft after the fix, draft
+    /// before it, the word typed), so Backspace can undo it.
+    autocorrected: Option<(String, String, String)>,
+    /// The composer's text as of the last keystroke (UI thread's view).
+    typed: String,
+    /// Words put back with Backspace: not fixed again this session.
+    no_fix: HashSet<String>,
+    /// The rooms each space lists (from the server), with when they were fetched.
+    space_rooms: HashMap<RoomKey, (Instant, Vec<timeline::SpaceRoom>)>,
     /// Running agents, by the account they speak as.
     agents: HashMap<AccountId, JoinHandle<()>>,
     last_activity: Option<Instant>,
@@ -940,6 +950,35 @@ impl Ctl {
             return self.show_messages().await;
         }
         self.ui(|u| u.set_current_invite(false));
+        // A space opens as a page of its rooms (clicking it again folds it).
+        if timeline::is_space(&room) {
+            {
+                let mut st = self.st.lock().unwrap();
+                if st.room.as_ref() == Some(&room_id) {
+                    if !st.closed_spaces.remove(&room_id) {
+                        st.closed_spaces.insert(room_id.clone());
+                    }
+                } else {
+                    st.closed_spaces.remove(&room_id);
+                }
+                st.room = Some(room_id.clone());
+                st.reply_to = None;
+                st.editing = None;
+                st.thread = None;
+            }
+            self.ui(|u| {
+                ui::with(|m| m.messages.set_vec(Vec::new()));
+                u.set_current_space(true);
+                u.set_thread_open(false);
+                u.set_loading_history(false);
+                u.set_reply_to(s(""));
+                u.set_editing(s(""));
+                u.set_space_status(s(""));
+            });
+            self.refresh_rooms().await;
+            return self.show_space(&key, &room).await;
+        }
+        self.ui(|u| u.set_current_space(false));
         // Encrypted rooms need the full member list before the first send;
         // fetch it now so pressing Enter doesn't wait for it.
         if room.encryption_state().is_encrypted() {
@@ -1050,6 +1089,7 @@ impl Ctl {
                 self.status("Joining…");
                 match whisker_core::rooms::accept_invite(&room).await {
                     Ok(()) => {
+                        timeline::check_room_type(&room).await;
                         self.status("");
                         self.select_room(room_id.to_string()).await;
                     }
@@ -1219,6 +1259,44 @@ impl Ctl {
             }
             "name" => whisker_core::rooms::set_display_name(&client, &value).await,
             "remove-avatar" => whisker_core::rooms::set_avatar(&client, None).await,
+            "export-keys" => {
+                if value.chars().count() < 8 {
+                    return self.settings_msg("Use a passphrase of at least 8 characters; you'll need it to import the file.");
+                }
+                let Some(path) = save_file_as("Export room keys", "whisker-keys.txt".into()).await else {
+                    #[cfg(target_os = "android")]
+                    self.settings_msg("Exporting keys isn't available on Android yet.");
+                    return;
+                };
+                self.settings_msg("Exporting keys…");
+                self.settings_msg(match client.encryption().export_room_keys(path.clone(), &value, |_| true).await {
+                    Ok(()) => {
+                        whisker_core::vault::owner_only(&path, false);
+                        format!("Keys exported to {}. Keep the file and its passphrase safe: together they unlock your messages.", path.display())
+                    }
+                    Err(e) => format!("Couldn't export keys: {e:#}"),
+                });
+                return;
+            }
+            "import-keys" => {
+                if value.is_empty() {
+                    return self.settings_msg("Enter the passphrase the key file was exported with.");
+                }
+                let Some(path) = pick_path("Import room keys").await else {
+                    #[cfg(target_os = "android")]
+                    self.settings_msg("Importing key files isn't available on Android yet.");
+                    return;
+                };
+                self.settings_msg("Importing keys…");
+                self.settings_msg(match client.encryption().import_room_keys(path, &value).await {
+                    Ok(r) => format!("Imported {} of {} keys. Older encrypted messages will show when you reopen a room.", r.imported_count, r.total_count),
+                    Err(e) => format!("Couldn't import keys (is the passphrase right?): {e}"),
+                });
+                let mut st = self.st.lock().unwrap();
+                st.messages.retain(|(a, _), _| *a != aid);
+                st.older.retain(|(a, _), _| *a != aid);
+                return;
+            }
             "verify-self" => {
                 let Some(me) = client.user_id().map(ToOwned::to_owned) else { return };
                 self.ui(|u| {
@@ -1853,6 +1931,89 @@ impl Ctl {
         }
     }
 
+    // ---- spaces ----
+
+    /// Fills the space page: the rooms the space lists, joined or not.
+    async fn show_space(&self, key: &RoomKey, space: &matrix_sdk::Room) {
+        let cached = self.st.lock().unwrap().space_rooms.get(key).filter(|(t, _)| t.elapsed() < Duration::from_secs(60)).map(|(_, l)| l.clone());
+        let list = match cached {
+            Some(l) => l,
+            None => {
+                self.ui(|u| {
+                    u.set_space_loading(true);
+                    u.set_space_rooms(ModelRc::default());
+                });
+                let l = timeline::space_rooms(space).await;
+                self.st.lock().unwrap().space_rooms.insert(key.clone(), (Instant::now(), l.clone()));
+                l
+            }
+        };
+        if self.current().as_ref() != Some(key) {
+            return;
+        }
+        self.fetch_avatars(key.0, list.iter().filter_map(|r| r.avatar.clone()));
+        let client = space.client();
+        let joined: Vec<bool> = list.iter().map(|r| client.get_room(&r.room_id).is_some_and(|x| x.state() == matrix_sdk::RoomState::Joined)).collect();
+        let px = self.avatars.clone();
+        self.ui(move |u| {
+            let items: Vec<SpaceRoomItem> = ui::with(|m| {
+                list.iter()
+                    .zip(joined)
+                    .map(|(r, joined)| {
+                        let (initial, hue) = initial_hue(&r.name);
+                        SpaceRoomItem {
+                            id: s(r.room_id.as_str()),
+                            name: s(&r.name),
+                            topic: s(r.topic.as_deref().unwrap_or_default().lines().next().unwrap_or_default()),
+                            members: s(if r.members == 1 { "1 member".into() } else { format!("{} members", r.members) }),
+                            initial,
+                            hue,
+                            avatar: m.avatar(&r.avatar, &px),
+                            joined,
+                            space: r.is_space,
+                            busy: false,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+            u.set_space_rooms(ModelRc::new(VecModel::from(items)));
+            u.set_space_loading(false);
+        });
+    }
+
+    /// Joins a room listed on the open space's page, then opens it.
+    async fn space_join(&self, id: String) {
+        let Some((key, space)) = self.current_room().await else { return };
+        let Some(r) = self.st.lock().unwrap().space_rooms.get(&key).and_then(|(_, l)| l.iter().find(|r| r.room_id.as_str() == id).cloned()) else { return };
+        let busy = |on: bool, id: String| {
+            move |u: &AppWindow| {
+                let rows = u.get_space_rooms();
+                if let Some(i) = (0..rows.row_count()).find(|&i| rows.row_data(i).is_some_and(|x| x.id == id.as_str())) {
+                    let mut x = rows.row_data(i).unwrap();
+                    x.busy = on;
+                    rows.set_row_data(i, x);
+                }
+            }
+        };
+        self.ui(busy(true, id.clone()));
+        match timeline::join_listed(&space.client(), &r).await {
+            Ok(room) => {
+                self.st.lock().unwrap().space_rooms.remove(&key);
+                self.ui(move |u| {
+                    u.set_current_room(s(room.room_id().as_str()));
+                    u.set_stick_bottom(true);
+                });
+                self.select_room(id).await;
+            }
+            Err(e) => {
+                let m = format!("Couldn't join {}: {e:#}", r.name);
+                self.ui(busy(false, id));
+                self.ui(move |u| u.set_space_status(s(m)));
+            }
+        }
+    }
+
     // ---- sharing from other apps ----
 
     /// Takes files or text shared from another app (any thread). Opens the
@@ -2316,6 +2477,57 @@ impl Ctl {
         if let Some(u) = self.ui.upgrade() {
             u.global::<Prefs>().set_notify_level(st.notify_level);
         }
+    }
+
+    fn set_autocorrect(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.autocorrect = on;
+        let _ = st.save(self.mgr.data_dir());
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_autocorrect(on);
+        }
+    }
+
+    /// Runs on the UI thread for every keystroke in the composer, so it sees
+    /// them in order. Returns the draft to show instead of `text`: a typo
+    /// just finished, fixed; or, on Backspace straight after a fix, the word
+    /// as typed (and that word isn't fixed again).
+    fn fix_typing(&self, text: &str) -> Option<String> {
+        let mut st = self.st.lock().unwrap();
+        let prev = std::mem::replace(&mut st.typed, text.to_owned());
+        if let Some((after, before, word)) = st.autocorrected.take()
+            && after.char_indices().last().is_some_and(|(i, _)| after[..i] == *text)
+        {
+            st.no_fix.insert(word.to_lowercase());
+            st.typed = before.clone();
+            return Some(before);
+        }
+        drop(st);
+        let new = self.autocorrect(&prev, text)?;
+        let mut st = self.st.lock().unwrap();
+        st.autocorrected = Some((new.clone(), prev.clone(), last_word(&prev).to_owned()));
+        st.typed = new.clone();
+        Some(new)
+    }
+
+    /// The draft with a just-finished typo fixed, if `text` is `prev` with
+    /// one word-ending character typed at the end.
+    fn autocorrect(&self, prev: &str, text: &str) -> Option<String> {
+        if !self.settings.lock().unwrap().autocorrect {
+            return None;
+        }
+        let end = text.strip_prefix(prev)?;
+        let mut cs = end.chars();
+        let (c, None) = (cs.next()?, cs.next()) else { return None };
+        if !autocorrect::ends_word(c) || prev.matches('`').count() % 2 == 1 {
+            return None;
+        }
+        let word = last_word(prev);
+        if self.st.lock().unwrap().no_fix.contains(&word.to_lowercase()) {
+            return None;
+        }
+        let fixed = autocorrect::fix(word)?;
+        Some(format!("{}{fixed}{c}", &prev[..prev.len() - word.len()]))
     }
 
     fn set_send_typing(&self, on: bool) {
@@ -3396,6 +3608,19 @@ async fn pick_file(title: &'static str, filters: &'static [(&'static str, &'stat
     }
 }
 
+/// Asks which file to open (desktop only).
+async fn pick_path(title: &'static str) -> Option<PathBuf> {
+    #[cfg(not(target_os = "android"))]
+    {
+        tokio::task::spawn_blocking(move || rfd::FileDialog::new().set_title(title).pick_file()).await.ok().flatten()
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = title;
+        None
+    }
+}
+
 /// Asks where to save a file (desktop only).
 async fn save_file_as(title: &'static str, name: String) -> Option<PathBuf> {
     #[cfg(not(target_os = "android"))]
@@ -3475,6 +3700,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_show_events(prefs.show_events);
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
+    ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
     let servers: Vec<SharedString> = SUGGESTED_SERVERS.iter().map(s).chain([s("Other server…")]).collect();
     ui.set_login_servers(slint::ModelRc::new(slint::VecModel::from(servers)));
     ui::RICH.set(prefs.rich_text);
@@ -3509,6 +3735,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     }
     on!(on_unlock, |p| unlock);
     on!(on_share_pick_account, |id| share_pick_account);
+    on!(on_space_join, |id| space_join);
     on!(on_share_search, |q| share_search);
     on!(on_share_to, |id| share_to);
     {
@@ -3639,8 +3866,24 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_set_send_typing(move |b| c.set_send_typing(b));
+        let c = ctl.clone();
+        ui.on_set_autocorrect(move |b| c.set_autocorrect(b));
     }
-    on!(on_draft_edited, |t| draft_edited);
+    {
+        let c = ctl.clone();
+        let weak = ui.as_weak();
+        ui.on_draft_edited(move |t| {
+            let mut text = t.to_string();
+            if let (Some(new), Some(u)) = (c.fix_typing(&text), weak.upgrade()) {
+                u.set_draft(s(&new));
+                u.set_cursor_at(new.len() as i32);
+                u.set_cursor_request(u.get_cursor_request() + 1);
+                text = new;
+            }
+            let c2 = c.clone();
+            c.spawn(async move { c2.draft_edited(text).await });
+        });
+    }
     on!(on_thread_send, |t| thread_send);
     {
         let c = ctl.clone();

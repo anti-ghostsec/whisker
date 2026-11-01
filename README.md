@@ -71,8 +71,18 @@ operating system and the **Wisp** browser.
   frame; click to **play** in mpv (looping, sound off to start) or, without mpv, your
   system's player. The copy goes to the RAM folder and is deleted when you lock or quit
   (your player may still list it under recent files).
-- **Spaces** show as folders in the room list, holding their rooms and sub-spaces (click to
-  fold or unfold; a folded space shows the unread count of everything inside).
+- **Spaces** show as folders in the room list, holding their rooms and sub-spaces (a folded
+  space shows the unread count of everything inside). Clicking a space opens its page: every
+  room it lists, with **Join** for the ones you aren't in yet and **Open** for the rest, plus
+  **Invite people** and **Space info**. Click it again to fold or unfold it. A space you just
+  joined shows as a space straight away (Whisker asks the server if its copy doesn't know).
+- **Autocorrect** fixes common typos when you finish a word: "teh" → "the", "dont" →
+  "don't", a lone "i" → "I". Backspace straight after a fix keeps what you typed (and that
+  word isn't fixed again). Turn it off in Settings.
+- **Right-click to cut, copy, paste or select all** in every text box and the composer, and
+  to copy addresses, descriptions and pinned messages in the side panel.
+- **Room keys:** Settings → account → *Export or import room keys* saves your message keys
+  to a passphrase-locked file (the format Element uses), or reads one in.
 - **Threads:** replies in a thread are tucked under the message that started it ("3
   replies"); click that, or right-click → *Reply in thread*, to read and answer in the side panel.
 - **Mentions and emoji shortcodes:** type `@` and part of a name for the closest matches
@@ -285,5 +295,5 @@ with tags, spaces, rooms, history, threads, replies, edits, reactions, forwardin
 mentions, notifications, typing, read receipts, session verification, moderation, AI accounts
 with character cards, and plugin discovery. Still to do: cross-signing beyond verifying
 sessions, video and audio playback inside the app, notifications on Windows and macOS,
-joining a space's rooms you aren't in yet from the folder, UI for plugin features, and an
+UI for plugin features, and an
 Android package that has been tested on a device.

@@ -27,6 +27,7 @@ export global Prefs {
     // 0 off, 1 "New message" only, 2 sender and room, 3 with message text.
     in-out property <int> notify-level: 2;
     in-out property <bool> send-typing: false;
+    in-out property <bool> autocorrect: true;
 }
 
 export component Avatar inherits Rectangle {
@@ -119,15 +120,25 @@ export component Input inherits Rectangle {
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
-        ti := TextInput {
-            vertical-alignment: center;
-            color: Theme.text;
-            font-size: 14px;
-            enabled: root.enabled;
-            input-type: root.password ? InputType.password : InputType.text;
-            selection-background-color: Theme.accent-soft;
-            accepted => { root.accepted(self.text); }
-            edited => { root.edited(self.text); }
+        // Right-click: the usual edit menu (no cut or copy for passwords).
+        ContextMenuArea {
+            Menu {
+                if !root.password && root.enabled: MenuItem { title: "Cut"; activated => { ti.cut(); root.edited(ti.text); } }
+                if !root.password: MenuItem { title: "Copy"; activated => { ti.copy(); } }
+                if root.enabled: MenuItem { title: "Paste"; activated => { ti.paste(); root.edited(ti.text); } }
+                MenuSeparator {}
+                MenuItem { title: "Select all"; activated => { ti.focus(); ti.select-all(); } }
+            }
+            ti := TextInput {
+                vertical-alignment: center;
+                color: Theme.text;
+                font-size: 14px;
+                enabled: root.enabled;
+                input-type: root.password ? InputType.password : InputType.text;
+                selection-background-color: Theme.accent-soft;
+                accepted => { root.accepted(self.text); }
+                edited => { root.edited(self.text); }
+            }
         }
     }
     if ti.text == "": Text {

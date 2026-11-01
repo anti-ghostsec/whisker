@@ -53,6 +53,13 @@ pub struct AppSettings {
     /// Tell others when you're typing (off: it's metadata the server sees).
     #[serde(default)]
     pub send_typing: bool,
+    /// Fix common typos in the composer as you type.
+    #[serde(default = "yes")]
+    pub autocorrect: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn two() -> i32 {

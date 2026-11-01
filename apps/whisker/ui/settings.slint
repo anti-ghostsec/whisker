@@ -176,6 +176,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-show-events(bool);
     callback set-notify-level(int);
     callback set-send-typing(bool);
+    callback set-autocorrect(bool);
     in-out property <int> auto-lock;
     in property <string> encryption-summary;
     callback set-theme(int);
@@ -260,6 +261,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.send-typing;
                 toggled => { root.set-send-typing(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Fix common typos as I type"; color: Theme.text; }
+                Text {
+                    text: "\"teh\" becomes \"the\", \"dont\" becomes \"don't\", a lone \"i\" becomes \"I\". Press Backspace straight after a fix to keep what you typed.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.autocorrect;
+                toggled => { root.set-autocorrect(self.checked); }
             }
         }
     }
@@ -377,6 +394,17 @@ component AccountPage inherits VerticalLayout {
         subtitle: "A new login has no keys for messages sent before it. Enter the recovery key (or security phrase) from another client to restore them from your server-side key backup.";
         key := Input { password: true; placeholder: "Recovery key"; }
         HorizontalLayout { alignment: start; Btn { text: "Restore keys"; enabled: key.text != ""; clicked => { root.recover(key.text); key.text = ""; } } }
+    }
+    Card {
+        title: "Export or import room keys";
+        subtitle: "Saves the keys for your encrypted messages to a file, locked with a passphrase, so another client (Element and others) or a new Whisker login can read them. Import reads such a file. Anyone with the file and its passphrase can read your messages.";
+        keypass := Input { password: true; placeholder: "File passphrase"; }
+        HorizontalLayout {
+            alignment: start;
+            spacing: 8px;
+            Btn { text: "Export keys…"; enabled: keypass.text != ""; clicked => { root.profile-edit("export-keys", root.account.id, keypass.text); keypass.text = ""; } }
+            Btn { text: "Import keys…"; enabled: keypass.text != ""; clicked => { root.profile-edit("import-keys", root.account.id, keypass.text); keypass.text = ""; } }
+        }
     }
     Card {
         title: root.account.is-agent ? "AI" : "Use as an AI";
@@ -724,6 +752,7 @@ export component SettingsPage inherits Rectangle {
     callback set-show-events(bool);
     callback set-notify-level(int);
     callback set-send-typing(bool);
+    callback set-autocorrect(bool);
     callback save-account(AccountForm);
     callback profile-edit(string, string, string);
     callback recover(string);
@@ -807,6 +836,7 @@ export component SettingsPage inherits Rectangle {
                             set-show-events(b) => { root.set-show-events(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-send-typing(b) => { root.set-send-typing(b); }
+                            set-autocorrect(b) => { root.set-autocorrect(b); }
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }
                             unlock-hidden(p) => { root.unlock-hidden(p); }
                             create-hidden(p) => { root.create-hidden(p); }

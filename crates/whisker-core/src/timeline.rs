@@ -728,7 +728,15 @@ pub async fn send_file(room: &Room, path: &Path) -> Result<()> {
     }
     let data = tokio::fs::read(path).await?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    send_bytes(room, &name, data).await
+}
+
+/// Uploads `data` as a file called `name` (its extension sets the type).
+pub async fn send_bytes(room: &Room, name: &str, data: Vec<u8>) -> Result<()> {
+    if data.len() as u64 > MAX_UPLOAD {
+        anyhow::bail!("that file is over 100 MB");
+    }
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
     room.send_attachment(name, &mime, data, AttachmentConfig::new()).await?;
     Ok(())
 }

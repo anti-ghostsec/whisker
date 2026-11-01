@@ -744,6 +744,8 @@ component UnlockScreen inherits Rectangle {
     in property <bool> first-run;
     in property <string> error;
     in property <bool> busy;
+    // What's waiting to be shared (from another app), if anything.
+    in property <string> sharing;
     callback submit(string);
     background: Theme.bg;
     VerticalLayout {
@@ -772,6 +774,7 @@ component UnlockScreen inherits Rectangle {
                     clicked => { root.submit(pass.text); pass.text = ""; }
                 }
                 if root.error != "": Text { text: root.error; color: Theme.danger; wrap: word-wrap; horizontal-alignment: center; }
+                if root.sharing != "": Text { text: "Unlock to share " + root.sharing + "."; color: Theme.muted; wrap: word-wrap; horizontal-alignment: center; }
             }
         }
     }
@@ -953,6 +956,21 @@ export component AppWindow inherits Window {
     in property <[ForwardItem]> forward-rooms;
     callback forward-search(string);
     callback forward-to(string);
+    // Sharing files or text from another app: pick an account (step 0),
+    // then a room (step 1). The rooms are `forward-rooms`.
+    in-out property <bool> share-open;
+    in property <string> share-what;
+    in property <int> share-step;
+    in property <string> share-account-name;
+    in property <[AccountItem]> share-accounts;
+    in-out property <string> share-query;
+    in property <string> share-status;
+    in property <bool> share-busy;
+    callback share-pick-account(string);
+    callback share-search(string);
+    callback share-to(string);
+    callback share-back();
+    callback share-cancel();
     // Emoji picker: `emoji-for` is the message to react to, or "" to type into the composer.
     in-out property <bool> emoji-open;
     in-out property <string> emoji-for;
@@ -1101,6 +1119,7 @@ export component AppWindow inherits Window {
         first-run: root.first-run;
         error: root.error;
         busy: root.busy;
+        sharing: root.share-what;
         submit(p) => { root.unlock(p); }
     }
 
@@ -2073,6 +2092,74 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             alignment: end;
             Btn { text: "Done"; primary: true; clicked => { root.forward-open = false; } }
+        }
+    }
+
+    if root.share-open: Overlay {
+        card-width: 440px;
+        dismiss => { if !root.share-busy { root.share-cancel(); } }
+        Text { text: "Share " + root.share-what; font-size: 18px; font-weight: 800; color: Theme.text; overflow: elide; }
+        Text {
+            text: root.share-step == 0 ? "Which account should send it?" : "Pick a room for " + root.share-account-name + ".";
+            color: Theme.muted;
+            wrap: word-wrap;
+        }
+        if root.share-step == 1: Input { text <=> root.share-query; placeholder: "Search rooms"; edited(t) => { root.share-search(t); } }
+        ssv := ScrollView {
+            height: min(slist.preferred-height, 360px, root.height - 280px);
+            content-width: self.visible-width;
+            content-height: slist.preferred-height;
+            slist := VerticalLayout {
+                width: ssv.visible-width;
+                spacing: 2px;
+                if root.share-step == 0 && root.share-accounts.length == 0: Text { text: "No accounts are signed in."; color: Theme.muted; horizontal-alignment: center; }
+                if root.share-step == 0: VerticalLayout {
+                    spacing: 2px;
+                    for a in root.share-accounts: Rectangle {
+                        height: 52px;
+                        border-radius: 8px;
+                        background: sata.has-hover ? Theme.hover : transparent;
+                        sata := TouchArea { clicked => { root.share-pick-account(a.id); } }
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            spacing: 10px;
+                            VerticalLayout { alignment: center; Avatar { initial: a.initial; hue: a.hue; image: a.avatar; size: 36px; } }
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                Text { text: a.name; color: Theme.text; font-weight: 600; overflow: elide; }
+                                if a.user-id != a.name: Text { text: a.user-id; color: Theme.muted; font-size: 12px; overflow: elide; }
+                            }
+                        }
+                    }
+                }
+                if root.share-step == 1 && root.forward-rooms.length == 0: Text { text: root.share-query == "" ? "Loading rooms…" : "No rooms found."; color: Theme.muted; horizontal-alignment: center; }
+                if root.share-step == 1: VerticalLayout {
+                    spacing: 2px;
+                    for f in root.forward-rooms: Rectangle {
+                        height: 48px;
+                        border-radius: 8px;
+                        background: srta.has-hover && !root.share-busy ? Theme.hover : transparent;
+                        srta := TouchArea { enabled: !root.share-busy; clicked => { root.share-to(f.id); } }
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            spacing: 10px;
+                            VerticalLayout { alignment: center; Avatar { initial: f.initial; hue: f.hue; image: f.avatar; size: 34px; } }
+                            Text { text: f.name; color: Theme.text; font-weight: 600; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                            if f.sent: Text { text: "Sending…"; color: Theme.muted; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+        }
+        if root.share-status != "": Text { text: root.share-status; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+        HorizontalLayout {
+            spacing: 8px;
+            if root.share-step == 1 && root.share-accounts.length > 1: Btn { text: "Back"; enabled: !root.share-busy; clicked => { root.share-back(); } }
+            Rectangle { horizontal-stretch: 1; }
+            Btn { text: "Cancel"; enabled: !root.share-busy; clicked => { root.share-cancel(); } }
         }
     }
 

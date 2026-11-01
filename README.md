@@ -55,6 +55,12 @@ operating system and the **Wisp** browser.
   nothing to install: Whisker carries Noto Emoji pictures (picker, reactions, suggestions,
   big emoji-only messages) and a trimmed copy of the Noto Color Emoji font, listed before
   the system fonts, for emoji inside text (see `apps/whisker/assets`).
+- **Share to Whisker** from other apps: files, pictures, text and links. Whisker asks which
+  account should send it (skipped if you only have one), then which room, sends it, and opens
+  that room. Several files at once are fine. On FerroOS it's in the Share box; elsewhere use
+  "Open with" or run `whisker FILE…`. If Whisker is already open, the share goes to that
+  window; if it's locked, the share waits until you unlock. On Android it's in the system
+  Share menu.
 - **Forward** any message from its right-click menu to one or more of your rooms. Images
   and files are re-posted as the same file (nothing is downloaded or uploaded again);
   replies lose their reply link. Forwarding from an encrypted room into an unencrypted
@@ -231,7 +237,17 @@ cargo build --release            # Linux / Windows
 Use the release build for real use; debug builds are much slower (dependencies are
 optimised in debug too, but Whisker's own code isn't).
 
-Android needs the NDK and [`xbuild`](https://github.com/rust-mobile/xbuild) or `cargo-apk`:
+To have Whisker in the app menu and the FerroOS Share box, install its desktop entry (it
+expects `whisker` on your `PATH`, e.g. linked into `~/.local/bin`):
+
+```sh
+ln -s "$PWD/target/release/whisker" ~/.local/bin/whisker
+cp apps/whisker/whisker.desktop ~/.local/share/applications/
+```
+
+Android needs the NDK and [`xbuild`](https://github.com/rust-mobile/xbuild) or `cargo-apk`.
+The share menu entry, permissions and package name are in `apps/whisker/Cargo.toml` under
+`[package.metadata.android]` (cargo-apk's format):
 
 ```sh
 rustup target add aarch64-linux-android

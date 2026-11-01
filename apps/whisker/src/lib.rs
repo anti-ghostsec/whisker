@@ -7,6 +7,7 @@ mod emoji;
 mod notify;
 mod format;
 mod settings;
+pub mod share;
 mod spaces;
 mod ui;
 
@@ -53,6 +54,10 @@ struct State {
     reactions: HashMap<RoomKey, Vec<timeline::Reaction>>,
     /// The message the "Forward to…" dialog is for.
     forwarding: Option<(RoomKey, OwnedEventId)>,
+    /// Files and text shared from other apps, not sent yet, and the account
+    /// picked to send them.
+    sharing: Vec<share::Shared>,
+    share_account: Option<AccountId>,
     /// Running agents, by the account they speak as.
     agents: HashMap<AccountId, JoinHandle<()>>,
     last_activity: Option<Instant>,
@@ -413,6 +418,10 @@ impl Ctl {
             }
         }
         self.refresh_accounts().await;
+        let waiting = !self.st.lock().unwrap().sharing.is_empty();
+        if waiting {
+            self.open_share().await;
+        }
     }
 
     async fn unlock_more(&self, pass: String) {
@@ -467,6 +476,8 @@ impl Ctl {
             u.set_reply_to(s(""));
             u.set_editing(s(""));
             u.set_pane(1);
+            u.set_share_open(false);
+            u.set_share_what(s(""));
         });
     }
 
@@ -1785,8 +1796,15 @@ impl Ctl {
 
     async fn forward_search(&self, q: String) {
         let Some(((account, _), _)) = self.st.lock().unwrap().forwarding.clone() else { return };
+        self.room_choices(account, q).await;
+    }
+
+    /// Fills the room list the Forward and Share dialogs pick from: the
+    /// account's rooms whose name has `q`. Returns how many there are.
+    async fn room_choices(&self, account: AccountId, q: String) -> usize {
         let q = q.to_lowercase();
-        let rooms: Vec<_> = self.mgr.rooms(account).await.into_iter().filter(|r| !r.invite && (q.is_empty() || r.name.to_lowercase().contains(&q))).collect();
+        let rooms: Vec<_> = self.mgr.rooms(account).await.into_iter().filter(|r| !r.invite && !r.is_space && (q.is_empty() || r.name.to_lowercase().contains(&q))).collect();
+        let n = rooms.len();
         self.fetch_avatars(account, rooms.iter().filter_map(|r| r.avatar.clone()));
         let px = self.avatars.clone();
         self.ui(move |_| {
@@ -1801,6 +1819,7 @@ impl Ctl {
                 m.forward.set_vec(items);
             });
         });
+        n
     }
 
     async fn forward_to(&self, target: String) {
@@ -1831,6 +1850,197 @@ impl Ctl {
                 self.ui(mark(false, target));
                 self.ui(move |u| u.set_forward_status(s(m)));
             }
+        }
+    }
+
+    // ---- sharing from other apps ----
+
+    /// Takes files or text shared from another app (any thread). Opens the
+    /// Share dialog, or waits for the vault to be unlocked.
+    fn receive_share(&self, items: Vec<share::Shared>) {
+        let c = self.clone();
+        self.spawn(async move {
+            c.ui(|u| {
+                let _ = u.show();
+            });
+            if items.is_empty() {
+                return;
+            }
+            let (what, unlocked) = {
+                let mut st = c.st.lock().unwrap();
+                st.sharing.extend(items);
+                (share::summary(&st.sharing), st.active_vault.is_some())
+            };
+            c.ui(move |u| u.set_share_what(s(what)));
+            if unlocked {
+                c.open_share().await;
+            }
+        });
+    }
+
+    /// The Share dialog: which account sends it (skipped when there's only one).
+    async fn open_share(&self) {
+        let accounts = self.mgr.accounts().await;
+        for a in &accounts {
+            if let Some(m) = &a.avatar {
+                self.fetch_avatars(a.id, [m.clone()]);
+            }
+        }
+        let only = (accounts.len() == 1).then(|| accounts[0].id);
+        let px = self.avatars.clone();
+        self.ui(move |u| {
+            let items: Vec<AccountItem> = ui::with(|m| {
+                accounts
+                    .iter()
+                    .map(|a| {
+                        let (initial, hue) = initial_hue(&a.display_name);
+                        AccountItem {
+                            id: s(a.id.to_string()),
+                            name: s(&a.display_name),
+                            user_id: s(&a.user_id),
+                            tags: s(""),
+                            is_agent: a.kind == AccountKind::Agent,
+                            initial,
+                            hue,
+                            avatar: m.avatar(&a.avatar, &px),
+                            unread: 0,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+            u.set_share_accounts(ModelRc::new(VecModel::from(items)));
+            u.set_share_step(0);
+            u.set_share_query(s(""));
+            u.set_share_status(s(""));
+            u.set_share_busy(false);
+            u.set_share_open(true);
+        });
+        if let Some(id) = only {
+            self.share_pick_account(id.to_string()).await;
+        }
+    }
+
+    async fn share_pick_account(&self, id: String) {
+        let Ok(id) = id.parse::<AccountId>() else { return };
+        self.st.lock().unwrap().share_account = Some(id);
+        let name = self.mgr.accounts().await.into_iter().find(|a| a.id == id).map(|a| a.display_name).unwrap_or_default();
+        self.ui(move |u| {
+            ui::with(|m| m.forward.set_vec(Vec::new()));
+            u.set_share_account_name(s(name));
+            u.set_share_query(s(""));
+            u.set_share_step(1);
+        });
+        // Right after unlock the account may still be loading its rooms.
+        for _ in 0..30 {
+            if self.st.lock().unwrap().share_account != Some(id) || self.room_choices(id, String::new()).await > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn share_search(&self, q: String) {
+        let Some(account) = self.st.lock().unwrap().share_account else { return };
+        self.room_choices(account, q).await;
+    }
+
+    fn share_back(&self) {
+        self.st.lock().unwrap().share_account = None;
+        self.ui(|u| {
+            ui::with(|m| m.forward.set_vec(Vec::new()));
+            u.set_share_status(s(""));
+            u.set_share_step(0);
+        });
+    }
+
+    fn share_cancel(&self) {
+        {
+            let mut st = self.st.lock().unwrap();
+            st.sharing.clear();
+            st.share_account = None;
+        }
+        self.ui(|u| {
+            u.set_share_open(false);
+            u.set_share_what(s(""));
+        });
+    }
+
+    /// Sends everything shared to the room, then opens it.
+    async fn share_to(&self, target: String) {
+        let (Some(account), items) = ({
+            let st = self.st.lock().unwrap();
+            (st.share_account, st.sharing.clone())
+        }) else {
+            return;
+        };
+        let Some(client) = self.mgr.client(account).await else { return };
+        let Some(room) = OwnedRoomId::try_from(target.as_str()).ok().and_then(|id| client.get_room(&id)) else { return };
+        let mark = |sending: bool, id: String| {
+            move |u: &AppWindow| {
+                u.set_share_busy(sending);
+                ui::with(|m| {
+                    if let Some(i) = (0..m.forward.row_count()).find(|&i| m.forward.row_data(i).is_some_and(|r| r.id == id.as_str())) {
+                        let mut r = m.forward.row_data(i).unwrap();
+                        r.sent = sending;
+                        m.forward.set_row_data(i, r);
+                    }
+                });
+            }
+        };
+        self.ui(mark(true, target.clone()));
+        let total = items.len();
+        let mut too_big = Vec::new();
+        for (i, item) in items.into_iter().enumerate() {
+            if total > 1 {
+                let m = format!("Sending {} of {total}…", i + 1);
+                self.ui(move |u| u.set_share_status(s(m)));
+            }
+            let sent = match item {
+                share::Shared::File { name, data } => timeline::send_bytes(&room, &name, data).await.map_err(|e| (name, e)),
+                share::Shared::Text(t) => timeline::send_text(&room, &t, None, &[]).await.map(drop).map_err(|e| ("the text".into(), e)),
+                share::Shared::TooBig(name) => {
+                    too_big.push(name);
+                    Ok(())
+                }
+            };
+            if let Err((name, e)) = sent {
+                // What went already is done; a retry sends only the rest.
+                self.st.lock().unwrap().sharing.drain(..i);
+                let m = format!("Couldn't send {name}: {e:#}");
+                self.ui(mark(false, target));
+                self.ui(move |u| u.set_share_status(s(m)));
+                return;
+            }
+        }
+        let more = {
+            let mut st = self.st.lock().unwrap();
+            st.sharing.drain(..total);
+            st.share_account = None;
+            st.account_chosen = true;
+            st.account = Some(account);
+            st.room = None;
+            !st.sharing.is_empty()
+        };
+        let room_id = target.clone();
+        self.ui(move |u| {
+            u.set_share_busy(false);
+            u.set_share_open(false);
+            u.set_share_what(s(""));
+            u.set_exploring(false);
+            u.set_pane(2);
+            u.set_current_room(s(&room_id));
+        });
+        self.select_room(target).await;
+        self.refresh_accounts_only().await;
+        if !too_big.is_empty() {
+            self.status(format!("Not sent (over 100 MB): {}", too_big.join(", ")));
+        }
+        // More came in while this was sending.
+        if more {
+            let what = share::summary(&self.st.lock().unwrap().sharing);
+            self.ui(move |u| u.set_share_what(s(what)));
+            self.open_share().await;
         }
     }
 
@@ -3298,6 +3508,20 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         }};
     }
     on!(on_unlock, |p| unlock);
+    on!(on_share_pick_account, |id| share_pick_account);
+    on!(on_share_search, |q| share_search);
+    on!(on_share_to, |id| share_to);
+    {
+        let c = ctl.clone();
+        ui.on_share_back(move || c.share_back());
+        let c = ctl.clone();
+        ui.on_share_cancel(move || c.share_cancel());
+    }
+    share::listen(ctl.mgr.data_dir());
+    {
+        let c = ctl.clone();
+        share::on_share(move |items| c.receive_share(items));
+    }
     on!(on_unlock_more, |p| unlock_more);
     on!(on_create_hidden, |p| create_hidden);
     on!(on_select_account, |id| select_account);
@@ -3432,17 +3656,36 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.run()?;
     rt.block_on(ctl.mgr.lock_all());
     let _ = std::fs::remove_dir_all(media_dir(ctl.mgr.data_dir()));
+    share::stop_listening(ctl.mgr.data_dir());
     Ok(())
 }
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: slint::android::AndroidApp) {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    // The task Whisker's window is in (0 until it's running).
+    static TASK: AtomicI32 = AtomicI32::new(0);
+    let shares = share::android::intent_shares(&app);
+    // Sharing to Whisker while it's open starts a second copy of the
+    // activity (in the sharing app's task). Hand the share to the running
+    // one, bring it to the front, and close this one.
+    let task = TASK.load(Ordering::SeqCst);
+    if task != 0 {
+        share::deliver(shares);
+        share::android::bring_to_front(&app, task);
+        return;
+    }
+    TASK.store(share::android::task_id(&app).unwrap_or(-1), Ordering::SeqCst);
+    if !shares.is_empty() {
+        share::deliver(shares);
+    }
     let dir = app.internal_data_path().unwrap_or_else(|| PathBuf::from("/data/local/tmp/whisker"));
     slint::android::init(app).expect("Slint Android backend");
     if let Err(e) = run(dir) {
         eprintln!("whisker: {e:#}");
     }
+    TASK.store(0, Ordering::SeqCst);
 }
 
 

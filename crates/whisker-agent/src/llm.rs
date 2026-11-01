@@ -246,12 +246,28 @@ fn to_openai(messages: &[Value]) -> Vec<Value> {
                 out.push(msg);
             }
             Value::Array(blocks) => {
+                // Text and pictures stay one user message: some servers
+                // want user and assistant turns to alternate.
+                let mut parts = Vec::new();
                 for b in blocks {
                     match b["type"].as_str() {
                         Some("tool_result") => out.push(json!({ "role": "tool", "tool_call_id": b["tool_use_id"], "content": b["content"] })),
-                        Some("text") => out.push(json!({ "role": "user", "content": b["text"] })),
+                        Some("text") => parts.push(json!({ "type": "text", "text": b["text"] })),
+                        Some("image") => {
+                            let src = &b["source"];
+                            let url = format!("data:{};base64,{}", src["media_type"].as_str().unwrap_or("image/jpeg"), src["data"].as_str().unwrap_or_default());
+                            parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                        }
                         _ => {}
                     }
+                }
+                if parts.iter().all(|p| p["type"] == "text") {
+                    let text: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
+                    if !text.is_empty() {
+                        out.push(json!({ "role": "user", "content": text.join("\n\n") }));
+                    }
+                } else {
+                    out.push(json!({ "role": "user", "content": parts }));
                 }
             }
             _ => {}
@@ -324,5 +340,19 @@ mod tests {
         assert_eq!(o[1]["tool_calls"][0]["function"]["name"], "ban");
         assert_eq!(o[2]["role"], "tool");
         assert_eq!(o[2]["tool_call_id"], "t1");
+    }
+
+    #[test]
+    fn pictures_go_to_openai_as_data_urls() {
+        let msgs = vec![json!({ "role": "user", "content": [
+            { "type": "text", "text": "look" },
+            { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "QUJD" } },
+            { "type": "text", "text": "end" }
+        ]})];
+        let o = to_openai(&msgs);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0]["content"][1]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+        let text_only = to_openai(&[json!({ "role": "user", "content": [{ "type": "text", "text": "a" }, { "type": "text", "text": "b" }] })]);
+        assert_eq!(text_only[0]["content"], "a\n\nb");
     }
 }

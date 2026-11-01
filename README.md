@@ -122,13 +122,22 @@ operating system and the **Wisp** browser.
   → *Add an AI account*, or turn an account you have into one from its settings page. Its
   page under **AI** takes any API address and key (Venice, OpenAI, Anthropic, OpenRouter,
   a local server…), the model, and Venice's privacy switches (both off by default).
+  *Longest reply posted* caps replies in characters (cut at the last sentence that fits),
+  and *Let the AI see pictures* (off by default) sends the newest pictures in the
+  conversation, shrunk to 1024 px, to models that can see images.
 - **Character cards.** On an AI's page, *Import card…* reads Tavern / SillyTavern character
   cards, versions 1, 2 and 3, as `.json` or as `.png` (the card hidden in the picture,
   `ccv3` read before `chara`). The AI then plays that character: description,
   personality, scenario and example messages go into its instructions (your own text stays,
   and a card's system prompt can place it with `{{original}}`), `{{char}}` and `{{user}}`
   are filled in, lorebook entries are added when their keywords come up (constant,
-  selective and case-sensitive entries and the scan depth are honoured), and it greets
+  selective and case-sensitive entries and the scan depth are honoured, and so are the
+  CCv3 `@@depth`, `@@role`, `@@position`, `@@activate` and `@@dont_activate` decorators and
+  SillyTavern's "at depth" setting; no `@@` line ever reaches the model). Entries set to a
+  depth and the card's post-history instructions go at the end of the conversation, after
+  the message being answered, where reminders actually work. A `<state>…</state>` block in
+  a reply is never posted, even cut off: it's kept and shown back to the model next time.
+  It greets
   with the first message when it joins a room (can be turned off). Every field can be
   edited; *Export .png* / *Export .json* write it back out as CCv3 (plus v2 in the PNG, for
   older apps), keeping fields Whisker doesn't use. *Use the card's name and picture* sets

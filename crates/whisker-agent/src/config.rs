@@ -68,6 +68,15 @@ pub struct AgentConfig {
     /// Minimum seconds between replies in one room.
     #[serde(default = "default_cooldown")]
     pub cooldown_secs: u64,
+    /// Show the model pictures posted in the room (recent ones, shrunk).
+    /// Off by default: only some models can see pictures, and it sends them
+    /// to the AI service.
+    #[serde(default)]
+    pub see_images: bool,
+    /// Longest reply posted, in characters (0: no limit). The model is
+    /// told, and a longer reply is cut at the last sentence that fits.
+    #[serde(default)]
+    pub reply_chars: usize,
     /// Venice only: also use Venice's own system prompt (off by default).
     #[serde(default)]
     pub venice_system_prompt: bool,

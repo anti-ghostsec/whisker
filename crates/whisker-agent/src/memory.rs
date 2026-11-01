@@ -50,6 +50,10 @@ pub struct RoomMemory {
     /// Seconds since the Unix epoch of the last message, for forgetting idle rooms.
     #[serde(default)]
     pub last_active: u64,
+    /// The `<state>` block of the agent's last reply here: hidden from the
+    /// chat, shown back to the model next time.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -90,6 +94,12 @@ impl Memory {
             while r.lines.len() > keep.max(1) {
                 r.lines.pop_front();
             }
+        }
+    }
+
+    pub fn set_state(&mut self, room: &OwnedRoomId, state: &str) {
+        if let Some(r) = self.rooms.get_mut(room) {
+            r.state = truncate(state.trim(), MAX_SUMMARY);
         }
     }
 

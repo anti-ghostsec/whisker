@@ -8,6 +8,7 @@ pub mod config;
 pub mod llm;
 pub mod memory;
 pub mod permissions;
+pub mod reply;
 pub mod runner;
 pub mod tools;
 

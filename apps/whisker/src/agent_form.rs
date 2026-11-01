@@ -82,6 +82,8 @@ pub fn to_form(account: AccountId, name: &str, cfg: Option<&AgentConfig>) -> Age
         max_rapid: c.max_rapid_replies.min(50) as i32,
         venice_system_prompt: c.venice_system_prompt,
         venice_web_search: c.venice_web_search,
+        see_images: c.see_images,
+        reply_chars: c.reply_chars.min(20_000) as i32,
         cooldown: c.cooldown_secs.min(3600) as i32,
         max_steps: c.max_steps.min(20) as i32,
         g_reply: has(Permission::Reply),
@@ -223,6 +225,8 @@ pub fn from_form(account: AccountId, f: &AgentForm, old: Option<&AgentConfig>, d
     cfg.max_rapid_replies = f.max_rapid.max(1) as u32;
     cfg.venice_system_prompt = f.venice_system_prompt;
     cfg.venice_web_search = f.venice_web_search;
+    cfg.see_images = f.see_images;
+    cfg.reply_chars = f.reply_chars.max(0) as usize;
     cfg.cooldown_secs = f.cooldown.max(0) as u64;
     cfg.max_steps = f.max_steps.max(1) as usize;
     cfg.card = card_from_form(f, card)?;

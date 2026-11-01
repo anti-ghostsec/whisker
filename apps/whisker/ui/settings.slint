@@ -52,6 +52,8 @@ export struct AgentForm {
     max-rapid: int,
     venice-system-prompt: bool,
     venice-web-search: bool,
+    see-images: bool,
+    reply-chars: int,
     g-reply: bool,
     g-redact: bool,
     g-kick: bool,
@@ -447,6 +449,8 @@ component AgentPage inherits VerticalLayout {
     property <int> a-rapid: agent.max-rapid;
     property <bool> a-venice-prompt: agent.venice-system-prompt;
     property <bool> a-venice-search: agent.venice-web-search;
+    property <bool> a-see-images: agent.see-images;
+    property <int> a-reply-chars: agent.reply-chars;
     property <int> a-cooldown: agent.cooldown;
     property <int> a-steps: agent.max-steps;
     property <bool> a-reply: agent.g-reply;
@@ -472,6 +476,7 @@ component AgentPage inherits VerticalLayout {
             summarize: root.a-summarize, summary-model: root.a-summary-model, context-tokens: root.a-context,
             cooldown: root.a-cooldown, max-steps: root.a-steps, yield-secs: root.a-yield, max-rapid: root.a-rapid,
             venice-system-prompt: root.a-venice-prompt, venice-web-search: root.a-venice-search,
+            see-images: root.a-see-images, reply-chars: root.a-reply-chars,
             g-reply: root.a-reply, g-redact: root.a-redact, g-kick: root.a-kick, g-ban: root.a-ban,
             g-unban: root.a-unban, g-invite: root.a-invite, g-power: root.a-power,
             commanders: root.a-commanders, min-level: root.a-min-level, autonomous: root.a-autonomous,
@@ -548,6 +553,12 @@ component AgentPage inherits VerticalLayout {
             }
         }
         Number { text: "Longest reply (tokens)"; minimum: 64; maximum: 32000; value <=> root.a-max-tokens; }
+        Number { text: "Longest reply posted (characters, 0 = no limit)"; minimum: 0; maximum: 20000; value <=> root.a-reply-chars; }
+        Toggle { text: "Let the AI see pictures posted in the room"; checked <=> root.a-see-images; }
+        Text {
+            text: "Sends recent pictures (shrunk) to the AI service with each reply. Only for models that can see images.";
+            font-size: 11px; color: Theme.muted; wrap: word-wrap;
+        }
         Text {
             text: "Venice only (api.venice.ai). Both stay off unless you turn them on.";
             font-size: 11px; color: Theme.muted; wrap: word-wrap;

@@ -8439,6 +8439,7 @@ name = "whisker-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "image",
  "matrix-sdk",
  "reqwest",
  "serde",

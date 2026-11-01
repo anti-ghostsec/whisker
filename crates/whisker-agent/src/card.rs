@@ -61,6 +61,12 @@ pub struct Entry {
     pub insertion_order: i64,
     pub name: String,
     pub comment: String,
+    /// CCv3: `before_char` or `after_char` (some tools write a number).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<Value>,
+    /// SillyTavern keeps `position`, `depth` and `role` here.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub extensions: Map<String, Value>,
 }
 
 impl Default for Entry {
@@ -76,6 +82,8 @@ impl Default for Entry {
             insertion_order: 100,
             name: String::new(),
             comment: String::new(),
+            position: None,
+            extensions: Map::new(),
         }
     }
 }
@@ -178,6 +186,11 @@ impl Card {
     /// owner's own persona text, which a card's system prompt can include
     /// with `{{original}}`.
     pub fn system(&self, base: &str, user: &str) -> String {
+        self.system_with(base, user, "")
+    }
+
+    /// [`Card::system`] with lorebook text placed ahead of the character.
+    pub fn system_with(&self, base: &str, user: &str, before: &str) -> String {
         let mut out = String::new();
         let sys = self.system_prompt.trim();
         if sys.is_empty() {
@@ -186,6 +199,9 @@ impl Card {
             out.push_str(&replace_ignore_case(sys, "{{original}}", base.trim()));
         }
         out.push_str(&format!("\n\nYou are playing {}. Stay in character.", self.name));
+        if !before.trim().is_empty() {
+            out.push_str(&format!("\n\n{}", before.trim()));
+        }
         for (label, text) in [
             ("Character", &self.description),
             ("Personality", &self.personality),
@@ -200,25 +216,40 @@ impl Card {
     }
 
     /// Lorebook text for what's being talked about: constant entries, and
-    /// those whose keywords appear in `recent` (newest last).
-    pub fn lore(&self, recent: &[&str], user: &str) -> String {
-        let Some(book) = &self.character_book else { return String::new() };
-        let depth = book.scan_depth.unwrap_or(4).max(1);
-        let scan: Vec<&str> = recent.iter().rev().take(depth).copied().collect();
-        let hit = |keys: &[String], case: bool| {
+    /// those whose keywords appear in `recent` (newest last), placed where
+    /// each entry asks (see [`Lore`]).
+    pub fn lore(&self, recent: &[&str], user: &str) -> Lore {
+        let mut out = Lore::default();
+        let Some(book) = &self.character_book else { return out };
+        let scanned = |depth: usize| -> Vec<&str> { recent.iter().rev().take(depth.max(1)).copied().collect() };
+        let hit = |keys: &[String], case: bool, scan: &[&str]| {
             keys.iter().map(|k| k.trim()).filter(|k| !k.is_empty()).any(|k| {
                 scan.iter().any(|t| if case { t.contains(k) } else { t.to_lowercase().contains(&k.to_lowercase()) })
             })
         };
-        let mut picked: Vec<&Entry> = book
-            .entries
-            .iter()
-            .filter(|e| e.enabled && !e.content.trim().is_empty())
-            .filter(|e| e.constant || (hit(&e.keys, e.case_sensitive) && (!e.selective || e.secondary_keys.is_empty() || hit(&e.secondary_keys, e.case_sensitive))))
-            .collect();
-        picked.sort_by_key(|e| e.insertion_order);
-        let text = picked.iter().map(|e| e.content.trim()).collect::<Vec<_>>().join("\n\n");
-        self.fill(&text, user)
+        let mut picked: Vec<(&Entry, Placed, String)> = Vec::new();
+        for e in book.entries.iter().filter(|e| e.enabled) {
+            let (d, text) = decorators(&e.content);
+            if text.trim().is_empty() || d.dont_activate {
+                continue;
+            }
+            let scan = scanned(d.scan_depth.or(book.scan_depth).unwrap_or(4));
+            let on = e.constant
+                || d.activate
+                || (hit(&e.keys, e.case_sensitive, &scan) && (!e.selective || e.secondary_keys.is_empty() || hit(&e.secondary_keys, e.case_sensitive, &scan)));
+            if on {
+                picked.push((e, placement(e, &d), self.fill(text.trim(), user)));
+            }
+        }
+        picked.sort_by_key(|(e, _, _)| e.insertion_order);
+        let join = |v: Vec<&str>| v.join("\n\n");
+        out.before = join(picked.iter().filter(|p| matches!(p.1, Placed::Before)).map(|p| p.2.as_str()).collect());
+        out.after = join(picked.iter().filter(|p| matches!(p.1, Placed::After)).map(|p| p.2.as_str()).collect());
+        let mut notes: Vec<(usize, Role, &str)> = picked.iter().filter_map(|p| match p.1 { Placed::Depth(n, r) => Some((n, r, p.2.as_str())), _ => None }).collect();
+        // Deepest first, so depth 0 ends up last (sort is stable: order kept within a depth).
+        notes.sort_by_key(|n| std::cmp::Reverse(n.0));
+        out.notes = notes.into_iter().map(|(depth, role, text)| Note { depth, role, text: text.to_owned() }).collect();
+        out
     }
 
     /// Writes the card into a PNG picture (replacing any card already in it).
@@ -247,6 +278,118 @@ impl Card {
             bail!("that PNG is cut short");
         }
         Ok(out)
+    }
+}
+
+/// Lorebook entries for one reply, by where they go.
+#[derive(Debug, Default, PartialEq)]
+pub struct Lore {
+    /// Ahead of the character description (`before_char`, `@@position before_desc`).
+    pub before: String,
+    /// After the character, as world info (the default).
+    pub after: String,
+    /// At a depth in the chat (`@@depth N`, SillyTavern's "at depth"),
+    /// deepest first: these go at the end of the conversation, where
+    /// reminders actually work, not up in the system prompt.
+    pub notes: Vec<Note>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Note {
+    pub depth: usize,
+    pub role: Role,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Placed {
+    Before,
+    After,
+    Depth(usize, Role),
+}
+
+/// An entry's CCv3 decorators (`@@name value` lines at the top of its text).
+#[derive(Debug, Default)]
+struct Decor {
+    depth: Option<usize>,
+    role: Option<Role>,
+    position: Option<String>,
+    activate: bool,
+    dont_activate: bool,
+    scan_depth: Option<usize>,
+}
+
+fn role(s: &str) -> Option<Role> {
+    match s.trim().to_lowercase().as_str() {
+        "system" | "0" => Some(Role::System),
+        "user" | "1" => Some(Role::User),
+        "assistant" | "model" | "2" => Some(Role::Assistant),
+        _ => None,
+    }
+}
+
+/// Splits the decorators off an entry's text. Every `@@…` line is taken
+/// out (`@@@` fallbacks and ones this app doesn't use too), so none reach
+/// the model as prose.
+fn decorators(content: &str) -> (Decor, String) {
+    let mut d = Decor::default();
+    let mut text = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("@@") else {
+            text.push(line);
+            continue;
+        };
+        if rest.starts_with('@') {
+            continue;
+        }
+        let (name, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let value = value.trim();
+        match name.to_lowercase().as_str() {
+            "depth" => d.depth = value.parse().ok(),
+            "role" => d.role = role(value),
+            "position" => d.position = Some(value.to_lowercase()),
+            "activate" => d.activate = true,
+            "dont_activate" => d.dont_activate = true,
+            "scan_depth" => d.scan_depth = value.parse().ok(),
+            _ => {}
+        }
+    }
+    (d, text.join("\n"))
+}
+
+/// Where an entry goes: decorators first, then SillyTavern's extensions
+/// (position 0 before, 4 at depth), then the CCv3 `position` field.
+fn placement(e: &Entry, d: &Decor) -> Placed {
+    let ext = |k: &str| e.extensions.get(k);
+    let ext_num = |k: &str| ext(k).and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()));
+    let ext_role = ext("role").and_then(|v| role(&v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_owned))?));
+    let role = d.role.or(ext_role).unwrap_or(Role::System);
+    if let Some(depth) = d.depth {
+        return Placed::Depth(depth, role);
+    }
+    match d.position.as_deref() {
+        Some("before_desc" | "before_char") => return Placed::Before,
+        Some(_) => return Placed::After,
+        None => {}
+    }
+    match ext_num("position") {
+        Some(0) => return Placed::Before,
+        Some(4) => return Placed::Depth(ext_num("depth").unwrap_or(4) as usize, role),
+        Some(_) => return Placed::After,
+        None => {}
+    }
+    match &e.position {
+        Some(Value::String(p)) if p == "before_char" => Placed::Before,
+        Some(Value::Number(n)) if n.as_u64() == Some(0) => Placed::Before,
+        _ => Placed::After,
     }
 }
 
@@ -499,13 +642,44 @@ mod tests {
         assert!(sys.contains("Mira runs a tea shop."));
         assert!(!sys.contains("Scenario"));
         assert_eq!(card.fill(&card.first_mes, "Sam"), "Welcome, Sam!");
-        assert_eq!(card.lore(&["hello"], "Sam"), "The shop is in Kyoto.");
-        assert_eq!(card.lore(&["where is oolong?"], "Sam"), "The shop is in Kyoto.\n\nOolong is the shop cat.");
+        let after = |t: &str| card.lore(&[t], "Sam").after;
+        assert_eq!(after("hello"), "The shop is in Kyoto.");
+        assert_eq!(after("where is oolong?"), "The shop is in Kyoto.\n\nOolong is the shop cat.");
         // Past the scan depth: not seen.
-        assert_eq!(card.lore(&["oolong", "a", "b"], "Sam"), "The shop is in Kyoto.");
-        assert!(!card.lore(&["tea please"], "Sam").contains("coins"));
-        assert!(card.lore(&["tea price?"], "Sam").contains("3 coins"));
-        assert!(!card.lore(&["off"], "Sam").contains("never"));
+        assert_eq!(card.lore(&["oolong", "a", "b"], "Sam").after, "The shop is in Kyoto.");
+        assert!(!after("tea please").contains("coins"));
+        assert!(after("tea price?").contains("3 coins"));
+        assert!(!after("off").contains("never"));
+    }
+
+    #[test]
+    fn lore_decorators_place_entries() {
+        let card = Card::from_json(json!({"spec": "chara_card_v3", "spec_version": "3.0", "data": {
+            "name": "Mira",
+            "character_book": {"entries": [
+                {"keys": [], "constant": true, "insertion_order": 20,
+                 "content": "@@depth 0\n@@role assistant\n@@position after_desc\n@@ignore_on_max_context\nEnd every reply with <state>.", "enabled": true},
+                {"keys": [], "constant": true, "insertion_order": 5, "content": "@@position before_desc\nIt is raining.", "enabled": true},
+                {"keys": [], "constant": true, "insertion_order": 30, "content": "Tea is cheap.", "enabled": true},
+                {"keys": [], "constant": true, "insertion_order": 1, "content": "Deep note.", "enabled": true,
+                 "extensions": {"position": 4, "depth": 3, "role": 1}},
+                {"keys": [], "constant": true, "content": "@@dont_activate\nNever.", "enabled": true},
+                {"keys": ["zzz"], "content": "@@activate\nAlways.", "enabled": true}
+            ]}
+        }}))
+        .unwrap();
+        let l = card.lore(&["hi"], "Sam");
+        assert_eq!(l.before, "It is raining.");
+        assert_eq!(l.after, "Tea is cheap.\n\nAlways.");
+        assert_eq!(
+            l.notes,
+            [
+                Note { depth: 3, role: Role::User, text: "Deep note.".into() },
+                Note { depth: 0, role: Role::Assistant, text: "End every reply with <state>.".into() },
+            ]
+        );
+        // SillyTavern's extensions survive a round trip.
+        assert_eq!(Card::from_json(card.to_v3()).unwrap().character_book.unwrap().entries[3].extensions["depth"], 3);
     }
 
     #[test]

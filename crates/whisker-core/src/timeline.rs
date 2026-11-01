@@ -20,6 +20,26 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Shown for messages this device has no keys for yet.
+/// Whether a message body is the "can't decrypt" placeholder.
+pub fn is_undecryptable(body: &str) -> bool {
+    body.starts_with(UNDECRYPTABLE)
+}
+
+/// Why a message can't be decrypted, in plain words.
+pub fn undecryptable_reason(r: &matrix_sdk::deserialized_responses::UnableToDecryptReason) -> String {
+    use matrix_sdk::deserialized_responses::UnableToDecryptReason as R;
+    match r {
+        R::MissingMegolmSession { withheld_code: None } => "no key for it on this device".into(),
+        R::MissingMegolmSession { withheld_code: Some(code) } => format!("the sender's device withheld the key: {code}"),
+        R::UnknownMegolmMessageIndex => "this device has the key, but only from a later message on".into(),
+        R::MegolmDecryptionFailure => "the key on this device doesn't fit it".into(),
+        R::MismatchedIdentityKeys => "the key came from a device that doesn't match the sender".into(),
+        R::SenderIdentityNotTrusted(_) => "the sender isn't trusted enough".into(),
+        R::MalformedEncryptedEvent => "the message is malformed".into(),
+        other => format!("{other:?}"),
+    }
+}
+
 pub const UNDECRYPTABLE: &str = "Encrypted message — this device doesn't have the key yet";
 
 #[derive(Debug, Clone)]
@@ -506,8 +526,10 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
     let mut out = Vec::new();
     let mut reactions = Vec::new();
     let mut from = from;
+    let mut saw_create = false;
     for _ in 0..5 {
-        let (mut items, mut r, older) = history_page(room, from.clone(), limit).await?;
+        let (mut items, mut r, older, created) = history_page(room, from.clone(), limit).await?;
+        saw_create |= created;
         reactions.append(&mut r);
         items.append(&mut out);
         out = items;
@@ -521,12 +543,58 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
             break;
         }
     }
+    // The server stopped before the room's start: it hides what came before
+    // we joined (or were invited). Say so, since keys can't bring it back.
+    if from.is_none() && !saw_create {
+        use matrix_sdk::ruma::events::room::history_visibility::HistoryVisibility;
+        let text = match room.history_visibility_or_default() {
+            HistoryVisibility::Joined => Some(hidden_history("joined")),
+            HistoryVisibility::Invited => Some(hidden_history("were invited")),
+            // History is open to members, but the server gave nothing older.
+            _ => Some(
+                "No older messages came from your server. The room lets members see its history, so \
+                 your server doesn't have it: it may not have fetched it from the server the room started on."
+                    .to_owned(),
+            ),
+        };
+        if let (Some(text), Ok(id)) = (text, OwnedEventId::try_from("$whisker-history-start")) {
+            let ts = out.first().map_or(0u64, |m| u64::from(m.ts.get()).saturating_sub(1));
+            out.insert(
+                0,
+                HistoryItem {
+                    event_id: id,
+                    sender: room.own_user_id().to_owned(),
+                    sender_name: None,
+                    sender_avatar: None,
+                    body: text,
+                    ts: MilliSecondsSinceUnixEpoch(UInt::new(ts).unwrap_or_default()),
+                    reply_to: None,
+                    media: None,
+                    edited: false,
+                    notice: true,
+                    member: None,
+                    thread: None,
+                    pills: Vec::new(),
+                    shield: None,
+                },
+            );
+        }
+    }
     Ok(Page { items: out, reactions, older: from })
 }
 
 /// One `/messages` request: its items, oldest first, and the token for the
 /// page before (`None` at the start of the room).
-async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(Vec<HistoryItem>, Vec<Reaction>, Option<String>)> {
+fn hidden_history(when: &str) -> String {
+    format!(
+        "Earlier messages are hidden: this room only shows members its history from when they {when}. \
+         The server doesn't send older messages to you, so importing keys can't bring them back. \
+         A room admin can change this (History: all members) for messages sent from now on."
+    )
+}
+
+/// Also says whether the room's creation event was on it.
+async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(Vec<HistoryItem>, Vec<Reaction>, Option<String>, bool)> {
     let mut opts = MessagesOptions::backward();
     opts.limit = UInt::from(limit);
     opts.from = from;
@@ -537,6 +605,7 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     // A short page means the server had nothing more to give: either the
     // start of the room or the start of what we're allowed to see.
     let mut at_start = msgs.chunk.len() < limit as usize || msgs.end.is_none();
+    let mut created = false;
     let mut reactions = Vec::new();
     // Newest first: an edit is seen before the message it changes.
     for ev in &msgs.chunk {
@@ -544,7 +613,8 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             Ok(AnySyncTimelineEvent::MessageLike(m)) => m,
             Ok(AnySyncTimelineEvent::State(_)) => {
                 let Some(st) = state_event(ev.raw()) else { continue };
-                at_start |= matches!(st, AnySyncStateEvent::RoomCreate(_));
+                created |= matches!(st, AnySyncStateEvent::RoomCreate(_));
+                at_start |= created;
                 if let Some(item) = notice_item(room, &st, &mut profiles).await {
                     out.push(item);
                 }
@@ -560,12 +630,14 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)) => {
                 (m.event_id, m.sender, m.origin_server_ts, parse(&m.content))
             }
-            AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(m)) => (
-                m.event_id,
-                m.sender,
-                m.origin_server_ts,
-                Parsed::New { body: UNDECRYPTABLE.to_owned(), is_text: false, reply_to: None, media: None, thread: None, pills: Vec::new() },
-            ),
+            AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(m)) => {
+                let why = match &ev.kind {
+                    matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt { utd_info, .. } => undecryptable_reason(&utd_info.reason),
+                    _ => "unknown reason".to_owned(),
+                };
+                let body = format!("{UNDECRYPTABLE} ({why})");
+                (m.event_id, m.sender, m.origin_server_ts, Parsed::New { body, is_text: false, reply_to: None, media: None, thread: None, pills: Vec::new() })
+            }
             _ => continue,
         };
         let (body, reply_to, media, thread, pills) = match parsed {
@@ -598,7 +670,7 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
         });
     }
     out.reverse();
-    Ok((out, reactions, if at_start { None } else { msgs.end }))
+    Ok((out, reactions, if at_start { None } else { msgs.end }, created))
 }
 
 /// A room (state) event from the timeline. Reads `prev_content` from the top

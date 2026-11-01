@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use ui::{MsgRow, PixelCache, Pixels, initial_hue, s};
 use whisker_agent::{Detected, Llm, agents_in, save_agents};
-use whisker_core::timeline::{self, HistoryItem, MediaKind, UNDECRYPTABLE};
+use whisker_core::timeline::{self, HistoryItem, MediaKind};
 use whisker_core::{AccountId, AccountKind, AccountManager, AccountSummary, ClientEvent, LoginRequest, ModAction, VaultId};
 
 slint::include_modules!();
@@ -626,7 +626,7 @@ impl Ctl {
                     .latest
                     .as_ref()
                     .map(|l| {
-                        if l.body == UNDECRYPTABLE {
+                        if timeline::is_undecryptable(&l.body) {
                             "Encrypted message".to_owned()
                         } else {
                             format!("{}: {}", l.sender_label(), l.body.lines().find(|x| !x.trim().is_empty()).unwrap_or_default())
@@ -2581,7 +2581,7 @@ impl Ctl {
         }
         let who = sender_name.unwrap_or_else(|| sender.localpart().to_owned());
         let room_name = timeline::room_name(&room).await;
-        let text = if body == UNDECRYPTABLE { "Encrypted message".to_owned() } else { body };
+        let text = if timeline::is_undecryptable(&body) { "Encrypted message".to_owned() } else { body };
         let Some((summary, text)) = notify::content(detail, &who, &room_name, direct, &text) else { return };
         // One notification per room: a newer message replaces it.
         let replaces = self.st.lock().unwrap().notified.get(&key).filter(|(_, t)| t.elapsed() < Duration::from_secs(300)).map_or(0, |n| n.0);

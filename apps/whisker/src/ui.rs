@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use whisker_core::timeline::{HistoryItem, MediaKind, UNDECRYPTABLE};
+use whisker_core::timeline::{HistoryItem, MediaKind};
 
 pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 /// An animation: its frames, and how long each shows (ms).
@@ -345,7 +345,7 @@ impl Models {
             avatar: self.avatar(&r.item.sender_avatar, pixels),
             first: r.first,
             day: s(&r.day),
-            faint: local || r.item.body == UNDECRYPTABLE,
+            faint: local || whisker_core::timeline::is_undecryptable(&r.item.body),
             edited: r.item.edited,
             reply_name: s(reply_name),
             reply_text: s(reply_text),

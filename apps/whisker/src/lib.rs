@@ -91,6 +91,9 @@ struct State {
     marks_pending: HashSet<RoomKey>,
     /// Animated pictures (GIF, WebP): their frames and ms per frame.
     animations: HashMap<OwnedEventId, ui::Frames>,
+    /// Whether each account has verified each person it sees messages from
+    /// (see [`ui::Trust`]), looked up once and kept.
+    trust: HashMap<(AccountId, OwnedUserId), ui::Trust>,
     /// Rooms marked read locally: the server's unread count at that moment.
     /// The badge stays hidden until the server reports a different count.
     cleared: HashMap<RoomKey, u64>,
@@ -756,6 +759,7 @@ impl Ctl {
                     readers: readers.remove(&i).unwrap_or_default(),
                     reactions: reactions.remove(&m.event_id).unwrap_or_default(),
                     thread: if thread.is_none() { threads.remove(&m.event_id) } else { None },
+                    trust: st.trust.get(&(key.0, m.sender.clone())).copied().unwrap_or_default(),
                     item: m.clone(),
                 }
             })
@@ -771,6 +775,7 @@ impl Ctl {
             return;
         };
         let rows = self.rows(&key).await;
+        self.fetch_trust(key.0, rows.iter().filter(|r| !r.mine && !r.item.notice).map(|r| r.item.sender.clone()));
         self.fetch_avatars(key.0, rows.iter().filter_map(|r| r.item.sender_avatar.clone()).chain(rows.iter().flat_map(|r| r.readers.iter().filter_map(|x| x.1.clone()))));
         let items: Vec<HistoryItem> = rows.iter().map(|r| r.item.clone()).collect();
         self.fetch_pictures(&key, &items);
@@ -1313,6 +1318,10 @@ impl Ctl {
             V::Done => ("done", vec![], String::new()),
             V::Cancelled(m) => ("cancelled", vec![], m),
         };
+        if tag == "done" {
+            // Look them up again: they're verified now.
+            self.st.lock().unwrap().trust.retain(|(a, u), _| (*a, u) != (account, &user));
+        }
         if matches!(tag, "done" | "cancelled") {
             // Keep the screen, but stop tracking so new requests can come in.
             self.st.lock().unwrap().verifying = None;
@@ -1570,6 +1579,8 @@ impl Ctl {
             member: None,
             thread: None,
             pills: picked.iter().map(|(n, u)| (n.clone(), u.to_string())).collect(),
+
+            shield: None,
         };
         self.merge(&key, vec![item]);
         self.ui(|u| u.set_stick_bottom(true));
@@ -1973,12 +1984,19 @@ impl Ctl {
                 _ => 0,
             }
         } else {
-            match whisker_core::verify::is_verified(&client, &user).await {
-                Some(true) => 2,
-                Some(false) => 1,
-                None => 0,
+            match client.encryption().request_user_identity(&user).await {
+                Ok(Some(i)) if i.has_verification_violation() => 3,
+                Ok(Some(i)) if i.is_verified() => 2,
+                Ok(Some(_)) => 1,
+                _ => 0,
             }
         };
+        // Their logins, verified ones first.
+        let mut sessions: Vec<(String, String, bool)> = match client.encryption().get_user_devices(&user).await {
+            Ok(list) => list.devices().map(|d| (d.display_name().unwrap_or("Unnamed session").to_owned(), d.device_id().to_string(), d.is_verified())).collect(),
+            Err(_) => Vec::new(),
+        };
+        sessions.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
         let (initial, hue) = initial_hue(&name);
         let is_me = me.as_ref() == Some(&user);
         let user_id = user.to_string();
@@ -1998,6 +2016,9 @@ impl Ctl {
                 can_ban,
                 has_dm,
                 verified,
+                sessions: ModelRc::new(VecModel::from(
+                    sessions.iter().map(|(name, id, v)| SessionItem { name: s(name), id: s(id), verified: *v }).collect::<Vec<_>>(),
+                )),
             });
             u.set_profile_loading(false);
         });
@@ -2321,6 +2342,43 @@ impl Ctl {
 
     /// Works out a room's read receipts again soon (at most every half
     /// second), then redraws it.
+    /// Looks up whether `account` verified each of `users` it hasn't
+    /// checked yet (from the local crypto store, no network), and redraws
+    /// when one turns out verified or changed.
+    fn fetch_trust(&self, account: AccountId, users: impl Iterator<Item = OwnedUserId>) {
+        let todo: Vec<OwnedUserId> = {
+            let mut st = self.st.lock().unwrap();
+            let mut todo: Vec<OwnedUserId> = users.filter(|u| !st.trust.contains_key(&(account, u.clone()))).collect();
+            todo.sort();
+            todo.dedup();
+            for u in &todo {
+                st.trust.insert((account, u.clone()), ui::Trust::Unknown);
+            }
+            todo
+        };
+        if todo.is_empty() {
+            return;
+        }
+        let c = self.clone();
+        self.spawn(async move {
+            let Some(client) = c.mgr.client(account).await else { return };
+            let mut changed = false;
+            for user in todo {
+                let t = match client.encryption().get_user_identity(&user).await {
+                    Ok(Some(i)) if i.has_verification_violation() => ui::Trust::Changed,
+                    Ok(Some(i)) if i.is_verified() => ui::Trust::Verified,
+                    Ok(Some(_)) => ui::Trust::Unverified,
+                    _ => ui::Trust::Unknown,
+                };
+                changed |= matches!(t, ui::Trust::Verified | ui::Trust::Changed);
+                c.st.lock().unwrap().trust.insert((account, user), t);
+            }
+            if changed && c.current().is_some_and(|k| k.0 == account) {
+                c.show_messages().await;
+            }
+        });
+    }
+
     fn schedule_marks(&self, key: RoomKey) {
         if !self.st.lock().unwrap().marks_pending.insert(key.clone()) {
             return;
@@ -2394,6 +2452,8 @@ impl Ctl {
             member: None,
             thread: Some(root.clone()),
             pills: Vec::new(),
+
+            shield: None,
         };
         self.merge(&key, vec![item]);
         self.show_thread().await;
@@ -2484,6 +2544,8 @@ impl Ctl {
 
         // Plain data for the account page; the Slint struct is built on the UI thread.
         let mut account_data: Option<(AccountSummary, Option<String>, Option<String>)> = None;
+        // This login (session): 2 verified, 1 not, 0 not signed in; and its device id.
+        let mut session = (0, String::new());
         let mut agent = AgentForm::default();
         let mut models: Vec<SharedString> = Vec::new();
         let mut detect = String::new();
@@ -2496,6 +2558,14 @@ impl Ctl {
                 self.fetch_avatars(aid, [m.clone()]);
             }
             account_data = Some((a.clone(), label, proxy));
+            if let Some(client) = self.mgr.client(aid).await {
+                let verified = match client.encryption().get_own_device().await {
+                    Ok(Some(d)) if d.is_cross_signed_by_owner() => 2,
+                    Ok(Some(_)) => 1,
+                    _ => 0,
+                };
+                session = (verified, client.device_id().map(|d| d.to_string()).unwrap_or_default());
+            }
         }
         if let Some(rest) = id.strip_prefix("ai:")
             && let Ok(aid) = rest.parse::<AccountId>()
@@ -2553,6 +2623,8 @@ impl Ctl {
                         label: s(label.clone().unwrap_or_default()),
                         tags: s(a.tags.iter().cloned().collect::<Vec<_>>().join(", ")),
                         proxy: s(proxy.clone().unwrap_or_default()),
+                        session_verified: session.0,
+                        session_id: s(&session.1),
                     }
                 }
                 None => AccountForm::default(),
@@ -2921,14 +2993,14 @@ impl Ctl {
                         self.schedule_rooms();
                     }
                 }
-                ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, thread, pills, .. } => {
+                ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, thread, pills, shield, .. } => {
                     {
                         let c = self.clone();
                         let (room_id, sender, name, body) = (room_id.clone(), sender.clone(), sender_name.clone(), body.clone());
                         self.spawn(async move { c.maybe_notify(account, room_id, sender, name, body, origin_server_ts).await });
                     }
                     let key = (account, room_id);
-                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone(), pills };
+                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone(), pills, shield };
                     // Kept for every room, so opening one shows something at once
                     // (its history still loads on first open).
                     self.merge(&key, vec![item]);
@@ -3399,6 +3471,7 @@ mod tests {
             member: member.map(|(joined, guessed)| MemberChange { user: OwnedUserId::try_from(format!("@{who}:x")).unwrap(), joined, guessed }),
             thread: None,
             pills: Vec::new(),
+            shield: None,
         };
         let mut msgs = vec![
             item("join1", "nully", Some((true, true))),

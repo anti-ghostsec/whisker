@@ -228,6 +228,19 @@ pub struct MsgRow {
     pub reactions: Vec<(String, usize, bool, String)>,
     /// For a thread's first message: replies, and the newest one ("Bob: hi").
     pub thread: Option<(usize, String)>,
+    pub trust: Trust,
+}
+
+/// Whether you've verified someone (their cross-signing identity).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Trust {
+    /// No keys to verify, or not looked up yet.
+    #[default]
+    Unknown,
+    Unverified,
+    Verified,
+    /// Verified once, but their identity has changed since: a warning.
+    Changed,
 }
 
 pub fn human_size(n: u64) -> String {
@@ -256,7 +269,7 @@ impl Models {
         let loaded = |m: &Option<OwnedMxcUri>| m.as_ref().is_some_and(|m| matches!(pixels.lock().unwrap().get(m), Some(Some(_))));
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", r.item).hash(&mut h);
-        (r.mine, r.first, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, RICH.get()).hash(&mut h);
+        (r.mine, r.first, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust, RICH.get()).hash(&mut h);
         r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
         r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
         loaded(&r.item.sender_avatar).hash(&mut h);
@@ -319,6 +332,13 @@ impl Models {
                 r.reactions.iter().map(|(key, n, mine, who)| ReactionChip { key: s(key), count: *n as i32, mine: *mine, who: s(who), picture: emoji_image(key) }).collect::<Vec<_>>(),
             )),
             mine: r.mine,
+            trust: match r.trust {
+                Trust::Unknown | Trust::Unverified => 0,
+                Trust::Verified => 1,
+                Trust::Changed => 2,
+            },
+            shield: r.item.shield.map_or(0, |sh| if sh.red { 2 } else { 1 }),
+            shield_text: s(r.item.shield.map(|sh| sh.message).unwrap_or_default()),
             time: if local { s("Sending…") } else { s(crate::fmt_time(r.item.ts)) },
             initial,
             hue,

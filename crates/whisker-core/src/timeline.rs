@@ -83,6 +83,28 @@ pub struct HistoryItem {
     pub thread: Option<OwnedEventId>,
     /// Mentions of people in the text: (name as shown, user id).
     pub pills: Vec<(String, String)>,
+    /// A warning about who really sent an encrypted message.
+    pub shield: Option<Shield>,
+}
+
+/// Element's warning shield on an encrypted message, in its lax mode: no
+/// nagging about people you never verified, but a word when the sending
+/// device isn't verified by its owner, is unknown, or the person's
+/// identity changed since you verified them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shield {
+    /// Red (the identity changed, or the sender doesn't match) or grey.
+    pub red: bool,
+    pub message: &'static str,
+}
+
+pub fn shield(info: Option<&matrix_sdk::deserialized_responses::EncryptionInfo>) -> Option<Shield> {
+    use matrix_sdk::deserialized_responses::ShieldState;
+    match info?.verification_state.to_shield_state_lax() {
+        ShieldState::Red { message, .. } => Some(Shield { red: true, message }),
+        ShieldState::Grey { message, .. } => Some(Shield { red: false, message }),
+        ShieldState::None => None,
+    }
 }
 
 /// Someone's membership after a room event.
@@ -457,6 +479,7 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             member: None,
             thread,
             pills,
+            shield: shield(ev.encryption_info().map(|i| &**i)),
         });
     }
     out.reverse();
@@ -527,6 +550,7 @@ pub async fn notice_item(
         member,
         thread: None,
         pills: Vec::new(),
+        shield: None,
     })
 }
 

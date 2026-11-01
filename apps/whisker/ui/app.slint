@@ -119,6 +119,11 @@ export struct MessageItem {
     body: string,
     blocks: [Block],
     mine: bool,
+    // 1 you verified the sender, 2 verified but their identity changed since.
+    trust: int,
+    // Encrypted by a device its owner didn't verify (1, grey) or worse (2, red).
+    shield: int,
+    shield-text: string,
     time: string,
     initial: string,
     hue: int,
@@ -185,6 +190,13 @@ export struct RoomDetails {
 }
 
 // A user's profile card.
+// One of someone's logins (devices).
+export struct SessionItem {
+    name: string,
+    id: string,
+    verified: bool,
+}
+
 export struct Profile {
     user-id: string,
     name: string,
@@ -196,9 +208,12 @@ export struct Profile {
     can-kick: bool,
     can-ban: bool,
     has-dm: bool,
-    // 0 = no encryption keys to verify, 1 = not verified, 2 = verified, -1 = checking
+    // 0 = no encryption keys to verify, 1 = not verified, 2 = verified,
+    // 3 = verified before but their identity changed, -1 = checking
     verified: int,
+    sessions: [SessionItem],
 }
+
 
 export struct EmojiItem {
     symbol: string,
@@ -300,239 +315,250 @@ component MessageRow inherits Rectangle {
     callback pick-reaction();
 
     background: area.has-hover ? Theme.hover : transparent;
-    area := TouchArea {}
-
-    cm := ContextMenuArea {
-        Menu {
-            if root.item.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.item.id); } }
-            if root.item.media == 2 || root.item.media == 3: MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
-            if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
-            if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
-            if root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
-            if root.item.media > 0 && root.item.media < 4: MenuSeparator {}
+    // Wraps the whole row, so it keeps its hover over names, pictures,
+    // links and chips too (their own touch areas sit inside it).
+    area := TouchArea {
+        cm := ContextMenuArea {
             Menu {
-                title: "React";
-                for e in root.quick-reactions: MenuItem { title: e; activated => { root.action("react:" + e, root.item.id); } }
-                MenuItem { title: "More emoji…"; activated => { root.pick-reaction(); } }
-            }
-            MenuItem { title: "Reply"; activated => { root.action("reply", root.item.id); } }
-            MenuItem { title: "Reply in thread"; activated => { root.action("thread", root.item.id); } }
-            MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
-            MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
-            MenuItem { title: "Copy text"; activated => { root.copy(root.item.body); } }
-            MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
-            if root.item.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
-            for l in root.item.links: MenuItem { title: "Open " + l; activated => { root.link(l); } }
-            MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); } }
-            if root.item.mine && root.item.media == 0: MenuItem { title: "Edit"; activated => { root.action("edit", root.item.id); } }
-            MenuSeparator {}
-            if root.item.mine || root.can-moderate: MenuItem { title: "Delete"; activated => { root.action("delete", root.item.id); } }
-            if !root.item.mine && root.can-moderate: Menu {
-                title: "Moderate " + root.item.name;
-                MenuItem { title: "Kick"; activated => { root.action("kick", root.item.id); } }
-                MenuItem { title: "Ban"; activated => { root.action("ban", root.item.id); } }
-            }
-            MenuItem { title: "View profile"; activated => { root.action("profile", root.item.id); } }
-            MenuItem { title: "Copy user id"; activated => { root.copy(root.item.sender); } }
-        }
-
-        VerticalLayout {
-            if root.item.day != "": HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                padding-top: 14px;
-                padding-bottom: 4px;
-                spacing: 10px;
-                Rectangle { height: 1px; y: 8px; background: Theme.border; horizontal-stretch: 1; }
-                Text { text: root.item.day; font-size: 11px; font-weight: 700; color: Theme.muted; }
-                Rectangle { height: 1px; y: 8px; background: Theme.border; horizontal-stretch: 1; }
-            }
-            if root.item.notice: HorizontalLayout {
-                padding-left: 64px;
-                padding-right: 16px;
-                padding-top: 3px;
-                padding-bottom: 3px;
-                spacing: 8px;
-                Text { text: root.item.body; font-size: 12px; color: Theme.muted; wrap: word-wrap; horizontal-stretch: 1; }
-                if area.has-hover: Text { text: root.item.time; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
-            }
-            if !root.item.notice: HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                padding-top: root.item.first ? 10px : 1px;
-                padding-bottom: 2px;
-                spacing: 12px;
-                VerticalLayout {
-                    width: 36px;
-                    alignment: start;
-                    if root.item.first: Avatar {
-                        initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; size: 36px;
-                        TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
-                    }
-                    if !root.item.first && area.has-hover: Text { text: root.item.time; font-size: 9px; color: Theme.muted; horizontal-alignment: right; height: 20px; vertical-alignment: center; }
+                if root.item.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.item.id); } }
+                if root.item.media == 2 || root.item.media == 3: MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
+                if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
+                if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
+                if root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
+                if root.item.media > 0 && root.item.media < 4: MenuSeparator {}
+                Menu {
+                    title: "React";
+                    for e in root.quick-reactions: MenuItem { title: e; activated => { root.action("react:" + e, root.item.id); } }
+                    MenuItem { title: "More emoji…"; activated => { root.pick-reaction(); } }
                 }
-                VerticalLayout {
-                    spacing: 3px;
-                    if root.item.first: HorizontalLayout {
-                        spacing: 8px;
+                MenuItem { title: "Reply"; activated => { root.action("reply", root.item.id); } }
+                MenuItem { title: "Reply in thread"; activated => { root.action("thread", root.item.id); } }
+                MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
+                MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
+                MenuItem { title: "Copy text"; activated => { root.copy(root.item.body); } }
+                MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
+                if root.item.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
+                for l in root.item.links: MenuItem { title: "Open " + l; activated => { root.link(l); } }
+                MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); } }
+                if root.item.mine && root.item.media == 0: MenuItem { title: "Edit"; activated => { root.action("edit", root.item.id); } }
+                MenuSeparator {}
+                if root.item.mine || root.can-moderate: MenuItem { title: "Delete"; activated => { root.action("delete", root.item.id); } }
+                if !root.item.mine && root.can-moderate: Menu {
+                    title: "Moderate " + root.item.name;
+                    MenuItem { title: "Kick"; activated => { root.action("kick", root.item.id); } }
+                    MenuItem { title: "Ban"; activated => { root.action("ban", root.item.id); } }
+                }
+                MenuItem { title: "View profile"; activated => { root.action("profile", root.item.id); } }
+                MenuItem { title: "Copy user id"; activated => { root.copy(root.item.sender); } }
+            }
+
+            VerticalLayout {
+                if root.item.day != "": HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    padding-top: 14px;
+                    padding-bottom: 4px;
+                    spacing: 10px;
+                    Rectangle { height: 1px; y: 8px; background: Theme.border; horizontal-stretch: 1; }
+                    Text { text: root.item.day; font-size: 11px; font-weight: 700; color: Theme.muted; }
+                    Rectangle { height: 1px; y: 8px; background: Theme.border; horizontal-stretch: 1; }
+                }
+                if root.item.notice: HorizontalLayout {
+                    padding-left: 64px;
+                    padding-right: 16px;
+                    padding-top: 3px;
+                    padding-bottom: 3px;
+                    spacing: 8px;
+                    Text { text: root.item.body; font-size: 12px; color: Theme.muted; wrap: word-wrap; horizontal-stretch: 1; }
+                    if area.has-hover: Text { text: root.item.time; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
+                }
+                if !root.item.notice: HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    padding-top: root.item.first ? 10px : 1px;
+                    padding-bottom: 2px;
+                    spacing: 12px;
+                    VerticalLayout {
+                        width: 36px;
                         alignment: start;
-                        Text {
-                            text: root.item.name;
-                            font-weight: 700;
-                            color: root.item.mine ? Theme.accent : Theme.text;
-                            font-size: 14px;
-                            // Click a name to reply to this message.
-                            TouchArea { mouse-cursor: pointer; clicked => { root.action("reply", root.item.id); } }
+                        if root.item.first: Avatar {
+                            initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; size: 36px;
+                            TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
                         }
-                        Text { text: root.item.time; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                        if !root.item.first && area.has-hover: Text { text: root.item.time; font-size: 9px; color: Theme.muted; horizontal-alignment: right; height: 20px; vertical-alignment: center; }
                     }
-                    if root.item.reply-name != "": HorizontalLayout {
-                        spacing: 6px;
-                        Rectangle { width: 2px; background: Theme.muted.transparentize(0.5); }
-                        Text { text: root.item.reply-name; font-size: 12px; font-weight: 700; color: Theme.muted; }
-                        Text { text: root.item.reply-text; font-size: 12px; color: Theme.muted; overflow: elide; horizontal-stretch: 1; }
-                    }
-                    // Narrow chat (side panel open): shrink, keeping the shape.
-                    // Pictures, and videos that came with a preview frame.
-                    if root.item.media == 1 || (root.item.media == 2 && root.item.picture.width > 0): Rectangle {
-                        property <float> fit: min(1, max(60px, root.width - 100px) / max(1px, root.item.picture-width));
-                        // Animated pictures step through their frames, looping.
-                        property <int> frame: 0;
-                        width: root.item.picture-width * self.fit;
-                        height: root.item.picture-height * self.fit;
-                        border-radius: 8px;
-                        clip: true;
-                        background: Theme.raised;
-                        Timer {
-                            interval: max(20, root.item.frame-ms) * 1ms;
-                            running: root.item.frames.length > 1;
-                            triggered => { parent.frame = mod(parent.frame + 1, root.item.frames.length); }
-                        }
-                        if root.item.picture.width > 0 && root.item.frames.length == 0: Image { source: root.item.picture; width: parent.width; height: parent.height; image-fit: cover; }
-                        if root.item.frames.length > 0: Image { source: root.item.frames[min(parent.frame, root.item.frames.length - 1)]; width: parent.width; height: parent.height; image-fit: cover; }
-                        if root.item.picture.width == 0: Text { text: "Loading image…"; color: Theme.muted; font-size: 12px; }
-                        if root.item.media == 2: Rectangle {
-                            width: 48px; height: 48px; border-radius: 24px;
-                            background: #000000a0;
-                            Text { text: "▶"; color: white; font-size: 20px; }
-                        }
-                        // Takes every button, so it opens the menu itself on right-click.
-                        TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.action(root.item.media == 2 ? "play" : "view", root.item.id); }
-                            pointer-event(e) => {
-                                if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
+                    VerticalLayout {
+                        spacing: 3px;
+                        if root.item.first: HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            Text {
+                                text: root.item.name;
+                                font-weight: 700;
+                                color: root.item.mine ? Theme.accent : Theme.text;
+                                font-size: 14px;
+                                // Click a name to reply to this message.
+                                TouchArea { mouse-cursor: pointer; clicked => { root.action("reply", root.item.id); } }
                             }
+                            if root.item.trust == 1: Text { text: "✓ Verified"; color: Theme.ok; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+                            if root.item.trust == 2: Text { text: "⚠ Identity changed"; color: Theme.danger; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+                            Text { text: root.item.time; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
                         }
-                    }
-                    if root.item.media > 2 || (root.item.media == 2 && root.item.picture.width == 0): Rectangle {
-                        height: 52px;
-                        max-width: 340px;
-                        border-radius: 8px;
-                        background: Theme.raised;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        HorizontalLayout {
-                            padding: 8px;
-                            spacing: 10px;
-                            Rectangle {
-                                width: 36px;
-                                border-radius: 6px;
-                                background: Theme.accent-soft;
-                                Text {
-                                    text: root.item.media == 2 || root.item.media == 3 ? "▶" : "FILE";
-                                    font-size: root.item.media == 2 || root.item.media == 3 ? 16px : 9px; font-weight: 800; color: Theme.accent;
+                        if root.item.reply-name != "": HorizontalLayout {
+                            spacing: 6px;
+                            Rectangle { width: 2px; background: Theme.muted.transparentize(0.5); }
+                            Text { text: root.item.reply-name; font-size: 12px; font-weight: 700; color: Theme.muted; }
+                            Text { text: root.item.reply-text; font-size: 12px; color: Theme.muted; overflow: elide; horizontal-stretch: 1; }
+                        }
+                        // Narrow chat (side panel open): shrink, keeping the shape.
+                        // Pictures, and videos that came with a preview frame.
+                        if root.item.media == 1 || (root.item.media == 2 && root.item.picture.width > 0): Rectangle {
+                            property <float> fit: min(1, max(60px, root.width - 100px) / max(1px, root.item.picture-width));
+                            // Animated pictures step through their frames, looping.
+                            property <int> frame: 0;
+                            width: root.item.picture-width * self.fit;
+                            height: root.item.picture-height * self.fit;
+                            border-radius: 8px;
+                            clip: true;
+                            background: Theme.raised;
+                            Timer {
+                                interval: max(20, root.item.frame-ms) * 1ms;
+                                running: root.item.frames.length > 1;
+                                triggered => { parent.frame = mod(parent.frame + 1, root.item.frames.length); }
+                            }
+                            if root.item.picture.width > 0 && root.item.frames.length == 0: Image { source: root.item.picture; width: parent.width; height: parent.height; image-fit: cover; }
+                            if root.item.frames.length > 0: Image { source: root.item.frames[min(parent.frame, root.item.frames.length - 1)]; width: parent.width; height: parent.height; image-fit: cover; }
+                            if root.item.picture.width == 0: Text { text: "Loading image…"; color: Theme.muted; font-size: 12px; }
+                            if root.item.media == 2: Rectangle {
+                                width: 48px; height: 48px; border-radius: 24px;
+                                background: #000000a0;
+                                Text { text: "▶"; color: white; font-size: 20px; }
+                            }
+                            // Takes every button, so it opens the menu itself on right-click.
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.action(root.item.media == 2 ? "play" : "view", root.item.id); }
+                                pointer-event(e) => {
+                                    if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
                                 }
                             }
-                            VerticalLayout {
-                                alignment: center;
-                                Text { text: root.item.media-name; color: Theme.text; overflow: elide; font-weight: 600; }
-                                Text { text: root.item.media-info; color: Theme.muted; font-size: 11px; }
-                            }
                         }
-                        TouchArea {
-                            mouse-cursor: pointer;
-                            // Videos and audio play; other files save.
-                            clicked => { root.action(root.item.media == 2 || root.item.media == 3 ? "play" : "save", root.item.id); }
-                            pointer-event(e) => {
-                                if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
-                            }
-                        }
-                    }
-                    if root.item.big-emoji.length > 0: HorizontalLayout {
-                        alignment: start;
-                        spacing: 4px;
-                        for pic in root.item.big-emoji: Image { source: pic; width: 40px; height: 40px; }
-                    }
-                    if root.item.media == 0 && root.item.big-emoji.length == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } }
-                    if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
-                    if root.item.thread-replies > 0: Rectangle {
-                        height: 26px;
-                        width: min(th.preferred-width + 16px, 360px);
-                        border-radius: 8px;
-                        background: th-ta.has-hover ? Theme.hover : Theme.raised;
-                        th := HorizontalLayout {
-                            x: 8px;
-                            width: parent.width - 16px;
-                            spacing: 6px;
-                            Text {
-                                text: root.item.thread-replies == 1 ? "1 reply" : root.item.thread-replies + " replies";
-                                font-size: 12px; font-weight: 700; color: Theme.accent; vertical-alignment: center;
-                            }
-                            Text { text: root.item.thread-last; font-size: 12px; color: Theme.muted; overflow: elide; vertical-alignment: center; }
-                        }
-                        th-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("thread", root.item.id); } }
-                    }
-                    if root.item.reactions.length > 0: HorizontalLayout {
-                        alignment: start;
-                        spacing: 4px;
-                        padding-top: 2px;
-                        for r in root.item.reactions: Rectangle {
-                            height: 24px;
-                            width: chip.preferred-width + 14px;
-                            border-radius: 12px;
-                            background: r.mine ? Theme.accent-soft : chip-ta.has-hover ? Theme.hover : Theme.raised;
+                        if root.item.media > 2 || (root.item.media == 2 && root.item.picture.width == 0): Rectangle {
+                            height: 52px;
+                            max-width: 340px;
+                            border-radius: 8px;
+                            background: Theme.raised;
                             border-width: 1px;
-                            border-color: r.mine ? Theme.accent : Theme.border;
-                            chip := HorizontalLayout {
-                                x: 7px;
-                                spacing: 4px;
-                                if r.picture.width > 0: Image { source: r.picture; width: 16px; height: 16px; y: (parent.height - self.height) / 2; }
-                                if r.picture.width == 0: Text { text: r.key; font-size: 13px; vertical-alignment: center; }
-                                Text { text: r.count; font-size: 11px; font-weight: 700; color: r.mine ? Theme.accent : Theme.muted; vertical-alignment: center; }
+                            border-color: Theme.border;
+                            HorizontalLayout {
+                                padding: 8px;
+                                spacing: 10px;
+                                Rectangle {
+                                    width: 36px;
+                                    border-radius: 6px;
+                                    background: Theme.accent-soft;
+                                    Text {
+                                        text: root.item.media == 2 || root.item.media == 3 ? "▶" : "FILE";
+                                        font-size: root.item.media == 2 || root.item.media == 3 ? 16px : 9px; font-weight: 800; color: Theme.accent;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Text { text: root.item.media-name; color: Theme.text; overflow: elide; font-weight: 600; }
+                                    Text { text: root.item.media-info; color: Theme.muted; font-size: 11px; }
+                                }
                             }
-                            chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("react:" + r.key, root.item.id); } }
-                            // Who reacted, on hover.
-                            if chip-ta.has-hover: Rectangle {
-                                y: -28px;
-                                height: 22px;
-                                width: min(260px, tip.preferred-width + 14px);
-                                border-radius: 6px;
-                                background: Theme.panel;
-                                border-width: 1px;
-                                border-color: Theme.border;
-                                tip := Text { text: r.who; font-size: 11px; color: Theme.text; overflow: elide; width: parent.width - 14px; }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                // Videos and audio play; other files save.
+                                clicked => { root.action(root.item.media == 2 || root.item.media == 3 ? "play" : "save", root.item.id); }
+                                pointer-event(e) => {
+                                    if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
+                                }
                             }
                         }
-                        Rectangle {
-                            height: 24px;
-                            width: 30px;
-                            border-radius: 12px;
-                            background: add-ta.has-hover ? Theme.hover : transparent;
-                            Text { text: "+"; font-size: 14px; color: Theme.muted; }
-                            add-ta := TouchArea { mouse-cursor: pointer; clicked => { root.pick-reaction(); } }
+                        if root.item.big-emoji.length > 0: HorizontalLayout {
+                            alignment: start;
+                            spacing: 4px;
+                            for pic in root.item.big-emoji: Image { source: pic; width: 40px; height: 40px; }
+                        }
+                        if root.item.media == 0 && root.item.big-emoji.length == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } }
+                        if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
+                        // Who really sent it: the warning always, the reason on hover.
+                        if root.item.shield > 0: Text {
+                            text: area.has-hover ? "⚠ " + root.item.shield-text : "⚠";
+                            font-size: 10px;
+                            color: root.item.shield == 2 ? Theme.danger : Theme.muted;
+                            wrap: word-wrap;
+                        }
+                        if root.item.thread-replies > 0: Rectangle {
+                            height: 26px;
+                            width: min(th.preferred-width + 16px, 360px);
+                            border-radius: 8px;
+                            background: th-ta.has-hover ? Theme.hover : Theme.raised;
+                            th := HorizontalLayout {
+                                x: 8px;
+                                width: parent.width - 16px;
+                                spacing: 6px;
+                                Text {
+                                    text: root.item.thread-replies == 1 ? "1 reply" : root.item.thread-replies + " replies";
+                                    font-size: 12px; font-weight: 700; color: Theme.accent; vertical-alignment: center;
+                                }
+                                Text { text: root.item.thread-last; font-size: 12px; color: Theme.muted; overflow: elide; vertical-alignment: center; }
+                            }
+                            th-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("thread", root.item.id); } }
+                        }
+                        if root.item.reactions.length > 0: HorizontalLayout {
+                            alignment: start;
+                            spacing: 4px;
+                            padding-top: 2px;
+                            for r in root.item.reactions: Rectangle {
+                                height: 24px;
+                                width: chip.preferred-width + 14px;
+                                border-radius: 12px;
+                                background: r.mine ? Theme.accent-soft : chip-ta.has-hover ? Theme.hover : Theme.raised;
+                                border-width: 1px;
+                                border-color: r.mine ? Theme.accent : Theme.border;
+                                chip := HorizontalLayout {
+                                    x: 7px;
+                                    spacing: 4px;
+                                    if r.picture.width > 0: Image { source: r.picture; width: 16px; height: 16px; y: (parent.height - self.height) / 2; }
+                                    if r.picture.width == 0: Text { text: r.key; font-size: 13px; vertical-alignment: center; }
+                                    Text { text: r.count; font-size: 11px; font-weight: 700; color: r.mine ? Theme.accent : Theme.muted; vertical-alignment: center; }
+                                }
+                                chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("react:" + r.key, root.item.id); } }
+                                // Who reacted, on hover.
+                                if chip-ta.has-hover: Rectangle {
+                                    y: -28px;
+                                    height: 22px;
+                                    width: min(260px, tip.preferred-width + 14px);
+                                    border-radius: 6px;
+                                    background: Theme.panel;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    tip := Text { text: r.who; font-size: 11px; color: Theme.text; overflow: elide; width: parent.width - 14px; }
+                                }
+                            }
+                            Rectangle {
+                                height: 24px;
+                                width: 30px;
+                                border-radius: 12px;
+                                background: add-ta.has-hover ? Theme.hover : transparent;
+                                Text { text: "+"; font-size: 14px; color: Theme.muted; }
+                                add-ta := TouchArea { mouse-cursor: pointer; clicked => { root.pick-reaction(); } }
+                            }
                         }
                     }
                 }
-            }
-            // Read receipts: who has read up to here.
-            if root.item.readers.length > 0: HorizontalLayout {
-                alignment: end;
-                padding-right: 16px;
-                padding-bottom: 2px;
-                spacing: 2px;
-                for r in root.item.readers: Avatar { initial: r.initial; hue: r.hue; image: r.avatar; size: 16px; }
-                if root.item.more-readers > 0: Text { text: "+" + root.item.more-readers; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
+                // Read receipts: who has read up to here.
+                if root.item.readers.length > 0: HorizontalLayout {
+                    alignment: end;
+                    padding-right: 16px;
+                    padding-bottom: 2px;
+                    spacing: 2px;
+                    for r in root.item.readers: Avatar { initial: r.initial; hue: r.hue; image: r.avatar; size: 16px; }
+                    if root.item.more-readers > 0: Text { text: "+" + root.item.more-readers; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
+                }
             }
         }
     }
@@ -1622,6 +1648,14 @@ export component AppWindow inherits Window {
                                     height: 18px; width: nt.preferred-width + 12px; border-radius: 9px; background: Theme.raised;
                                     nt := Text { text: "Not verified"; font-size: 10px; font-weight: 700; color: Theme.muted; }
                                 }
+                                if root.profile.verified == 3: Rectangle {
+                                    height: 18px; width: ct.preferred-width + 12px; border-radius: 9px; background: Theme.danger.transparentize(0.75);
+                                    ct := Text { text: "⚠ Identity changed"; font-size: 10px; font-weight: 700; color: Theme.danger; }
+                                }
+                            }
+                            if root.profile.verified == 3: Text {
+                                text: "You verified this person before, but their encryption identity has changed since. Verify them again before trusting new messages.";
+                                font-size: 11px; color: Theme.danger; wrap: word-wrap; horizontal-alignment: center;
                             }
                             if root.profile-loading: Text { text: "Loading…"; color: Theme.muted; horizontal-alignment: center; font-size: 12px; }
                             Rectangle { height: 4px; }
@@ -1630,13 +1664,23 @@ export component AppWindow inherits Window {
                                 primary: true;
                                 clicked => { root.profile-action("message", root.profile.user-id); }
                             }
-                            if root.profile.verified == 1: Btn {
-                                text: root.profile.is-me ? "Verify this session" : "Verify";
+                            if root.profile.verified == 1 || root.profile.verified == 3: Btn {
+                                text: root.profile.is-me ? "Verify this session" : root.profile.verified == 3 ? "Verify again" : "Verify";
                                 clicked => { root.profile-action("verify", root.profile.user-id); }
                             }
                             if root.profile.verified == 0 && !root.profile.is-me: Text {
                                 text: "This user hasn't set up encryption keys, so they can't be verified yet.";
                                 font-size: 11px; color: Theme.muted; wrap: word-wrap; horizontal-alignment: center;
+                            }
+                            if root.profile.sessions.length > 0: VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "SESSIONS"; font-size: 10px; font-weight: 800; color: Theme.muted; }
+                                for d in root.profile.sessions: HorizontalLayout {
+                                    spacing: 6px;
+                                    Text { text: d.verified ? "✓" : "⚠"; color: d.verified ? Theme.ok : Theme.muted; font-size: 12px; width: 14px; }
+                                    Text { text: d.name; color: Theme.text; font-size: 12px; overflow: elide; horizontal-stretch: 1; }
+                                    Text { text: d.id; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+                                }
                             }
                             HorizontalLayout {
                                 spacing: 8px;

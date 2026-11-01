@@ -24,6 +24,9 @@ export struct AccountForm {
     label: string,
     tags: string,
     proxy: string,
+    // This login: 2 verified, 1 not verified, 0 not signed in.
+    session-verified: int,
+    session-id: string,
 }
 
 export struct AgentForm {
@@ -360,7 +363,14 @@ component AccountPage inherits VerticalLayout {
     Card {
         title: "Verify this session";
         subtitle: "Confirms this Whisker login is really you, using one of your other sessions (e.g. Element). People then stop seeing it as an unverified device, and it can receive your encryption keys.";
-        HorizontalLayout { alignment: start; Btn { text: "Verify with another session"; clicked => { root.profile-edit("verify-self", root.account.id, ""); } } }
+        HorizontalLayout {
+            alignment: start;
+            spacing: 12px;
+            if root.account.session-verified == 2: Text { text: "✓ This session is verified"; color: Theme.ok; font-weight: 700; vertical-alignment: center; }
+            if root.account.session-verified == 1: Text { text: "⚠ This session isn't verified yet"; color: Theme.danger; font-weight: 700; vertical-alignment: center; }
+            if root.account.session-id != "": Text { text: "Session " + root.account.session-id; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+        }
+        if root.account.session-verified != 2: HorizontalLayout { alignment: start; Btn { text: "Verify with another session"; clicked => { root.profile-edit("verify-self", root.account.id, ""); } } }
     }
     Card {
         title: "Read older encrypted messages";

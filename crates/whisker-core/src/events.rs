@@ -29,6 +29,8 @@ pub enum ClientEvent {
         thread: Option<OwnedEventId>,
         /// Mentions of people in `body`: (name as shown, user id).
         pills: Vec<(String, String)>,
+        /// A warning about who really sent it (encrypted messages).
+        shield: Option<crate::timeline::Shield>,
     },
     /// A room event (join, leave, rename, …) as a notice line.
     Notice { account: AccountId, item: Box<crate::timeline::HistoryItem>, room_id: OwnedRoomId },

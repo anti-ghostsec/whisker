@@ -108,6 +108,11 @@ operating system and the **Wisp** browser.
   mention, copy address, moderation and ignore.
 - **Verification**: the emoji comparison, for other people and for this session against your
   other sessions (Settings → account → *Verify this session*); incoming requests pop up.
+  People you've verified get a green *✓ Verified* by their name in the chat, and a red
+  *⚠ Identity changed* if their keys changed since. Encrypted messages from a device its
+  owner never verified (or an unknown one) carry a ⚠, with the reason on hover, as in
+  Element. A profile lists the person's sessions, verified ones first, and the account page
+  says whether this session is verified.
 - **Room info** (click the room name or **i**, opens in the side panel): description, pinned messages (where rooms
   usually keep their rules), who can join, history visibility, encryption, the member list
   (click anyone to see their profile), inviting people, and editing the name/description if

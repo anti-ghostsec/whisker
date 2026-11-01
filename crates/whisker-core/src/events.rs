@@ -36,6 +36,8 @@ pub enum ClientEvent {
     Notice { account: AccountId, item: Box<crate::timeline::HistoryItem>, room_id: OwnedRoomId },
     /// Someone's read receipt in a room moved.
     Receipts { account: AccountId, room_id: OwnedRoomId },
+    /// Keys arrived that may unlock messages shown as undecryptable.
+    RoomKeys { account: AccountId, rooms: Vec<OwnedRoomId> },
     /// A message was edited; `body` is its new text.
     Edited { account: AccountId, room_id: OwnedRoomId, target: OwnedEventId, body: String },
     /// Someone reacted to a message with an emoji.

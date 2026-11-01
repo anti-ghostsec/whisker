@@ -48,7 +48,8 @@ operating system and the **Wisp** browser.
 - **Chat:** Markdown formatting (bold, italic, strikethrough, `code`, code blocks, quotes,
   lists, headings, clickable links); replies, edits and deletions; image previews with a
   full-size viewer; file cards; date dividers; a multi-line composer (Enter sends,
-  Shift+Enter adds a line); and an **attach** button for images and files (up to 100 MB).
+  Shift+Enter adds a line); and an **attach** button for images and files, as big as your server takes (up to 2 GB),
+  with the upload's progress in percent.
 - **Emoji and reactions.** The ☺ button next to Send opens a searchable emoji picker.
   Reactions show under messages with a count (hover to see who); click one to add or take
   back your own, or right-click a message → *React*. Emoji are in colour everywhere, with
@@ -76,6 +77,8 @@ operating system and the **Wisp** browser.
   room it lists, with **Join** for the ones you aren't in yet and **Open** for the rest, plus
   **Invite people** and **Space info**. Click it again to fold or unfold it. A space you just
   joined shows as a space straight away (Whisker asks the server if its copy doesn't know).
+  Right-click a room on the page to open or join it, see its info, invite people, mark it
+  read, copy its address or leave it.
 - **Autocorrect** fixes common typos when you finish a word: "teh" → "the", "dont" →
   "don't", a lone "i" → "I". Backspace straight after a fix keeps what you typed (and that
   word isn't fixed again). Turn it off in Settings.
@@ -106,7 +109,8 @@ operating system and the **Wisp** browser.
   address or leave it. Opening a room clears its unread badge using a *private* read
   receipt, so the server's counter resets without telling anyone you read it.
 - **Read receipts.** Small avatars under a message show who has read up to there (from
-  their public receipts; people who use private receipts, like you, don't appear).
+  their public receipts; people who use private receipts, like you, don't appear). Click
+  them for the list of readers; click a reader for their profile.
 - **Repeated joins hidden.** Some servers don't say what a member event replaced, so every
   name or picture change looks like another join; Whisker hides those repeats.
 - **Room events.** Settings → *Show room events* adds joins, leaves, invites, kicks, bans,
@@ -129,13 +133,21 @@ operating system and the **Wisp** browser.
   owner never verified (or an unknown one) carry a ⚠, with the reason on hover, as in
   Element. A profile lists the person's sessions, verified ones first, and the account page
   says whether this session is verified.
+- **No other session needed.** A new account gets its cross-signing keys on the device that
+  creates or first logs into it, so that session is verified from the start (Settings →
+  account → *Set up verification* does it for an account that has none yet). *Make a
+  recovery key* turns on key backup; a later login can enter that key to verify itself and
+  read older messages. Lost every session and the key? *Reset verification* starts over.
+  Your AI accounts and your other accounts on this device verify each other automatically
+  (but two people-accounts never do, so alts stay unlinked).
 - **Room info** (click the room name or **i**, opens in the side panel): description, pinned messages (where rooms
   usually keep their rules), who can join, history visibility, encryption, the member list
   (click anyone to see their profile), inviting people, and editing the name/description if
   you're allowed.
 - **Your profile**: change your display name and picture in Settings → your account.
 - **Right-click a message** to reply, quote, copy its text, select part of it, save its
-  file, copy a link to it, edit or delete it, or kick/ban its sender if you're a moderator.
+  file, copy a link to it, show its source, edit or delete it, or kick/ban its sender if
+  you're a moderator. Settings → *Message menu* turns each entry on or off.
 - **Settings page** (⚙): dark (the default), light or follow-system theme; auto-lock after
   5/15/60 minutes idle; change a vault's passphrase; nickname, tags and proxy per account;
   a full AI agent setup form (model, API key, effort, permissions, commanders, audit room).
@@ -145,7 +157,10 @@ operating system and the **Wisp** browser.
   a local server…), the model, and Venice's privacy switches (both off by default).
   *Longest reply posted* caps replies in characters (cut at the last sentence that fits),
   and *Let the AI see pictures* (off by default) sends the newest pictures in the
-  conversation, shrunk to 1024 px, to models that can see images.
+  conversation (and a picture someone replies to), shrunk to 1024 px, to models that can
+  see images. For a chat model that can't, set a *Picture model* on the same API: it
+  describes each picture in words for the chat model. An AI answers when it's named,
+  mentioned, or someone replies to one of its messages.
 - **Character cards.** On an AI's page, *Import card…* reads Tavern / SillyTavern character
   cards, versions 1, 2 and 3, as `.json` or as `.png` (the card hidden in the picture,
   `ccv3` read before `chara`). The AI then plays that character: description,
@@ -293,7 +308,6 @@ when someone mentions it and to every DM (`--trigger every` makes it read every 
 This is an early version. It already does: vaults and hidden vaults, many accounts at once
 with tags, spaces, rooms, history, threads, replies, edits, reactions, forwarding, media,
 mentions, notifications, typing, read receipts, session verification, moderation, AI accounts
-with character cards, and plugin discovery. Still to do: cross-signing beyond verifying
-sessions, video and audio playback inside the app, notifications on Windows and macOS,
+with character cards, and plugin discovery. Still to do: video and audio playback inside the app, notifications on Windows and macOS,
 UI for plugin features, and an
 Android package that has been tested on a device.

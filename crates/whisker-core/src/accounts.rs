@@ -583,7 +583,23 @@ impl AccountManager {
 
         let sync_client = client.clone();
         let tx = self.events.clone();
+        let keys_client = client.clone();
         let sync = tokio::spawn(async move {
+            // Room keys often arrive just after the messages they unlock:
+            // say so, so those messages can be shown again. Stops with the sync.
+            let keys_tx = tx.clone();
+            let _keys = AbortOnDrop(tokio::spawn(async move {
+                use futures_util::StreamExt;
+                let Some(stream) = keys_client.encryption().room_keys_received_stream().await else { return };
+                let mut stream = std::pin::pin!(stream);
+                while let Some(got) = stream.next().await {
+                    let Ok(infos) = got else { continue };
+                    let mut rooms: Vec<OwnedRoomId> = infos.into_iter().map(|i| i.room_id).collect();
+                    rooms.sort();
+                    rooms.dedup();
+                    let _ = keys_tx.send(ClientEvent::RoomKeys { account, rooms });
+                }
+            }));
             // Lazy-load members: the first sync of a big account stays small and fast.
             let mut filter = FilterDefinition::default();
             filter.room.state.lazy_load_options = LazyLoadOptions::Enabled { include_redundant_members: false };
@@ -628,6 +644,19 @@ impl AccountManager {
             LiveAccount { record, profile_name: None, avatar: None, vault: vault.to_owned(), client: client.clone(), sync: Some(sync) },
         );
         let _ = self.events.send(ClientEvent::AccountsChanged);
+
+        // A new account gets cross-signing keys so its session counts as
+        // verified (most servers allow the first upload without a password;
+        // `login` passes one for the rest). Then your own accounts vouch for
+        // each other.
+        let (mgr, c) = (self.clone(), client.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if let Err(e) = crate::verify::ensure_identity(&c, None).await {
+                tracing::warn!("couldn't set up cross-signing for {account}: {e:#}");
+            }
+            mgr.vouch_own().await;
+        });
 
         // Fetch the profile in the background; the list updates when it lands.
         let (mgr, c) = (self.clone(), client);
@@ -699,7 +728,11 @@ impl AccountManager {
             position,
         };
         self.mutate_profile(req.vault, |p| p.accounts.push(record.clone())).await?;
-        self.go_live(req.vault, record, client).await;
+        self.go_live(req.vault, record, client.clone()).await;
+        match crate::verify::ensure_identity(&client, Some(req.password)).await {
+            Ok(_) => self.vouch_own().await,
+            Err(e) => tracing::warn!("couldn't set up cross-signing for the new account: {e:#}"),
+        }
         // Save the new device's keys into the vault right away, and again
         // once the first sync has settled.
         if let Err(e) = self.persist(req.vault).await {
@@ -1071,6 +1104,24 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Your AI accounts and the other accounts on this device mark each
+    /// other verified, so their messages don't show as unverified. Two
+    /// people-accounts never do: that would tie alts together.
+    pub async fn vouch_own(&self) {
+        let live: Vec<(AccountKind, Client)> = self.inner.read().await.live.values().map(|l| (l.record.kind, l.client.clone())).collect();
+        for (ka, a) in &live {
+            for (kb, b) in &live {
+                if *ka == AccountKind::Human && *kb == AccountKind::Human {
+                    continue;
+                }
+                let Some(other) = b.user_id() else { continue };
+                if let Err(e) = crate::verify::vouch(a, other).await {
+                    tracing::debug!("couldn't vouch for {other}: {e:#}");
+                }
+            }
+        }
+    }
+
     /// Unlocks server-side key backup so older encrypted messages can be read.
     pub async fn recover(&self, account: AccountId, recovery_key: &str) -> Result<()> {
         let c = self.client(account).await.ok_or_else(|| anyhow!("no such account"))?;
@@ -1127,4 +1178,13 @@ fn random_byte() -> u8 {
     let mut b = [0u8; 1];
     let _ = getrandom::fill(&mut b);
     b[0]
+}
+
+/// Aborts a task when dropped (so it ends with the task that owns it).
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }

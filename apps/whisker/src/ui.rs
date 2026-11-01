@@ -223,7 +223,8 @@ pub struct MsgRow {
     /// Animated pictures: all frames.
     pub frames: Option<Frames>,
     /// People whose read receipt lands on this message: (name, avatar).
-    pub readers: Vec<(String, Option<OwnedMxcUri>)>,
+    /// (user id, name, avatar) of everyone who read up to here.
+    pub readers: Vec<(String, String, Option<OwnedMxcUri>)>,
     /// Emoji reactions: (emoji, how many, one of them is ours, who).
     pub reactions: Vec<(String, usize, bool, String)>,
     /// For a thread's first message: replies, and the newest one ("Bob: hi").
@@ -273,7 +274,7 @@ impl Models {
         r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
         r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
         loaded(&r.item.sender_avatar).hash(&mut h);
-        r.readers.iter().map(|x| loaded(&x.1)).collect::<Vec<_>>().hash(&mut h);
+        r.readers.iter().map(|x| loaded(&x.2)).collect::<Vec<_>>().hash(&mut h);
         let sig = h.finish();
         let id = r.item.event_id.to_string();
         if let Some((_, item)) = self.built.get(&id).filter(|(old, _)| *old == sig) {
@@ -307,6 +308,14 @@ impl Models {
             None => (0, String::new(), String::new(), (0.0, 0.0)),
         };
         let (reply_name, reply_text) = r.reply.clone().unwrap_or_default();
+        let readers: Vec<Reader> = r
+            .readers
+            .iter()
+            .map(|(user, name, avatar)| {
+                let (initial, hue) = initial_hue(name);
+                Reader { user_id: s(user), name: s(name), initial, hue, avatar: self.avatar(avatar, pixels) }
+            })
+            .collect();
         MessageItem {
             id: s(r.item.event_id.as_str()),
             notice: r.item.notice,
@@ -315,16 +324,8 @@ impl Models {
             body: s(&r.item.body),
             blocks: blocks(&r.item.body, &r.item.pills),
             links: ModelRc::new(VecModel::from(format::links(&r.item.body).iter().map(s).collect::<Vec<_>>())),
-            readers: ModelRc::new(VecModel::from(
-                r.readers
-                    .iter()
-                    .take(5)
-                    .map(|(name, avatar)| {
-                        let (initial, hue) = initial_hue(name);
-                        Reader { name: s(name), initial, hue, avatar: self.avatar(avatar, pixels) }
-                    })
-                    .collect::<Vec<_>>(),
-            )),
+            readers: ModelRc::new(VecModel::from(readers.iter().take(5).cloned().collect::<Vec<_>>())),
+            all_readers: ModelRc::new(VecModel::from(readers)),
             more_readers: r.readers.len().saturating_sub(5) as i32,
             thread_replies: r.thread.as_ref().map_or(0, |t| t.0 as i32),
             thread_last: s(r.thread.as_ref().map(|t| t.1.as_str()).unwrap_or_default()),

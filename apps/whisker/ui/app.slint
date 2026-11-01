@@ -54,6 +54,7 @@ export struct PublicItem {
 
 // Someone whose read receipt is on a message.
 export struct Reader {
+    user-id: string,
     name: string,
     initial: string,
     hue: int,
@@ -165,6 +166,8 @@ export struct MessageItem {
     links: [string],
     // People who have read up to here (at most 5), and how many more.
     readers: [Reader],
+    // Everyone, for the list (`readers` is the first few).
+    all-readers: [Reader],
     more-readers: int,
     reactions: [ReactionChip],
     // A thread's first message: how many replies, and the newest ("Bob: hi").
@@ -327,6 +330,8 @@ component MessageRow inherits Rectangle {
     callback link(string);
     // Open the emoji picker to react to this message.
     callback pick-reaction();
+    // Clicked the read receipts: everyone who read up to here.
+    callback show-readers([Reader]);
 
     background: area.has-hover ? Theme.hover : transparent;
     // Wraps the whole row, so it keeps its hover over names, pictures,
@@ -340,20 +345,24 @@ component MessageRow inherits Rectangle {
                 if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
                 if root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
                 if root.item.media > 0 && root.item.media < 4: MenuSeparator {}
-                Menu {
+                if Prefs.menu-react: Menu {
                     title: "React";
                     for e in root.quick-reactions: MenuItem { title: e; activated => { root.action("react:" + e, root.item.id); } }
                     MenuItem { title: "More emoji…"; activated => { root.pick-reaction(); } }
                 }
-                MenuItem { title: "Reply"; activated => { root.action("reply", root.item.id); } }
-                MenuItem { title: "Reply in thread"; activated => { root.action("thread", root.item.id); } }
-                MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
-                MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
-                MenuItem { title: "Copy text"; activated => { root.copy(root.item.body); } }
-                MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
+                if Prefs.menu-reply: MenuItem { title: "Reply"; activated => { root.action("reply", root.item.id); } }
+                if Prefs.menu-thread: MenuItem { title: "Reply in thread"; activated => { root.action("thread", root.item.id); } }
+                if Prefs.menu-forward: MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
+                if Prefs.menu-quote: MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
+                if Prefs.menu-copy: MenuItem { title: "Copy text"; activated => { root.copy(root.item.body); } }
+                if Prefs.menu-select: MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
                 if root.item.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
-                for l in root.item.links: MenuItem { title: "Open " + l; activated => { root.link(l); } }
-                MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); } }
+                if Prefs.menu-open-links: Menu {
+                    title: "Open link";
+                    enabled: root.item.links.length > 0;
+                    for l in root.item.links: MenuItem { title: l; activated => { root.link(l); } }
+                }
+                if Prefs.menu-copy-link: MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); } }
                 if root.item.mine && root.item.media == 0: MenuItem { title: "Edit"; activated => { root.action("edit", root.item.id); } }
                 MenuSeparator {}
                 if root.item.mine || root.can-moderate: MenuItem { title: "Delete"; activated => { root.action("delete", root.item.id); } }
@@ -362,8 +371,9 @@ component MessageRow inherits Rectangle {
                     MenuItem { title: "Kick"; activated => { root.action("kick", root.item.id); } }
                     MenuItem { title: "Ban"; activated => { root.action("ban", root.item.id); } }
                 }
-                MenuItem { title: "View profile"; activated => { root.action("profile", root.item.id); } }
-                MenuItem { title: "Copy user id"; activated => { root.copy(root.item.sender); } }
+                if Prefs.menu-profile: MenuItem { title: "View profile"; activated => { root.action("profile", root.item.id); } }
+                if Prefs.menu-copy-id: MenuItem { title: "Copy user id"; activated => { root.copy(root.item.sender); } }
+                if Prefs.menu-source: MenuItem { title: "Show source"; activated => { root.action("source", root.item.id); } }
             }
 
             VerticalLayout {
@@ -383,7 +393,8 @@ component MessageRow inherits Rectangle {
                     padding-top: 3px;
                     padding-bottom: 3px;
                     spacing: 8px;
-                    Text { text: root.item.body; font-size: 12px; color: Theme.muted; wrap: word-wrap; horizontal-stretch: 1; }
+                    // A set width, so wrapped lines count in the row's height.
+                    Text { text: root.item.body; font-size: 12px; color: Theme.muted; wrap: word-wrap; width: max(40px, root.width - 64px - 16px - 52px); }
                     if area.has-hover: Text { text: root.item.time; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
                 }
                 if !root.item.notice: HorizontalLayout {
@@ -504,6 +515,7 @@ component MessageRow inherits Rectangle {
                             font-size: 10px;
                             color: root.item.shield == 2 ? Theme.danger : Theme.muted;
                             wrap: word-wrap;
+                            width: max(40px, root.width - 80px);
                         }
                         if root.item.thread-replies > 0: Rectangle {
                             height: 26px;
@@ -570,8 +582,15 @@ component MessageRow inherits Rectangle {
                     padding-right: 16px;
                     padding-bottom: 2px;
                     spacing: 2px;
-                    for r in root.item.readers: Avatar { initial: r.initial; hue: r.hue; image: r.avatar; size: 16px; }
-                    if root.item.more-readers > 0: Text { text: "+" + root.item.more-readers; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
+                    Rectangle {
+                        width: rd.preferred-width;
+                        rd := HorizontalLayout {
+                            spacing: 2px;
+                            for r in root.item.readers: Avatar { initial: r.initial; hue: r.hue; image: r.avatar; size: 16px; }
+                            if root.item.more-readers > 0: Text { text: "+" + root.item.more-readers; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
+                        }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.show-readers(root.item.all-readers); } }
+                    }
                 }
             }
         }
@@ -956,6 +975,10 @@ export component AppWindow inherits Window {
 
     // Overlays
     in-out property <string> select-text;
+    in-out property <string> select-title: "Select text";
+    // The read-receipt list: who read up to a message.
+    in-out property <[Reader]> readers-list;
+    in-out property <bool> readers-open;
     in-out property <image> viewer-image;
     // Animated pictures in the viewer: frames shown in turn, looping.
     in property <[image]> viewer-frames;
@@ -1111,6 +1134,7 @@ export component AppWindow inherits Window {
     callback set-notify-level(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
+    callback set-menu-entry(string, bool);
 
     function apply-theme() {
         Palette.color-scheme = root.theme == 0 ? ColorScheme.dark : root.theme == 1 ? ColorScheme.light : ColorScheme.unknown;
@@ -1441,6 +1465,19 @@ export component AppWindow inherits Window {
                                 height: 60px;
                                 border-radius: 10px;
                                 background: spta.has-hover ? Theme.hover : transparent;
+                                ContextMenuArea {
+                                    Menu {
+                                        if sr.joined: MenuItem { title: "Open"; activated => { root.activity(); root.current-room = sr.id; root.select-room(sr.id); root.stick-bottom = true; } }
+                                        if !sr.joined: MenuItem { title: "Join"; enabled: !sr.busy; activated => { root.activity(); root.space-join(sr.id); } }
+                                        if sr.joined && !sr.space: MenuItem { title: "Mark as read"; activated => { root.activity(); root.room-menu("read", sr.id); } }
+                                        if sr.joined: MenuItem { title: sr.space ? "Space info" : "Room info"; activated => { root.activity(); root.room-menu("info", sr.id); } }
+                                        if sr.joined: MenuItem { title: "Invite people…"; activated => { root.activity(); root.room-menu("info", sr.id); } }
+                                        MenuItem { title: sr.space ? "Copy space address" : "Copy room address"; activated => { root.room-menu("copy", sr.id); } }
+                                        MenuItem { title: "Copy room id"; activated => { root.copy-text(sr.id); } }
+                                        if sr.joined: MenuSeparator {}
+                                        if sr.joined: MenuItem { title: sr.space ? "Leave space" : "Leave room"; activated => { root.activity(); root.room-menu("leave", sr.id); } }
+                                    }
+                                }
                                 spta := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => {
@@ -1496,13 +1533,14 @@ export component AppWindow inherits Window {
                         }
                         col := VerticalLayout {
                             width: msgs.visible-width;
-                            padding-bottom: 8px;
+                            padding-bottom: 16px;
                             for m in root.messages: MessageRow {
                                 item: m;
                                 can-moderate: root.can-moderate;
                                 room-id: root.current-room;
                                 quick-reactions: root.quick-reactions;
                                 pick-reaction => { root.emoji-for = m.id; root.emoji-search(""); root.emoji-open = true; }
+                                show-readers(list) => { root.readers-list = list; root.readers-open = true; }
                                 action(a, id) => {
                                     root.activity();
                                     if a == "profile" {
@@ -1835,6 +1873,7 @@ export component AppWindow inherits Window {
                                 room-id: root.current-room;
                                 quick-reactions: root.quick-reactions;
                                 pick-reaction => { root.emoji-for = m.id; root.emoji-search(""); root.emoji-open = true; }
+                                show-readers(list) => { root.readers-list = list; root.readers-open = true; }
                                 action(a, id) => {
                                     root.activity();
                                     if a == "profile" {
@@ -2012,6 +2051,7 @@ export component AppWindow inherits Window {
         set-notify-level(i) => { root.set-notify-level(i); }
         set-send-typing(b) => { root.set-send-typing(b); }
         set-autocorrect(b) => { root.set-autocorrect(b); }
+        set-menu-entry(k, b) => { root.set-menu-entry(k, b); }
         save-account(f) => { root.activity(); root.save-account(f); }
         profile-edit(a, id, v) => { root.activity(); root.profile-edit(a, id, v); }
         recover(k) => { root.activity(); root.recover(k); }
@@ -2040,15 +2080,46 @@ export component AppWindow inherits Window {
 
     if root.select-text != "": Overlay {
         card-width: 640px;
-        dismiss => { root.select-text = ""; }
-        Text { text: "Select text"; font-size: 16px; font-weight: 800; color: Theme.text; }
+        dismiss => { root.select-text = ""; root.select-title = "Select text"; }
+        Text { text: root.select-title; font-size: 16px; font-weight: 800; color: Theme.text; }
         TextEdit { text: root.select-text; read-only: true; height: min(400px, root.height - 200px); wrap: word-wrap; }
         HorizontalLayout {
             spacing: 8px;
             alignment: end;
             Btn { text: "Copy all"; clicked => { root.copy-text(root.select-text); } }
-            Btn { text: "Close"; primary: true; clicked => { root.select-text = ""; } }
+            Btn { text: "Close"; primary: true; clicked => { root.select-text = ""; root.select-title = "Select text"; } }
         }
+    }
+
+    if root.readers-open: Overlay {
+        dismiss => { root.readers-open = false; }
+        Text { text: root.readers-list.length == 1 ? "Read by 1 person" : "Read by " + root.readers-list.length + " people"; font-size: 16px; font-weight: 800; color: Theme.text; }
+        Flickable {
+            height: min(root.readers-list.length * 44px, root.height - 220px);
+            VerticalLayout {
+                for r in root.readers-list: Rectangle {
+                    height: 44px;
+                    border-radius: 8px;
+                    background: rta.has-hover ? Theme.hover : transparent;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 10px;
+                        Avatar { initial: r.initial; hue: r.hue; image: r.avatar; size: 30px; y: 7px; }
+                        VerticalLayout {
+                            alignment: center;
+                            Text { text: r.name; color: Theme.text; font-weight: 600; overflow: elide; }
+                            Text { text: r.user-id; color: Theme.muted; font-size: 11px; overflow: elide; }
+                        }
+                    }
+                    rta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.readers-open = false; root.show-profile(r.user-id, r.name, r.initial, r.hue, r.avatar); }
+                    }
+                }
+            }
+        }
+        HorizontalLayout { alignment: end; Btn { text: "Close"; primary: true; clicked => { root.readers-open = false; } } }
     }
 
     if root.viewer-open: Rectangle {

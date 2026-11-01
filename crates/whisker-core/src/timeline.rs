@@ -904,27 +904,63 @@ pub async fn forward(from: &Room, event_id: &EventId, to: &Room, edited_body: Op
     Ok(to.send(content).with_request_config(config).await?.response.event_id)
 }
 
-/// Most bytes we'll upload in one go.
-pub const MAX_UPLOAD: u64 = 100 * 1024 * 1024;
+/// Most bytes we'll upload in one go, whatever the server allows: the
+/// file is held (and encrypted) in memory.
+pub const MAX_UPLOAD: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Uploads a file from disk and posts it (as an image when it is one).
-pub async fn send_file(room: &Room, path: &Path) -> Result<()> {
+/// The biggest upload `room`'s server takes (and we do).
+async fn upload_limit(room: &Room) -> u64 {
+    match room.client().load_or_fetch_max_upload_size().await {
+        Ok(n) => u64::from(n).min(MAX_UPLOAD),
+        Err(_) => MAX_UPLOAD,
+    }
+}
+
+fn too_big(limit: u64) -> anyhow::Error {
+    anyhow::anyhow!("that file is over {} MB, the most this server takes", limit / 1_048_576)
+}
+
+/// Uploads a file from disk and posts it (as an image when it is one),
+/// calling `progress` with the percentage sent as it goes.
+pub async fn send_file(room: &Room, path: &Path, progress: impl Fn(u8) + Send + 'static) -> Result<()> {
     let meta = tokio::fs::metadata(path).await.context("can't read that file")?;
-    if meta.len() > MAX_UPLOAD {
-        anyhow::bail!("that file is over 100 MB");
+    let limit = upload_limit(room).await;
+    if meta.len() > limit {
+        return Err(too_big(limit));
     }
     let data = tokio::fs::read(path).await?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
-    send_bytes(room, &name, data).await
+    send_bytes_with(room, &name, data, progress).await
 }
 
 /// Uploads `data` as a file called `name` (its extension sets the type).
 pub async fn send_bytes(room: &Room, name: &str, data: Vec<u8>) -> Result<()> {
-    if data.len() as u64 > MAX_UPLOAD {
-        anyhow::bail!("that file is over 100 MB");
+    send_bytes_with(room, name, data, |_| ()).await
+}
+
+async fn send_bytes_with(room: &Room, name: &str, data: Vec<u8>, progress: impl Fn(u8) + Send + 'static) -> Result<()> {
+    let limit = upload_limit(room).await;
+    if data.len() as u64 > limit {
+        return Err(too_big(limit));
     }
     let mime = mime_guess::from_path(name).first_or_octet_stream();
-    room.send_attachment(name, &mime, data, AttachmentConfig::new()).await?;
+    let sent = eyeball::SharedObservable::new(matrix_sdk::TransmissionProgress::default());
+    let mut watch = sent.subscribe();
+    // Ends when the upload drops `sent`.
+    tokio::spawn(async move {
+        let mut last = None;
+        while let Some(p) = watch.next().await {
+            if p.total == 0 {
+                continue;
+            }
+            let pct = (p.current.min(p.total) as u64 * 100 / p.total as u64) as u8;
+            if last != Some(pct) {
+                last = Some(pct);
+                progress(pct);
+            }
+        }
+    });
+    room.send_attachment(name, &mime, data, AttachmentConfig::new()).with_send_progress_observable(sent).await?;
     Ok(())
 }
 

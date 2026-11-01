@@ -12,6 +12,8 @@ futures-util.workspace = true
 getrandom.workspace = true
 flate2 = "1.1.10"
 mime_guess = "2.0.5"
+# Upload progress (the version matrix-sdk uses).
+eyeball = "0.8.8"
 # Same version matrix-sdk-sqlite uses, for consistent snapshots of its databases.
 rusqlite = { version = "0.40.2", default-features = false }
 matrix-sdk.workspace = true

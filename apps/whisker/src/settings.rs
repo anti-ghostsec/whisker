@@ -56,6 +56,9 @@ pub struct AppSettings {
     /// Fix common typos in the composer as you type.
     #[serde(default = "yes")]
     pub autocorrect: bool,
+    /// Message menu entries turned off (see `Prefs.menu-*` in the UI).
+    #[serde(default)]
+    pub menu_hidden: std::collections::BTreeSet<String>,
 }
 
 fn yes() -> bool {

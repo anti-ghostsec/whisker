@@ -163,6 +163,10 @@ pub struct AgentRunner {
     /// Where recent pictures can be fetched, by message (with `see_images`).
     pictures: HashMap<OwnedEventId, MediaSource>,
     picture_order: VecDeque<OwnedEventId>,
+    /// Describes pictures for a chat model that can't see (`image_model`).
+    vision: Option<Llm>,
+    /// What `vision` said about each picture, by message.
+    descriptions: std::sync::Mutex<HashMap<OwnedEventId, String>>,
 }
 
 impl AgentRunner {
@@ -173,6 +177,14 @@ impl AgentRunner {
             sum_api.model = cfg.summary_model.trim().to_owned();
         }
         let summarizer = Llm::new(sum_api, 600, Default::default())?.with_venice(cfg.venice());
+        let vision = match cfg.image_model.trim() {
+            "" => None,
+            model => {
+                let mut api = cfg.api.clone();
+                api.model = model.to_owned();
+                Some(Llm::new(api, 500, Default::default())?.with_venice(cfg.venice()))
+            }
+        };
         Ok(Self {
             cfg,
             mgr,
@@ -185,6 +197,8 @@ impl AgentRunner {
             pace: HashMap::new(),
             pictures: HashMap::new(),
             picture_order: VecDeque::new(),
+            vision,
+            descriptions: Default::default(),
         })
     }
 
@@ -228,7 +242,7 @@ impl AgentRunner {
                     return Ok(());
                 }
             };
-            let ClientEvent::Message { account, room_id, event_id, sender, sender_name, body, is_text, is_notice, media, .. } = ev else { continue };
+            let ClientEvent::Message { account, room_id, event_id, sender, sender_name, body, is_text, is_notice, media, reply_to, pills, .. } = ev else { continue };
             let picture = media.filter(|m| self.cfg.see_images && m.kind == MediaKind::Image);
             if !(is_text || picture.is_some()) || account != self.cfg.account {
                 continue;
@@ -256,7 +270,20 @@ impl AgentRunner {
                 continue;
             }
             let Some(room) = client.get_room(&room_id) else { continue };
-            if !self.triggered(&room, &names, &body).await {
+            // A reply to an older picture: fetch it so the AI can look.
+            if self.cfg.see_images
+                && let Some(to) = &reply_to
+                && !self.pictures.contains_key(to)
+                && let Some(source) = picture_of(&room, to).await
+            {
+                self.remember_picture(to, source);
+            }
+            // A reply to one of its messages, or a pill naming it, is talking to it.
+            let addressed = pills.iter().any(|(_, id)| id == me.as_str()) || match &reply_to {
+                Some(to) => self.replies_to_me(&room, &room_id, to, &me).await,
+                None => false,
+            };
+            if !addressed && !self.triggered(&room, &names, &body).await {
                 continue;
             }
             let pace = self.pace.entry(room_id.clone()).or_default();
@@ -268,7 +295,7 @@ impl AgentRunner {
                 continue;
             }
             self.fold(&room_id).await;
-            match self.respond(&room, &me, &sender, &event_id).await {
+            match self.respond(&room, &me, &sender, &event_id, reply_to.as_ref()).await {
                 Ok((posted, state)) => {
                     if let Some(s) = state {
                         self.memory.set_state(&room_id, &s);
@@ -297,13 +324,21 @@ impl AgentRunner {
 
     /// The newest pictures in `lines` (oldest first), ready to send:
     /// (message id, base64 JPEG). Ones that fail to load are skipped.
-    async fn load_pictures(&self, room: &Room, lines: &[&Line]) -> Vec<(OwnedEventId, String)> {
-        let wanted: Vec<(OwnedEventId, MediaSource)> = lines
+    async fn load_pictures(&self, room: &Room, lines: &[&Line], reply_to: Option<&OwnedEventId>) -> Vec<(OwnedEventId, String)> {
+        let mut wanted: Vec<(OwnedEventId, MediaSource)> = lines
             .iter()
             .rev()
             .filter_map(|l| self.pictures.get(&l.event_id).map(|s| (l.event_id.clone(), s.clone())))
             .take(MAX_PICTURES)
             .collect();
+        // The picture being replied to, even when it's older than the transcript.
+        if let Some(to) = reply_to
+            && !wanted.iter().any(|(id, _)| id == to)
+            && let Some(source) = self.pictures.get(to)
+        {
+            wanted.truncate(MAX_PICTURES.saturating_sub(1));
+            wanted.insert(0, (to.clone(), source.clone()));
+        }
         let mut out = Vec::new();
         for (id, source) in wanted.into_iter().rev() {
             let bytes = match timeline::download(&room.client(), &source, Some(PICTURE_PX)).await {
@@ -319,6 +354,31 @@ impl AgentRunner {
             }
         }
         out
+    }
+
+    /// The image model's description of a picture, remembered per message.
+    async fn describe(&self, id: &OwnedEventId, data: &str) -> Option<String> {
+        if let Some(d) = self.descriptions.lock().unwrap().get(id) {
+            return Some(d.clone());
+        }
+        let ask = json!([
+            { "type": "text", "text": "Describe this picture for someone who can't see it: what's in it, any writing in it word for word, and anything notable. Plain prose, under 150 words." },
+            { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": data } },
+        ]);
+        let said = match self.vision.as_ref()?.turn(&[], &[json!({ "role": "user", "content": ask })], &[]).await {
+            Ok(t) if !t.refused && !t.text.trim().is_empty() => t.text.trim().to_owned(),
+            Ok(_) => return None,
+            Err(e) => {
+                tracing::warn!("the picture model couldn't describe {id}: {e:#}");
+                return None;
+            }
+        };
+        let mut d = self.descriptions.lock().unwrap();
+        if d.len() > KEEP_PICTURES {
+            d.clear();
+        }
+        d.insert(id.clone(), said.clone());
+        Some(said)
     }
 
     async fn is_own_agent(&self, user: &UserId) -> bool {
@@ -399,6 +459,17 @@ impl AgentRunner {
         });
     }
 
+    /// Whether `to` is a message the agent sent: from memory, else the server.
+    async fn replies_to_me(&self, room: &Room, room_id: &OwnedRoomId, to: &OwnedEventId, me: &UserId) -> bool {
+        if let Some(line) = self.memory.room(room_id).and_then(|m| m.lines.iter().rev().find(|l| &l.event_id == to)) {
+            return line.sender == me;
+        }
+        match room.event(to, None).await {
+            Ok(ev) => ev.raw().get_field::<OwnedUserId>("sender").ok().flatten().is_some_and(|s| s == me),
+            Err(_) => false,
+        }
+    }
+
     async fn triggered(&self, room: &Room, names: &[String], body: &str) -> bool {
         let direct = room.is_direct().await.unwrap_or(false);
         match self.cfg.trigger {
@@ -410,7 +481,7 @@ impl AgentRunner {
 
     /// Answers one message. Returns whether it posted a reply, and the
     /// reply's hidden `<state>` block if it had one.
-    async fn respond(&self, room: &Room, me: &UserId, sender: &UserId, event_id: &OwnedEventId) -> Result<(bool, Option<String>)> {
+    async fn respond(&self, room: &Room, me: &UserId, sender: &UserId, event_id: &OwnedEventId, reply_to: Option<&OwnedEventId>) -> Result<(bool, Option<String>)> {
         let sender_level = level(room, sender).await;
         let my_level = level(room, me).await;
         let allowed = self.cfg.permissions.effective(room.room_id(), sender, sender_level);
@@ -442,11 +513,19 @@ impl AgentRunner {
         let persona = persona(&self.cfg, &lines, event_id, sender);
         let mut system = vec![OPERATING_NOTES];
         system.extend(persona.system.iter().map(String::as_str));
-        let pictures = if self.cfg.see_images { self.load_pictures(room, &lines).await } else { Vec::new() };
+        let pictures = if self.cfg.see_images { self.load_pictures(room, &lines, reply_to).await } else { Vec::new() };
         let mut content = vec![json!({ "type": "text", "text": user })];
         for (id, data) in &pictures {
-            content.push(json!({ "type": "text", "text": format!("Picture from message {id}:") }));
-            content.push(json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": data } }));
+            match &self.vision {
+                Some(_) => {
+                    let said = self.describe(id, data).await.unwrap_or_else(|| "(the picture couldn't be described)".to_owned());
+                    content.push(json!({ "type": "text", "text": format!("Picture from message {id}, as described by an image model: {said}") }));
+                }
+                None => {
+                    content.push(json!({ "type": "text", "text": format!("Picture from message {id}:") }));
+                    content.push(json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": data } }));
+                }
+            }
         }
         if !persona.tail.is_empty() {
             let notes = persona.tail.join("\n\n");
@@ -682,5 +761,15 @@ mod memory_tests {
         let reqs = server.received_requests().await.unwrap();
         assert!(!String::from_utf8_lossy(&reqs[0].body).contains("PERSONA"));
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// Where to fetch the picture in message `id`, if it is one.
+async fn picture_of(room: &Room, id: &OwnedEventId) -> Option<MediaSource> {
+    let ev = room.event(id, None).await.ok()?;
+    let content: RoomMessageEventContent = ev.raw().get_field("content").ok().flatten()?;
+    match timeline::parse(&content) {
+        timeline::Parsed::New { media: Some(m), .. } if m.kind == MediaKind::Image => Some(m.source),
+        _ => None,
     }
 }

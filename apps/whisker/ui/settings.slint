@@ -27,6 +27,12 @@ export struct AccountForm {
     // This login: 2 verified, 1 not verified, 0 not signed in.
     session-verified: int,
     session-id: string,
+    // The account has cross-signing keys on the server.
+    has-identity: bool,
+    // A recovery key is set up and unlocked here.
+    recovery-on: bool,
+    // A recovery key just made, to write down.
+    recovery-key: string,
 }
 
 export struct AgentForm {
@@ -56,6 +62,7 @@ export struct AgentForm {
     venice-system-prompt: bool,
     venice-web-search: bool,
     see-images: bool,
+    image-model: string,
     reply-chars: int,
     g-reply: bool,
     g-redact: bool,
@@ -170,6 +177,16 @@ component NavRow inherits Rectangle {
     ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
 }
 
+component MenuToggle inherits HorizontalLayout {
+    in property <string> key;
+    in property <string> label;
+    in property <bool> checked;
+    callback changed(string, bool);
+    spacing: 8px;
+    Text { text: root.label; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+    Switch { checked: root.checked; toggled => { root.changed(root.key, self.checked); } }
+}
+
 component GeneralPage inherits VerticalLayout {
     in-out property <int> theme;
     callback set-rich-text(bool);
@@ -177,6 +194,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-notify-level(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
+    callback set-menu-entry(string, bool);
     in-out property <int> auto-lock;
     in property <string> encryption-summary;
     callback set-theme(int);
@@ -281,6 +299,37 @@ component GeneralPage inherits VerticalLayout {
         }
     }
     Card {
+        title: "Message menu";
+        subtitle: "What right-clicking (or long-pressing) a message offers. Saving files, editing, deleting and moderating are always there when they apply.";
+        GridLayout {
+            spacing: 8px;
+            Row {
+                MenuToggle { key: "react"; label: "React"; checked: Prefs.menu-react; changed(k, b) => { root.set-menu-entry(k, b); } }
+                MenuToggle { key: "reply"; label: "Reply"; checked: Prefs.menu-reply; changed(k, b) => { root.set-menu-entry(k, b); } }
+            }
+            Row {
+                MenuToggle { key: "thread"; label: "Reply in thread"; checked: Prefs.menu-thread; changed(k, b) => { root.set-menu-entry(k, b); } }
+                MenuToggle { key: "forward"; label: "Forward…"; checked: Prefs.menu-forward; changed(k, b) => { root.set-menu-entry(k, b); } }
+            }
+            Row {
+                MenuToggle { key: "quote"; label: "Quote"; checked: Prefs.menu-quote; changed(k, b) => { root.set-menu-entry(k, b); } }
+                MenuToggle { key: "copy"; label: "Copy text"; checked: Prefs.menu-copy; changed(k, b) => { root.set-menu-entry(k, b); } }
+            }
+            Row {
+                MenuToggle { key: "select"; label: "Select text…"; checked: Prefs.menu-select; changed(k, b) => { root.set-menu-entry(k, b); } }
+                MenuToggle { key: "open-links"; label: "Open links"; checked: Prefs.menu-open-links; changed(k, b) => { root.set-menu-entry(k, b); } }
+            }
+            Row {
+                MenuToggle { key: "copy-link"; label: "Copy link to message"; checked: Prefs.menu-copy-link; changed(k, b) => { root.set-menu-entry(k, b); } }
+                MenuToggle { key: "profile"; label: "View profile"; checked: Prefs.menu-profile; changed(k, b) => { root.set-menu-entry(k, b); } }
+            }
+            Row {
+                MenuToggle { key: "copy-id"; label: "Copy user id"; checked: Prefs.menu-copy-id; changed(k, b) => { root.set-menu-entry(k, b); } }
+                MenuToggle { key: "source"; label: "Show source"; checked: Prefs.menu-source; changed(k, b) => { root.set-menu-entry(k, b); } }
+            }
+        }
+    }
+    Card {
         title: "Security";
         subtitle: "Locking stops every account and AI and forgets the vault keys until you unlock again.";
         Field {
@@ -379,7 +428,9 @@ component AccountPage inherits VerticalLayout {
     }
     Card {
         title: "Verify this session";
-        subtitle: "Confirms this Whisker login is really you, using one of your other sessions (e.g. Element). People then stop seeing it as an unverified device, and it can receive your encryption keys.";
+        subtitle: root.account.has-identity
+            ? "Confirms this Whisker login is really you, with one of your other sessions (e.g. Element) or your recovery key. People then stop seeing it as an unverified device, and it can receive your encryption keys."
+            : "This account has no verification keys yet. Set them up here, no other session needed: this session becomes your first verified one.";
         HorizontalLayout {
             alignment: start;
             spacing: 12px;
@@ -387,7 +438,36 @@ component AccountPage inherits VerticalLayout {
             if root.account.session-verified == 1: Text { text: "⚠ This session isn't verified yet"; color: Theme.danger; font-weight: 700; vertical-alignment: center; }
             if root.account.session-id != "": Text { text: "Session " + root.account.session-id; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
         }
-        if root.account.session-verified != 2: HorizontalLayout { alignment: start; Btn { text: "Verify with another session"; clicked => { root.profile-edit("verify-self", root.account.id, ""); } } }
+        if root.account.session-verified == 1 && root.account.has-identity: VerticalLayout {
+            spacing: 8px;
+            HorizontalLayout { alignment: start; Btn { text: "Verify with another session"; clicked => { root.profile-edit("verify-self", root.account.id, ""); } } }
+            Text { text: "No other session? Enter your recovery key under \"Read older encrypted messages\" below: that verifies this session too."; wrap: word-wrap; font-size: 12px; color: Theme.muted; }
+        }
+        if root.account.session-verified == 1 && !root.account.has-identity: VerticalLayout {
+            spacing: 8px;
+            pw := Input { password: true; placeholder: "Account password"; }
+            HorizontalLayout { alignment: start; Btn { text: "Set up verification"; primary: true; enabled: pw.text != ""; clicked => { root.profile-edit("secure", root.account.id, pw.text); pw.text = ""; } } }
+        }
+    }
+    if root.account.session-verified == 2: Card {
+        title: "Recovery key";
+        subtitle: "Lets a new login verify itself and read your older messages when no other session is around. Whisker backs your message keys up to your server, locked with it.";
+        if root.account.recovery-key != "": VerticalLayout {
+            spacing: 8px;
+            Text { text: "Write this down and keep it safe. It isn't shown again."; color: Theme.danger; font-weight: 700; wrap: word-wrap; }
+            Input { text: root.account.recovery-key; read-only: true; }
+        }
+        if root.account.recovery-key == "" && root.account.recovery-on: Text { text: "✓ Set up"; color: Theme.ok; font-weight: 700; }
+        if root.account.recovery-key == "" && !root.account.recovery-on: HorizontalLayout {
+            alignment: start;
+            Btn { text: "Make a recovery key"; clicked => { root.profile-edit("make-recovery", root.account.id, ""); } }
+        }
+    }
+    if root.account.session-verified == 1 && root.account.has-identity: Card {
+        title: "Lost every other session and your recovery key?";
+        subtitle: "Start over with new verification keys made here. Your other sessions and anyone who verified you will need to verify again, and the key backup on your server is deleted, so older messages you have no keys for stay unreadable.";
+        rpw := Input { password: true; placeholder: "Account password"; }
+        HorizontalLayout { alignment: start; Btn { text: "Reset verification"; enabled: rpw.text != ""; clicked => { root.profile-edit("reset-identity", root.account.id, rpw.text); rpw.text = ""; } } }
     }
     Card {
         title: "Read older encrypted messages";
@@ -488,6 +568,7 @@ component AgentPage inherits VerticalLayout {
     property <bool> a-venice-prompt: agent.venice-system-prompt;
     property <bool> a-venice-search: agent.venice-web-search;
     property <bool> a-see-images: agent.see-images;
+    property <string> a-image-model: agent.image-model;
     property <int> a-reply-chars: agent.reply-chars;
     property <int> a-cooldown: agent.cooldown;
     property <int> a-steps: agent.max-steps;
@@ -514,7 +595,7 @@ component AgentPage inherits VerticalLayout {
             summarize: root.a-summarize, summary-model: root.a-summary-model, context-tokens: root.a-context,
             cooldown: root.a-cooldown, max-steps: root.a-steps, yield-secs: root.a-yield, max-rapid: root.a-rapid,
             venice-system-prompt: root.a-venice-prompt, venice-web-search: root.a-venice-search,
-            see-images: root.a-see-images, reply-chars: root.a-reply-chars,
+            see-images: root.a-see-images, image-model: root.a-image-model, reply-chars: root.a-reply-chars,
             g-reply: root.a-reply, g-redact: root.a-redact, g-kick: root.a-kick, g-ban: root.a-ban,
             g-unban: root.a-unban, g-invite: root.a-invite, g-power: root.a-power,
             commanders: root.a-commanders, min-level: root.a-min-level, autonomous: root.a-autonomous,
@@ -594,8 +675,13 @@ component AgentPage inherits VerticalLayout {
         Number { text: "Longest reply posted (characters, 0 = no limit)"; minimum: 0; maximum: 20000; value <=> root.a-reply-chars; }
         Toggle { text: "Let the AI see pictures posted in the room"; checked <=> root.a-see-images; }
         Text {
-            text: "Sends recent pictures (shrunk) to the AI service with each reply. Only for models that can see images.";
+            text: "Sends recent pictures (shrunk) to the AI service with each reply, and a picture someone replies to.";
             font-size: 11px; color: Theme.muted; wrap: word-wrap;
+        }
+        if root.a-see-images: Field {
+            label: "Picture model";
+            hint: "Same API. A model that can see images (e.g. gpt-4o-mini, claude-haiku-4-5, qwen-2.5-vl) describes each picture for the chat model, so the chat model doesn't need to see images itself. Leave empty if the chat model can.";
+            Input { text <=> root.a-image-model; placeholder: "Chat model sees pictures itself"; }
         }
         Text {
             text: "Venice only (api.venice.ai). Both stay off unless you turn them on.";
@@ -753,6 +839,7 @@ export component SettingsPage inherits Rectangle {
     callback set-notify-level(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
+    callback set-menu-entry(string, bool);
     callback save-account(AccountForm);
     callback profile-edit(string, string, string);
     callback recover(string);
@@ -837,6 +924,7 @@ export component SettingsPage inherits Rectangle {
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-send-typing(b) => { root.set-send-typing(b); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }
+                            set-menu-entry(k, b) => { root.set-menu-entry(k, b); }
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }
                             unlock-hidden(p) => { root.unlock-hidden(p); }
                             create-hidden(p) => { root.create-hidden(p); }

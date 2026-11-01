@@ -73,6 +73,10 @@ pub struct AgentConfig {
     /// to the AI service.
     #[serde(default)]
     pub see_images: bool,
+    /// Model (same API) that describes pictures for the chat model, for
+    /// chat models that can't see. Empty: the chat model gets them itself.
+    #[serde(default)]
+    pub image_model: String,
     /// Longest reply posted, in characters (0: no limit). The model is
     /// told, and a longer reply is cut at the last sentence that fits.
     #[serde(default)]

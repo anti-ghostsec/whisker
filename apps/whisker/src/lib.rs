@@ -68,6 +68,8 @@ struct State {
     no_fix: HashSet<String>,
     /// The rooms each space lists (from the server), with when they were fetched.
     space_rooms: HashMap<RoomKey, (Instant, Vec<timeline::SpaceRoom>)>,
+    /// Rooms whose undecryptable messages are about to be fetched again.
+    redecrypting: HashSet<RoomKey>,
     /// Running agents, by the account they speak as.
     agents: HashMap<AccountId, JoinHandle<()>>,
     last_activity: Option<Instant>,
@@ -301,9 +303,30 @@ impl Ctl {
         self.spawn(async move {
             let Some(client) = c.mgr.client(account).await else { return };
             for m in wanted {
-                let px = timeline::thumbnail(&client, &m, AVATAR_PX).await.ok().and_then(|b| decode(&b, AVATAR_PX, AVATAR_PX, true));
-                c.avatars.lock().unwrap().insert(m.clone(), px);
-                c.loading.lock().unwrap().remove(m.as_str());
+                let px = match timeline::thumbnail(&client, &m, AVATAR_PX).await.ok().and_then(|b| decode(&b, AVATAR_PX, AVATAR_PX, true)) {
+                    Some(p) => Some(Some(p)),
+                    // No thumbnail (servers often can't make one for another
+                    // server's media) or one we can't read: the picture itself.
+                    None => match timeline::download(&client, &MediaSource::Plain(m.clone()), None).await {
+                        Ok(b) => Some(tokio::task::spawn_blocking(move || decode(&b, AVATAR_PX, AVATAR_PX, true)).await.ok().flatten()),
+                        Err(_) => None,
+                    },
+                };
+                match px {
+                    Some(px) => {
+                        c.avatars.lock().unwrap().insert(m.clone(), px);
+                        c.loading.lock().unwrap().remove(m.as_str());
+                    }
+                    // The server didn't answer (busy, rate limit, offline):
+                    // try again in a minute instead of showing initials for good.
+                    None => {
+                        let loading = c.loading.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            loading.lock().unwrap().remove(m.as_str());
+                        });
+                    }
+                }
             }
             c.refresh_accounts_only().await;
             c.refresh_rooms().await;
@@ -745,14 +768,15 @@ impl Ctl {
         }
         // Each reader goes on the message they read up to, or (if that one
         // isn't shown, e.g. a hidden room event) the last one before it.
-        let mut readers: HashMap<usize, Vec<(String, Option<OwnedMxcUri>)>> = HashMap::new();
+        let mut readers: HashMap<usize, Vec<(String, String, Option<OwnedMxcUri>)>> = HashMap::new();
         for mark in &marks {
             let at = msgs.iter().position(|m| m.event_id == mark.event_id).or_else(|| {
                 let ts = mark.ts?;
                 msgs.iter().rposition(|m| m.ts <= ts)
             });
             if let Some(i) = at {
-                readers.entry(i).or_default().push((mark.name.clone().unwrap_or_else(|| mark.user.localpart().to_owned()), mark.avatar.clone()));
+                let name = mark.name.clone().unwrap_or_else(|| mark.user.localpart().to_owned());
+                readers.entry(i).or_default().push((mark.user.to_string(), name, mark.avatar.clone()));
             }
         }
         msgs.iter()
@@ -797,7 +821,7 @@ impl Ctl {
         };
         let rows = self.rows(&key).await;
         self.fetch_trust(key.0, rows.iter().filter(|r| !r.mine && !r.item.notice).map(|r| r.item.sender.clone()));
-        self.fetch_avatars(key.0, rows.iter().filter_map(|r| r.item.sender_avatar.clone()).chain(rows.iter().flat_map(|r| r.readers.iter().filter_map(|x| x.1.clone()))));
+        self.fetch_avatars(key.0, rows.iter().filter_map(|r| r.item.sender_avatar.clone()).chain(rows.iter().flat_map(|r| r.readers.iter().filter_map(|x| x.2.clone()))));
         let items: Vec<HistoryItem> = rows.iter().map(|r| r.item.clone()).collect();
         self.fetch_pictures(&key, &items);
         let (px, older) = (self.avatars.clone(), self.st.lock().unwrap().older.get(&key).cloned().flatten().is_some());
@@ -864,6 +888,46 @@ impl Ctl {
             list.drain(..list.len() - KEEP_PER_ROOM);
         }
         added
+    }
+
+    /// New keys came for a room: messages shown as undecryptable there are
+    /// fetched again (a burst of keys is handled once, shortly after).
+    fn redecrypt(&self, key: RoomKey) {
+        {
+            let mut st = self.st.lock().unwrap();
+            let locked = st.messages.get(&key).is_some_and(|l| l.iter().any(|m| timeline::is_undecryptable(&m.body)));
+            if !locked || !st.redecrypting.insert(key.clone()) {
+                return;
+            }
+        }
+        let c = self.clone();
+        self.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            c.st.lock().unwrap().redecrypting.remove(&key);
+            let Some(room) = c.mgr.client(key.0).await.and_then(|cl| cl.get_room(&key.1)) else { return };
+            let Ok(page) = timeline::history(&room, None, PAGE).await else { return };
+            c.mgr.note_history(key.0, &key.1, &page.items);
+            let changed: Vec<OwnedEventId> = {
+                let mut st = c.st.lock().unwrap();
+                let Some(list) = st.messages.get_mut(&key) else { return };
+                let mut changed = Vec::new();
+                for new in page.items {
+                    if let Some(old) = list.iter_mut().find(|m| m.event_id == new.event_id && timeline::is_undecryptable(&m.body))
+                        && !timeline::is_undecryptable(&new.body)
+                    {
+                        changed.push(new.event_id.clone());
+                        *old = new;
+                    }
+                }
+                changed
+            };
+            for id in &changed {
+                c.update_message(&key, id);
+            }
+            if !changed.is_empty() {
+                c.refresh_rooms().await;
+            }
+        });
     }
 
     fn merge_reactions(&self, key: &RoomKey, new: Vec<timeline::Reaction>) {
@@ -1069,7 +1133,14 @@ impl Ctl {
     async fn room_menu(&self, action: String, id: String) {
         let Ok(room_id) = OwnedRoomId::try_from(id) else { return };
         let Some(account) = self.st.lock().unwrap().account else { return };
-        let Some(room) = self.mgr.client(account).await.and_then(|c| c.get_room(&room_id)) else { return };
+        let Some(room) = self.mgr.client(account).await.and_then(|c| c.get_room(&room_id)) else {
+            // A space's room you haven't joined: only its address.
+            if action == "copy" {
+                let link = format!("https://matrix.to/#/{room_id}");
+                self.ui(move |u| u.invoke_copy_text(s(link)));
+            }
+            return;
+        };
         let key = (account, room_id.clone());
         match action.as_str() {
             "toggle" => {
@@ -1246,6 +1317,7 @@ impl Ctl {
                 }
                 match self.mgr.set_kind(aid, if ai { AccountKind::Agent } else { AccountKind::Human }).await {
                     Ok(()) if ai => {
+                        self.mgr.vouch_own().await;
                         self.open_settings(format!("ai:{aid}")).await;
                         self.settings_msg("Now pick the AI's API and model, then turn it on.");
                     }
@@ -1297,6 +1369,40 @@ impl Ctl {
                 st.older.retain(|(a, _), _| *a != aid);
                 return;
             }
+            "secure" | "reset-identity" => {
+                use whisker_core::verify;
+                self.settings_msg("Setting up verification…");
+                let r = if action == "secure" {
+                    verify::ensure_identity(&client, Some(&value)).await.and_then(|ok| if ok { Ok(()) } else { Err(anyhow::anyhow!("the server wants your password")) })
+                } else {
+                    verify::reset_identity(&client, &value).await
+                };
+                if let Err(e) = r {
+                    return self.settings_msg(format!("Couldn't set up verification (is the password right?): {e:#}"));
+                }
+                self.mgr.vouch_own().await;
+                // A recovery key straight away, so the next login can verify itself.
+                let key = verify::enable_recovery(&client).await;
+                self.open_settings(format!("account:{aid}")).await;
+                match key {
+                    Ok(k) => {
+                        self.show_recovery_key(k);
+                        self.settings_msg("This session is verified.");
+                    }
+                    Err(e) => self.settings_msg(format!("This session is verified, but the recovery key couldn't be made: {e:#}")),
+                }
+                return;
+            }
+            "make-recovery" => {
+                self.settings_msg("Making a recovery key and backing up your keys…");
+                let key = whisker_core::verify::enable_recovery(&client).await;
+                self.open_settings(format!("account:{aid}")).await;
+                match key {
+                    Ok(k) => self.show_recovery_key(k),
+                    Err(e) => self.settings_msg(format!("Couldn't make a recovery key: {e:#}")),
+                }
+                return;
+            }
             "verify-self" => {
                 let Some(me) = client.user_id().map(ToOwned::to_owned) else { return };
                 self.ui(|u| {
@@ -1340,6 +1446,17 @@ impl Ctl {
             }
             Err(e) => self.settings_msg(format!("Couldn't update your profile: {e:#}")),
         }
+    }
+
+    /// Shows a just-made recovery key on the account page.
+    fn show_recovery_key(&self, key: Option<String>) {
+        let Some(key) = key else { return };
+        self.ui(move |u| {
+            let mut f = u.get_account_form();
+            f.recovery_key = s(&key);
+            f.recovery_on = true;
+            u.set_account_form(f);
+        });
     }
 
     async fn verify_action(&self, action: String) {
@@ -1744,7 +1861,9 @@ impl Ctl {
             for path in picked.unwrap_or_default() {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.status(format!("Uploading {name}…"));
-                match timeline::send_file(&room, &path).await {
+                let (me, label) = (self.clone(), name.clone());
+                let progress = move |pct: u8| me.status(format!("Uploading {label}… {pct}%"));
+                match timeline::send_file(&room, &path, progress).await {
                     Ok(()) => self.status(""),
                     Err(e) => self.status(format!("Couldn't send {name}: {e:#}")),
                 }
@@ -1780,7 +1899,27 @@ impl Ctl {
             }
             "select" => {
                 let body = m.body.clone();
-                self.ui(move |u| u.set_select_text(s(body)));
+                self.ui(move |u| {
+                    u.set_select_title(s("Select text"));
+                    u.set_select_text(s(body));
+                });
+            }
+            "source" => {
+                let text = match room.event(&m.event_id, None).await {
+                    Ok(ev) => {
+                        let pretty = |j: &str| serde_json::from_str::<serde_json::Value>(j).and_then(|v| serde_json::to_string_pretty(&v)).unwrap_or_else(|_| j.to_owned());
+                        let shown = pretty(ev.raw().json().get());
+                        match ev.encryption_info() {
+                            Some(info) => format!("{shown}\n\n// Decrypted. Sent from session {}.", info.sender_device.as_deref().map(|d| d.as_str()).unwrap_or("unknown")),
+                            None => shown,
+                        }
+                    }
+                    Err(e) => format!("Couldn't fetch the source: {e}"),
+                };
+                self.ui(move |u| {
+                    u.set_select_title(s("Message source"));
+                    u.set_select_text(s(text));
+                });
             }
             "edit" => {
                 self.st.lock().unwrap().editing = Some(m.event_id.clone());
@@ -2479,6 +2618,19 @@ impl Ctl {
         }
     }
 
+    fn set_menu_entry(&self, key: String, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        if on {
+            st.menu_hidden.remove(&key);
+        } else {
+            st.menu_hidden.insert(key);
+        }
+        let _ = st.save(self.mgr.data_dir());
+        if let Some(u) = self.ui.upgrade() {
+            apply_menu(&u, &st.menu_hidden);
+        }
+    }
+
     fn set_autocorrect(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.autocorrect = on;
@@ -2968,6 +3120,7 @@ impl Ctl {
         let mut account_data: Option<(AccountSummary, Option<String>, Option<String>)> = None;
         // This login (session): 2 verified, 1 not, 0 not signed in; and its device id.
         let mut session = (0, String::new());
+        let mut identity = (false, false);
         let mut agent = AgentForm::default();
         let mut models: Vec<SharedString> = Vec::new();
         let mut detect = String::new();
@@ -2987,6 +3140,7 @@ impl Ctl {
                     _ => 0,
                 };
                 session = (verified, client.device_id().map(|d| d.to_string()).unwrap_or_default());
+                identity = (whisker_core::verify::has_identity(&client).await, whisker_core::verify::recovery_on(&client));
             }
         }
         if let Some(rest) = id.strip_prefix("ai:")
@@ -3047,6 +3201,9 @@ impl Ctl {
                         proxy: s(proxy.clone().unwrap_or_default()),
                         session_verified: session.0,
                         session_id: s(&session.1),
+                        has_identity: identity.0,
+                        recovery_on: identity.1,
+                        recovery_key: s(""),
                     }
                 }
                 None => AccountForm::default(),
@@ -3458,6 +3615,11 @@ impl Ctl {
                         self.show_typing(&key).await;
                     }
                 }
+                ClientEvent::RoomKeys { account, rooms } => {
+                    for room_id in rooms {
+                        self.redecrypt((account, room_id));
+                    }
+                }
                 ClientEvent::Receipts { account, room_id } => {
                     let key = (account, room_id);
                     if self.current().as_ref() == Some(&key) {
@@ -3701,6 +3863,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
+    apply_menu(&ui, &prefs.menu_hidden);
     let servers: Vec<SharedString> = SUGGESTED_SERVERS.iter().map(s).chain([s("Other server…")]).collect();
     ui.set_login_servers(slint::ModelRc::new(slint::VecModel::from(servers)));
     ui::RICH.set(prefs.rich_text);
@@ -3868,6 +4031,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.on_set_send_typing(move |b| c.set_send_typing(b));
         let c = ctl.clone();
         ui.on_set_autocorrect(move |b| c.set_autocorrect(b));
+        let c = ctl.clone();
+        ui.on_set_menu_entry(move |k, b| c.set_menu_entry(k.to_string(), b));
     }
     {
         let c = ctl.clone();
@@ -3935,6 +4100,24 @@ fn android_main(app: slint::android::AndroidApp) {
 
 
 
+
+/// Shows the message menu entries that aren't in `hidden`.
+fn apply_menu(ui: &AppWindow, hidden: &std::collections::BTreeSet<String>) {
+    let p = ui.global::<Prefs>();
+    let on = |k: &str| !hidden.contains(k);
+    p.set_menu_react(on("react"));
+    p.set_menu_reply(on("reply"));
+    p.set_menu_thread(on("thread"));
+    p.set_menu_forward(on("forward"));
+    p.set_menu_quote(on("quote"));
+    p.set_menu_copy(on("copy"));
+    p.set_menu_select(on("select"));
+    p.set_menu_open_links(on("open-links"));
+    p.set_menu_copy_link(on("copy-link"));
+    p.set_menu_profile(on("profile"));
+    p.set_menu_copy_id(on("copy-id"));
+    p.set_menu_source(on("source"));
+}
 
 #[cfg(test)]
 mod tests {

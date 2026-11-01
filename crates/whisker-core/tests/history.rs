@@ -42,7 +42,9 @@ async fn short_page_means_nothing_older() {
         .mount(server.server())
         .await;
     let page = timeline::history(&room, None, 50).await.unwrap();
-    assert_eq!(page.items.iter().map(|i| i.body.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+    // The start of what the server has, short of the room's creation, gets a note why.
+    assert_eq!(page.items[0].event_id.as_str(), "$whisker-history-start");
+    assert_eq!(page.items[1..].iter().map(|i| i.body.as_str()).collect::<Vec<_>>(), ["first", "second"]);
     assert_eq!(page.older, None);
     assert_eq!(page.reactions.len(), 1);
     assert_eq!(page.reactions[0].key, "👍");
@@ -150,7 +152,7 @@ async fn name_changes_in_history_are_not_joins() {
         .mount(server.server())
         .await;
     let page = timeline::history(&room, None, 50).await.unwrap();
-    let lines: Vec<&str> = page.items.iter().map(|i| i.body.as_str()).collect();
+    let lines: Vec<&str> = page.items.iter().filter(|i| i.event_id != "$whisker-history-start").map(|i| i.body.as_str()).collect();
     assert_eq!(lines, ["nully is now A", "A is now B", "B is now C"]);
 }
 

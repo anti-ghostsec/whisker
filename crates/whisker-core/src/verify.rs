@@ -166,3 +166,79 @@ async fn watch_sas(sas: SasVerification, flow: String, tx: broadcast::Sender<Cli
         }
     }
 }
+
+/// The server's "confirm it's you" answer, with the account password.
+fn password_auth(client: &Client, password: &str, session: Option<String>) -> Result<matrix_sdk::ruma::api::client::uiaa::AuthData> {
+    use matrix_sdk::ruma::api::client::uiaa::{AuthData, Password};
+    let user = client.user_id().ok_or_else(|| anyhow!("not signed in"))?.to_owned();
+    let mut p = Password::new((&user).into(), password.to_owned());
+    p.session = session;
+    Ok(AuthData::Password(p))
+}
+
+/// Gives an account that has no cross-signing keys yet (a new account) a
+/// set, made on this device, which makes this session verified without
+/// needing another one. Accounts that already have keys are left alone.
+/// `Ok(false)`: the server wants the password and none was given.
+pub async fn ensure_identity(client: &Client, password: Option<&str>) -> Result<bool> {
+    let enc = client.encryption();
+    let Err(e) = enc.bootstrap_cross_signing_if_needed(None).await else { return Ok(true) };
+    let Some(info) = e.as_uiaa_response() else { return Err(e.into()) };
+    let Some(pw) = password else { return Ok(false) };
+    enc.bootstrap_cross_signing_if_needed(Some(password_auth(client, pw, info.session.clone())?)).await?;
+    Ok(true)
+}
+
+/// Whether the account has cross-signing keys on the server at all.
+pub async fn has_identity(client: &Client) -> bool {
+    let Some(me) = client.user_id() else { return false };
+    client.encryption().request_user_identity(me).await.ok().flatten().is_some()
+}
+
+/// Replaces the account's cross-signing keys with new ones made here, for
+/// when no other session or recovery key is left. Other sessions and
+/// people who verified you have to verify again, and the server-side key
+/// backup is deleted.
+pub async fn reset_identity(client: &Client, password: &str) -> Result<()> {
+    use matrix_sdk::encryption::CrossSigningResetAuthType;
+    let Some(handle) = client.encryption().recovery().reset_identity().await? else { return Ok(()) };
+    let auth = match handle.auth_type() {
+        CrossSigningResetAuthType::Uiaa(info) => Some(password_auth(client, password, info.session.clone())?),
+        CrossSigningResetAuthType::OAuth(o) => bail!("approve the reset at {} first, then try again", o.approval_url),
+    };
+    handle.reset(auth).await?;
+    Ok(())
+}
+
+/// Turns on the recovery key (secret storage plus key backup) and returns
+/// it, for the user to write down. `None`: it's already on.
+pub async fn enable_recovery(client: &Client) -> Result<Option<String>> {
+    use matrix_sdk::encryption::recovery::RecoveryState;
+    let r = client.encryption().recovery();
+    match r.state() {
+        RecoveryState::Enabled => Ok(None),
+        RecoveryState::Incomplete => bail!("a recovery key already exists for this account; enter it under \"Read older encrypted messages\""),
+        _ => Ok(Some(r.enable().wait_for_backups_to_upload().await?)),
+    }
+}
+
+/// Whether a recovery key is set up and unlocked on this session.
+pub fn recovery_on(client: &Client) -> bool {
+    client.encryption().recovery().state() == matrix_sdk::encryption::recovery::RecoveryState::Enabled
+}
+
+/// Marks `other` verified by `client`'s user, without the emoji check:
+/// for your own accounts on this device, which can't fool each other.
+/// Needs this session to hold the user-signing key.
+pub async fn vouch(client: &Client, other: &UserId) -> Result<()> {
+    let can = client.encryption().cross_signing_status().await.is_some_and(|s| s.has_user_signing);
+    if !can || client.user_id() == Some(other) {
+        return Ok(());
+    }
+    if let Some(id) = client.encryption().request_user_identity(other).await?
+        && !id.is_verified()
+    {
+        id.verify().await?;
+    }
+    Ok(())
+}

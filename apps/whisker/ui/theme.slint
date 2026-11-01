@@ -28,6 +28,19 @@ export global Prefs {
     in-out property <int> notify-level: 2;
     in-out property <bool> send-typing: false;
     in-out property <bool> autocorrect: true;
+    // Which entries the message right-click menu shows.
+    in-out property <bool> menu-react: true;
+    in-out property <bool> menu-reply: true;
+    in-out property <bool> menu-thread: true;
+    in-out property <bool> menu-forward: true;
+    in-out property <bool> menu-quote: true;
+    in-out property <bool> menu-copy: true;
+    in-out property <bool> menu-select: true;
+    in-out property <bool> menu-open-links: true;
+    in-out property <bool> menu-copy-link: true;
+    in-out property <bool> menu-profile: true;
+    in-out property <bool> menu-copy-id: true;
+    in-out property <bool> menu-source: true;
 }
 
 export component Avatar inherits Rectangle {
@@ -108,6 +121,8 @@ export component Input inherits Rectangle {
     in property <string> placeholder;
     in property <bool> password;
     in property <bool> enabled: true;
+    // Selectable and copyable, but not editable.
+    in property <bool> read-only;
     in-out property <string> text <=> ti.text;
     callback accepted(string);
     callback edited(string);
@@ -123,9 +138,9 @@ export component Input inherits Rectangle {
         // Right-click: the usual edit menu (no cut or copy for passwords).
         ContextMenuArea {
             Menu {
-                if !root.password && root.enabled: MenuItem { title: "Cut"; activated => { ti.cut(); root.edited(ti.text); } }
+                if !root.password && root.enabled && !root.read-only: MenuItem { title: "Cut"; activated => { ti.cut(); root.edited(ti.text); } }
                 if !root.password: MenuItem { title: "Copy"; activated => { ti.copy(); } }
-                if root.enabled: MenuItem { title: "Paste"; activated => { ti.paste(); root.edited(ti.text); } }
+                if root.enabled && !root.read-only: MenuItem { title: "Paste"; activated => { ti.paste(); root.edited(ti.text); } }
                 MenuSeparator {}
                 MenuItem { title: "Select all"; activated => { ti.focus(); ti.select-all(); } }
             }
@@ -134,6 +149,7 @@ export component Input inherits Rectangle {
                 color: Theme.text;
                 font-size: 14px;
                 enabled: root.enabled;
+                read-only: root.read-only;
                 input-type: root.password ? InputType.password : InputType.text;
                 selection-background-color: Theme.accent-soft;
                 accepted => { root.accepted(self.text); }

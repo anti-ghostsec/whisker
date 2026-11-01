@@ -17,7 +17,7 @@ whisker-agent.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 chrono.workspace = true
 matrix-sdk.workspace = true
 directories.workspace = true

@@ -132,6 +132,7 @@ export component Input inherits Rectangle {
     in-out property <string> text <=> ti.text;
     callback accepted(string);
     callback edited(string);
+    public function take-focus() { ti.focus(); }
     height: 38px;
     border-radius: 10px;
     clip: true;

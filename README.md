@@ -163,9 +163,10 @@ operating system and the **Wisp** browser.
   *Longest reply posted* caps replies in characters (cut at the last sentence that fits),
   and *Let the AI see pictures* (off by default) sends the newest pictures in the
   conversation (and a picture someone replies to), shrunk to 1024 px, to models that can
-  see images. For a chat model that can't, pick a *Picture model* from the list of the
-  service's models that can see (or type one): it describes each picture in words for the
-  chat model. Saving warns when the chat model probably can't see and no picture model is set. An AI answers when it's named,
+  see images. The page says whether the chosen chat model can see; for one that can't, pick
+  a *Picture model* from the dropdown of the service's models that can (or type one): it
+  describes each picture in words for the chat model. Pictures posted before the AI last
+  restarted are fetched again when it answers. Saving warns when the chat model probably can't see and no picture model is set. An AI answers when it's named,
   mentioned, or someone replies to one of its messages.
 - **Character cards.** On an AI's page, *Import card…* reads Tavern / SillyTavern character
   cards, versions 1, 2 and 3, as `.json` or as `.png` (the card hidden in the picture,

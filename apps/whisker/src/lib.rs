@@ -3150,6 +3150,7 @@ impl Ctl {
         {
             let cfgs = agents_in(&self.mgr, &a.vault).await;
             let cfg = cfgs.iter().find(|c| c.account == aid);
+            *VISION.lock().unwrap() = None;
             agent = agent_form::to_form(aid, &a.display_name, cfg);
             // Opening the page again drops an import that wasn't saved.
             self.st.lock().unwrap().pending_cards.remove(&aid);
@@ -3158,6 +3159,7 @@ impl Ctl {
             if let Some(d) = self.st.lock().unwrap().detected.get(&aid) {
                 models = d.models.iter().map(s).collect();
                 image_models = d.vision.iter().map(s).collect();
+                *VISION.lock().unwrap() = Some(d.vision.iter().cloned().collect());
                 detect = format!("✓ {} · {} models", d.service, d.models.len());
             } else if let Some(c) = cfg
                 && !c.api.url.is_empty()
@@ -3307,6 +3309,7 @@ impl Ctl {
                 );
                 let models: Vec<SharedString> = d.models.iter().map(s).collect();
                 let vision: Vec<SharedString> = d.vision.iter().map(s).collect();
+                *VISION.lock().unwrap() = Some(d.vision.iter().cloned().collect());
                 self.st.lock().unwrap().detected.insert(account, d);
                 self.ui(move |u| {
                     u.set_models(ModelRc::new(VecModel::from(models)));
@@ -3504,7 +3507,8 @@ impl Ctl {
     async fn filter_models(&self, q: String) {
         let Some(id) = self.settings_account() else { return };
         let q = q.trim().to_lowercase();
-        let all = self.st.lock().unwrap().detected.get(&id).map(|d| d.models.clone()).unwrap_or_default();
+        // Nothing listed yet: leave whatever the page shows.
+        let Some(all) = self.st.lock().unwrap().detected.get(&id).map(|d| d.models.clone()) else { return };
         // The exact name picked: show the whole list again.
         let models: Vec<SharedString> = if q.is_empty() || all.iter().any(|m| m.to_lowercase() == q) {
             all.iter().map(s).collect()
@@ -3517,7 +3521,7 @@ impl Ctl {
     async fn filter_image_models(&self, q: String) {
         let Some(id) = self.settings_account() else { return };
         let q = q.trim().to_lowercase();
-        let all = self.st.lock().unwrap().detected.get(&id).map(|d| d.vision.clone()).unwrap_or_default();
+        let Some(all) = self.st.lock().unwrap().detected.get(&id).map(|d| d.vision.clone()) else { return };
         let models: Vec<SharedString> = if q.is_empty() || all.iter().any(|m| m.to_lowercase() == q) {
             all.iter().map(s).collect()
         } else {
@@ -3899,6 +3903,15 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
     autocorrect::warm();
+    ui.global::<ModelInfo>().on_sees(|model, _| {
+        let model = model.trim();
+        match VISION.lock().unwrap().as_ref() {
+            Some(_) if model.is_empty() => 0,
+            Some(seeing) if seeing.contains(model) => 1,
+            Some(_) => 2,
+            None => 0,
+        }
+    });
     ui.global::<TextTools>().on_slice(|text, a, b| {
         let (a, b) = (a.clamp(0, text.len() as i32) as usize, b.clamp(0, text.len() as i32) as usize);
         let (from, to) = (a.min(b), a.max(b));
@@ -4147,6 +4160,10 @@ fn android_main(app: slint::android::AndroidApp) {
 
 
 
+
+/// The models on the open AI page's service that can see pictures (None
+/// until it's listed), for `ModelInfo.sees`.
+static VISION: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Shows the message menu entries that aren't in `hidden`.
 fn apply_menu(ui: &AppWindow, hidden: &std::collections::BTreeSet<String>) {

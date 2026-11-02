@@ -1,11 +1,11 @@
 import { ListView, ScrollView, Palette, TextEdit, Switch, ComboBox } from "std-widgets.slint";
 import { Theme, Prefs, TextTools, Avatar, Btn, IconBtn, Input, Pill } from "theme.slint";
-import { SettingsPage, AccountForm, AgentForm, NavItem } from "settings.slint";
+import { SettingsPage, AccountForm, AgentForm, NavItem, ModelInfo } from "settings.slint";
 // Colour emoji for all text (a trimmed Noto Color Emoji: no letters, digits
 // or spaces, so text still comes from the normal fonts). See assets/fonts.
 import "../assets/fonts/WhiskerEmoji.ttf";
 
-export { AccountForm, AgentForm, NavItem, Prefs, TextTools }
+export { AccountForm, AgentForm, NavItem, Prefs, TextTools, ModelInfo }
 
 // `initial`/`hue`/`avatar` are worked out in Rust so a name looks the same everywhere.
 export struct AccountItem {

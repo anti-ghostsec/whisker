@@ -1,4 +1,4 @@
-import { ComboBox, SpinBox, Switch, TextEdit, ScrollView } from "std-widgets.slint";
+import { ComboBox, SpinBox, Switch, TextEdit, ScrollView, ListView } from "std-widgets.slint";
 import { Theme, Prefs, Avatar, Btn, IconBtn, Input } from "theme.slint";
 
 // One entry in the settings sidebar. `id` is "general", "account:<id>" or "ai:<id>".
@@ -504,40 +504,99 @@ component AccountPage inherits VerticalLayout {
     }
 }
 
-/// A list of model names to pick from: a plain list, not a dropdown, so
-/// there's no popup to get stuck and long lists can be narrowed by typing.
-component ModelList inherits Rectangle {
+// Says whether a model can see pictures, from the service's model list:
+// 0 unknown, 1 yes, 2 no. `revision` is there to ask again when the list
+// changes.
+export global ModelInfo {
+    pure callback sees(string, int) -> int;
+}
+
+/// A dropdown of model names with a search box. `models` is what the
+/// search leaves (the app narrows it on `search`). Typing a name that isn't
+/// listed and pressing Enter picks it too.
+component ModelPicker inherits Rectangle {
     in property <[string]> models;
-    in property <string> picked;
-    callback chosen(string);
-    height: min(220px, root.models.length * 30px + 8px);
-    border-radius: 8px;
+    in-out property <string> value;
+    in property <string> placeholder;
+    // Shown in the dropdown when nothing is listed.
+    in property <string> empty-text: "No models listed. Type a name and press Enter.";
+    // Lets the value be cleared (for "none").
+    in property <string> none-text;
+    callback search(string);
+    callback picked(string);
+    height: 38px;
+    border-radius: 10px;
+    background: pta.has-hover ? Theme.hover : Theme.raised;
     border-width: 1px;
     border-color: Theme.border;
-    background: Theme.raised;
-    msv := ScrollView {
-        x: 4px;
-        y: 4px;
-        width: parent.width - 8px;
-        height: parent.height - 8px;
-        content-width: self.visible-width;
-        content-height: mlist.preferred-height;
-        mlist := VerticalLayout {
-            width: msv.visible-width;
-            for name in root.models: Rectangle {
-                height: 30px;
-                border-radius: 6px;
-                background: name == root.picked ? Theme.accent-soft : mta.has-hover ? Theme.hover : transparent;
-                Text {
-                    x: 8px;
-                    width: parent.width - 16px;
-                    text: name;
-                    color: name == root.picked ? Theme.accent : Theme.text;
-                    font-size: 12px;
-                    overflow: elide;
-                    vertical-alignment: center;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 8px;
+        Text {
+            text: root.value != "" ? root.value : root.placeholder;
+            color: root.value != "" ? Theme.text : Theme.muted;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Text { text: "▾"; color: Theme.muted; vertical-alignment: center; }
+    }
+    pta := TouchArea { mouse-cursor: pointer; clicked => { root.search(""); popup.show(); } }
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.width;
+        height: min(380px, 56px + (root.none-text != "" ? 32px : 0px) + max(1, root.models.length) * 32px + 8px);
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.panel;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000080;
+            VerticalLayout {
+                padding: 6px;
+                spacing: 6px;
+                sb := Input {
+                    placeholder: "Search, or type a name and press Enter";
+                    init => { self.take-focus(); }
+                    edited(t) => { root.search(t); }
+                    accepted(t) => {
+                        if t != "" {
+                            root.value = t;
+                            root.picked(t);
+                            popup.close();
+                        }
+                    }
                 }
-                mta := TouchArea { mouse-cursor: pointer; clicked => { root.chosen(name); } }
+                if root.none-text != "": Rectangle {
+                    height: 32px;
+                    border-radius: 6px;
+                    background: nta.has-hover ? Theme.hover : transparent;
+                    Text { x: 10px; text: root.none-text; color: Theme.muted; font-size: 13px; vertical-alignment: center; }
+                    nta := TouchArea { mouse-cursor: pointer; clicked => { root.value = ""; root.picked(""); popup.close(); } }
+                }
+                if root.models.length == 0: Text { text: root.empty-text; color: Theme.muted; font-size: 12px; wrap: word-wrap; height: 32px; vertical-alignment: center; }
+                if root.models.length > 0: ListView {
+                    vertical-stretch: 1;
+                    for name in root.models: Rectangle {
+                        height: 32px;
+                        border-radius: 6px;
+                        background: name == root.value ? Theme.accent-soft : mta.has-hover ? Theme.hover : transparent;
+                        Text {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            text: name;
+                            color: name == root.value ? Theme.accent : Theme.text;
+                            font-size: 13px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        mta := TouchArea { mouse-cursor: pointer; clicked => { root.value = name; root.picked(name); popup.close(); } }
+                    }
+                }
             }
         }
     }
@@ -675,12 +734,14 @@ component AgentPage inherits VerticalLayout {
         }
         Field {
             label: "Model";
-            hint: root.models.length > 0 ? "Type to narrow the list, then click one (or type any name)." : "";
-            Input { text <=> root.a-model; placeholder: "e.g. meta-llama/llama-3.3-70b-instruct"; edited(t) => { root.filter-models(t); } }
+            hint: root.models.length == 0 ? "Press Connect to list the service's models, or type a name in the box." : "";
+            ModelPicker {
+                models: root.models;
+                value <=> root.a-model;
+                placeholder: "Pick a model";
+                search(q) => { root.filter-models(q); }
+            }
         }
-        // A plain list, not a dropdown: no popup to get stuck, and long
-        // model lists can be narrowed by typing.
-        if root.models.length > 0: ModelList { models: root.models; picked: root.a-model; chosen(m) => { root.a-model = m; } }
         Number { text: "Longest reply (tokens)"; minimum: 64; maximum: 32000; value <=> root.a-max-tokens; }
         Number { text: "Longest reply posted (characters, 0 = no limit)"; minimum: 0; maximum: 20000; value <=> root.a-reply-chars; }
         Toggle { text: "Let the AI see pictures posted in the room"; checked <=> root.a-see-images; }
@@ -690,17 +751,19 @@ component AgentPage inherits VerticalLayout {
         }
         if root.a-see-images: Field {
             label: "Picture model";
-            hint: "Same API. A model that can see images (e.g. gpt-4o-mini, claude-haiku-4-5, qwen-2.5-vl) describes each picture for the chat model, so the chat model doesn't need to see images itself. Leave empty if the chat model can.";
-            Input { text <=> root.a-image-model; placeholder: "Chat model sees pictures itself"; edited(t) => { root.filter-image-models(t); } }
-        }
-        if root.a-see-images && root.image-models.length > 0: ModelList {
-            models: root.image-models;
-            picked: root.a-image-model;
-            chosen(m) => { root.a-image-model = m; }
-        }
-        if root.a-see-images && root.image-models.length == 0: Text {
-            text: root.models.length == 0 ? "Press Connect above to list the service's models." : "None of this service's models say they can see pictures; type a name if you know one.";
-            font-size: 11px; color: Theme.muted; wrap: word-wrap;
+            hint: ModelInfo.sees(root.a-model, root.image-models.length) == 1
+                ? "✓ " + root.a-model + " can see pictures itself, so this can stay on \"None\". Pick one only to have a different model describe pictures for it."
+                : ModelInfo.sees(root.a-model, root.image-models.length) == 2
+                ? "⚠ " + root.a-model + " can't see pictures. Pick a model here that can: it describes each picture in words for the chat model."
+                : "A model that can see pictures describes each one in words for the chat model. Not needed if the chat model can see.";
+            ModelPicker {
+                models: root.image-models;
+                value <=> root.a-image-model;
+                placeholder: "None: the chat model looks itself";
+                none-text: "None: the chat model looks itself";
+                empty-text: root.models.length == 0 ? "Press Connect above to list the service's models." : "None of this service's models say they can see pictures. Type a name and press Enter.";
+                search(q) => { root.filter-image-models(q); }
+            }
         }
         Text {
             text: "Venice only (api.venice.ai). Both stay off unless you turn them on.";

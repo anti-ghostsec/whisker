@@ -140,7 +140,7 @@ fn picture_line(body: &str, name: &str) -> String {
 }
 
 /// A downloaded picture, shrunk and re-encoded as JPEG, in base64.
-fn shrink_picture(bytes: &[u8]) -> Option<String> {
+pub(crate) fn shrink_picture(bytes: &[u8]) -> Option<String> {
     let img = image::load_from_memory(bytes).ok()?;
     let img = if img.width() > PICTURE_PX || img.height() > PICTURE_PX { img.thumbnail(PICTURE_PX, PICTURE_PX) } else { img };
     let mut out = std::io::Cursor::new(Vec::new());
@@ -325,19 +325,34 @@ impl AgentRunner {
     /// The newest pictures in `lines` (oldest first), ready to send:
     /// (message id, base64 JPEG). Ones that fail to load are skipped.
     async fn load_pictures(&self, room: &Room, lines: &[&Line], reply_to: Option<&OwnedEventId>) -> Vec<(OwnedEventId, String)> {
-        let mut wanted: Vec<(OwnedEventId, MediaSource)> = lines
-            .iter()
-            .rev()
-            .filter_map(|l| self.pictures.get(&l.event_id).map(|s| (l.event_id.clone(), s.clone())))
-            .take(MAX_PICTURES)
-            .collect();
+        // Pictures seen since the AI started, or (after a restart, which
+        // forgets them) fetched again for the transcript's picture lines.
+        let mut wanted: Vec<(OwnedEventId, MediaSource)> = Vec::new();
+        for l in lines.iter().rev() {
+            if wanted.len() >= MAX_PICTURES {
+                break;
+            }
+            let source = match self.pictures.get(&l.event_id) {
+                Some(s) => Some(s.clone()),
+                None if l.body.starts_with("[picture]") => picture_of(room, &l.event_id).await,
+                None => None,
+            };
+            if let Some(s) = source {
+                wanted.push((l.event_id.clone(), s));
+            }
+        }
         // The picture being replied to, even when it's older than the transcript.
         if let Some(to) = reply_to
             && !wanted.iter().any(|(id, _)| id == to)
-            && let Some(source) = self.pictures.get(to)
         {
-            wanted.truncate(MAX_PICTURES.saturating_sub(1));
-            wanted.insert(0, (to.clone(), source.clone()));
+            let source = match self.pictures.get(to) {
+                Some(s) => Some(s.clone()),
+                None => picture_of(room, to).await,
+            };
+            if let Some(source) = source {
+                wanted.truncate(MAX_PICTURES.saturating_sub(1));
+                wanted.insert(0, (to.clone(), source));
+            }
         }
         let mut out = Vec::new();
         for (id, source) in wanted.into_iter().rev() {
@@ -348,9 +363,13 @@ impl AgentRunner {
                     continue;
                 }
             };
+            let size = bytes.len();
             match tokio::task::spawn_blocking(move || shrink_picture(&bytes)).await {
-                Ok(Some(data)) => out.push((id, data)),
-                _ => tracing::warn!("couldn't read picture {id} for the AI"),
+                Ok(Some(data)) => {
+                    tracing::info!("showing the AI picture {id} ({size} bytes)");
+                    out.push((id, data));
+                }
+                _ => tracing::warn!("couldn't read picture {id} for the AI ({size} bytes; not PNG, JPEG, WebP or GIF?)"),
             }
         }
         out
@@ -622,6 +641,16 @@ pub fn spawn(cfg: AgentConfig, mgr: AccountManager) -> Result<JoinHandle<()>> {
     }))
 }
 
+/// Where to fetch the picture in message `id`, if it is one.
+async fn picture_of(room: &Room, id: &OwnedEventId) -> Option<MediaSource> {
+    let ev = room.event(id, None).await.ok()?;
+    let content: RoomMessageEventContent = ev.raw().get_field("content").ok().flatten()?;
+    match timeline::parse(&content) {
+        timeline::Parsed::New { media: Some(m), .. } if m.kind == MediaKind::Image => Some(m.source),
+        _ => None,
+    }
+}
+
 /// Starts every enabled agent in every unlocked vault.
 pub async fn start_all(mgr: &AccountManager) -> Vec<(AccountId, JoinHandle<()>)> {
     let mut handles = Vec::new();
@@ -764,12 +793,19 @@ mod memory_tests {
     }
 }
 
-/// Where to fetch the picture in message `id`, if it is one.
-async fn picture_of(room: &Room, id: &OwnedEventId) -> Option<MediaSource> {
-    let ev = room.event(id, None).await.ok()?;
-    let content: RoomMessageEventContent = ev.raw().get_field("content").ok().flatten()?;
-    match timeline::parse(&content) {
-        timeline::Parsed::New { media: Some(m), .. } if m.kind == MediaKind::Image => Some(m.source),
-        _ => None,
+#[cfg(test)]
+mod picture_tests {
+    #[test]
+    fn shrinking_keeps_the_picture() {
+        // Left half red, right half blue, bigger than the limit.
+        let img = image::RgbImage::from_fn(2000, 1000, |x, _| if x < 1000 { image::Rgb([220, 20, 20]) } else { image::Rgb([20, 20, 220]) });
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let b64 = super::shrink_picture(&png.into_inner()).unwrap();
+        let back = image::load_from_memory(&crate::card::decode_base64(&b64).unwrap()).unwrap().to_rgb8();
+        assert_eq!((back.width(), back.height()), (1024, 512));
+        let (l, r) = (back.get_pixel(100, 256), back.get_pixel(900, 256));
+        assert!(l[0] > 180 && l[2] < 60, "left is {l:?}");
+        assert!(r[2] > 180 && r[0] < 60, "right is {r:?}");
     }
 }

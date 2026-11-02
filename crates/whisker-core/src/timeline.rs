@@ -930,15 +930,87 @@ pub async fn send_file(room: &Room, path: &Path, progress: impl Fn(u8) + Send + 
     }
     let data = tokio::fs::read(path).await?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
-    send_bytes_with(room, &name, data, progress).await
+    let mut config = AttachmentConfig::new();
+    // A poster frame, so the video shows as a picture rather than a file.
+    if mime_guess::from_path(path).first().is_some_and(|m| m.type_() == mime_guess::mime::VIDEO) {
+        let owned = path.to_owned();
+        if let Ok(Some(p)) = tokio::task::spawn_blocking(move || video_poster(&owned)).await {
+            let size = UInt::try_from(p.jpeg.len() as u64).unwrap_or_default();
+            config = config
+                .info(matrix_sdk::attachment::AttachmentInfo::Video(matrix_sdk::attachment::BaseVideoInfo {
+                    duration: p.duration,
+                    width: Some(UInt::from(p.video_size.0)),
+                    height: Some(UInt::from(p.video_size.1)),
+                    size: UInt::try_from(meta.len()).ok(),
+                    blurhash: None,
+                }))
+                .thumbnail(Some(matrix_sdk::attachment::Thumbnail {
+                    data: p.jpeg,
+                    content_type: mime_guess::mime::IMAGE_JPEG,
+                    width: UInt::from(p.size.0),
+                    height: UInt::from(p.size.1),
+                    size,
+                }));
+        }
+    }
+    send_bytes_with(room, &name, data, config, progress).await
+}
+
+/// A still from a video, made by ffmpeg (when it's installed).
+pub struct Poster {
+    pub jpeg: Vec<u8>,
+    /// The still's width and height.
+    pub size: (u32, u32),
+    /// The video's.
+    pub video_size: (u32, u32),
+    pub duration: Option<std::time::Duration>,
+}
+
+/// Widest poster frame made.
+const POSTER_PX: u32 = 640;
+
+/// A frame from early in the video file at `path`, as a JPEG.
+pub fn video_poster(path: &Path) -> Option<Poster> {
+    use std::process::{Command, Stdio};
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration", "-of", "default=nw=1"])
+        .arg(path)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&probe.stdout);
+    let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=').map(str::trim));
+    let w: u32 = field("width")?.parse().ok()?;
+    let h: u32 = field("height")?.parse().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let duration = field("duration").and_then(|d| d.parse::<f64>().ok()).filter(|d| d.is_finite() && *d >= 0.0).map(std::time::Duration::from_secs_f64);
+    let pw = w.min(POSTER_PX) & !1;
+    let ph = ((u64::from(h) * u64::from(pw) / u64::from(w)) as u32).max(2) & !1;
+    // A second in skips black fade-ins; short clips use their first frame.
+    for seek in ["1", "0"] {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", seek, "-i"])
+            .arg(path)
+            .args(["-frames:v", "1", "-vf", &format!("scale={pw}:{ph}"), "-f", "image2", "-c:v", "mjpeg", "-q:v", "4", "pipe:1"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.stdout.is_empty() {
+            return Some(Poster { jpeg: out.stdout, size: (pw, ph), video_size: (w, h), duration });
+        }
+    }
+    None
 }
 
 /// Uploads `data` as a file called `name` (its extension sets the type).
 pub async fn send_bytes(room: &Room, name: &str, data: Vec<u8>) -> Result<()> {
-    send_bytes_with(room, name, data, |_| ()).await
+    send_bytes_with(room, name, data, AttachmentConfig::new(), |_| ()).await
 }
 
-async fn send_bytes_with(room: &Room, name: &str, data: Vec<u8>, progress: impl Fn(u8) + Send + 'static) -> Result<()> {
+async fn send_bytes_with(room: &Room, name: &str, data: Vec<u8>, config: AttachmentConfig, progress: impl Fn(u8) + Send + 'static) -> Result<()> {
     let limit = upload_limit(room).await;
     if data.len() as u64 > limit {
         return Err(too_big(limit));
@@ -960,13 +1032,34 @@ async fn send_bytes_with(room: &Room, name: &str, data: Vec<u8>, progress: impl 
             }
         }
     });
-    room.send_attachment(name, &mime, data, AttachmentConfig::new()).with_send_progress_observable(sent).await?;
+    room.send_attachment(name, &mime, data, config).with_send_progress_observable(sent).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn makes_video_posters() {
+        let dir = std::env::temp_dir().join(format!("whisker-poster-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("clip.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=10:duration=2", "-pix_fmt", "yuv420p"])
+            .arg(&video)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("no ffmpeg; skipping");
+            return;
+        }
+        let p = video_poster(&video).expect("a poster");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(&p.jpeg[..2], [0xFF, 0xD8]);
+        assert_eq!(p.size, (640, 360));
+        assert_eq!(p.video_size, (1280, 720));
+        assert!(p.duration.is_some_and(|d| d.as_secs_f64() > 1.5));
+    }
 
     #[test]
     fn strips_reply_fallback() {

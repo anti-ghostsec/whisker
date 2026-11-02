@@ -70,7 +70,8 @@ operating system and the **Wisp** browser.
 - **Images and videos:** right-click the picture or video itself to save it; the full-size
   viewer has Save / Forward / Close buttons and its own right-click menu. **GIFs and
   animated WebP play and loop**, in the timeline and the viewer. Videos show their preview
-  frame; click to **play** in mpv (looping, sound off to start) or, without mpv, your
+  frame (when they were sent without one, and are under 200 MB, Whisker makes one with
+  ffmpeg if it's installed; videos you send get one the same way); click to **play** in mpv (looping, sound off to start) or, without mpv, your
   system's player. The copy goes to the RAM folder and is deleted when you lock or quit
   (your player may still list it under recent files).
 - **Spaces** show as folders in the room list, holding their rooms and sub-spaces (a folded
@@ -87,7 +88,9 @@ operating system and the **Wisp** browser.
   straight after a fix keeps what you typed (and that word isn't fixed again). Turn it off
   in Settings. The word list comes from SCOWL (`apps/whisker/assets/words-LICENSE.txt`).
 - **Right-click to cut, copy, paste or select all** in every text box and the composer, and
-  to copy addresses, descriptions and pinned messages in the side panel.
+  to copy addresses, descriptions and pinned messages in the side panel. A message's menu
+  also has *Copy with the messages around it* and *Select text with the messages around it…*,
+  for a run of messages shown together under one name.
 - **Room keys:** Settings → account → *Export or import room keys* saves your message keys
   to a passphrase-locked file (the format Element uses), or reads one in.
 - **Threads:** replies in a thread are tucked under the message that started it ("3
@@ -159,15 +162,18 @@ operating system and the **Wisp** browser.
 - **AI accounts.** An AI chats as its own Matrix account. Add one from Settings → General
   → *Add an AI account*, or turn an account you have into one from its settings page. Its
   page under **AI** takes any API address and key (Venice, OpenAI, Anthropic, OpenRouter,
-  a local server…), the model, and Venice's privacy switches (both off by default).
+  a local server…), the model (filled in with the service's recommended one, Venice's own
+  default or a well-liked quick model, with a *Use it* button to switch back), and Venice's privacy switches (both off by default).
   *Longest reply posted* caps replies in characters (cut at the last sentence that fits),
-  and *Let the AI see pictures* (off by default) sends the newest pictures in the
-  conversation (and a picture someone replies to), shrunk to 1024 px, to models that can
+  and *Let the AI see pictures* (off by default) sends up to three of the newest pictures in the
+  last dozen messages (and a picture someone replies to, forwarded ones included), shrunk to 1024 px, to models that can
   see images. The page says whether the chosen chat model can see; for one that can't, pick
   a *Picture model* from the dropdown of the service's models that can (or type one): it
   describes each picture in words for the chat model. Pictures posted before the AI last
-  restarted are fetched again when it answers. Saving warns when the chat model probably can't see and no picture model is set. An AI answers when it's named,
-  mentioned, or someone replies to one of its messages.
+  restarted are fetched again when it answers, and each is fetched only once. Saving warns when the chat model probably can't see and no picture model is set. An AI answers when it's named,
+  mentioned, or someone replies to one of its messages or in a thread it started, and shows
+  as typing while it writes. Someone talking to it directly is always answered; the
+  rapid-exchange limit only holds back answers to its name in passing.
 - **Character cards.** On an AI's page, *Import card…* reads Tavern / SillyTavern character
   cards, versions 1, 2 and 3, as `.json` or as `.png` (the card hidden in the picture,
   `ccv3` read before `chara`). The AI then plays that character: description,

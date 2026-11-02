@@ -35,6 +35,8 @@ const AVATAR_PX: u32 = 96;
 /// Animated pictures bigger than this show still (playing them means
 /// downloading and decoding every frame).
 const MAX_ANIMATION_BYTES: u64 = 12 * 1024 * 1024;
+/// Biggest video without a poster frame that's fetched to make one.
+const MAX_POSTER_VIDEO_BYTES: u64 = 200 * 1024 * 1024;
 
 type RoomKey = (AccountId, OwnedRoomId);
 /// A character card and its PNG picture (if it came in one).
@@ -214,6 +216,27 @@ fn play_file(path: &std::path::Path, video: bool) {
     }
 }
 
+/// What a message preview is made from.
+#[derive(Clone, Copy)]
+enum Preview {
+    Still,
+    /// A GIF or WebP: every frame.
+    Animated,
+    /// A whole video, for a poster frame.
+    Video,
+}
+
+/// A poster frame (JPEG) for a downloaded video, via ffmpeg.
+fn poster_of(video: &[u8]) -> Option<Vec<u8>> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("whisker-poster-{}-{n}", std::process::id()));
+    std::fs::write(&path, video).ok()?;
+    let poster = whisker_core::timeline::video_poster(&path);
+    let _ = std::fs::remove_file(&path);
+    poster.map(|p| p.jpeg)
+}
+
 /// Opens a downloaded file in the app the system picks for it.
 fn open_file(path: &std::path::Path) {
     #[cfg(target_os = "linux")]
@@ -340,8 +363,8 @@ impl Ctl {
     /// animated GIF/WebP files (so they play). A few at a time, decoded off
     /// the network threads.
     fn fetch_pictures(&self, key: &RoomKey, items: &[HistoryItem]) {
-        // (event, source, ask the server for a thumbnail, animated)
-        let wanted: Vec<(OwnedEventId, MediaSource, bool, bool)> = {
+        // (event, source, ask the server for a thumbnail, what it is)
+        let wanted: Vec<(OwnedEventId, MediaSource, bool, Preview)> = {
             let st = self.st.lock().unwrap();
             let mut loading = self.loading.lock().unwrap();
             items
@@ -355,10 +378,14 @@ impl Ctl {
                         && matches!(media.mime.as_deref(), Some("image/gif" | "image/webp"))
                         && media.size.is_none_or(|s| s <= MAX_ANIMATION_BYTES);
                     match (media.kind, &media.thumbnail) {
-                        (MediaKind::Image, _) if animated => Some((m.event_id.clone(), media.source.clone(), false, true)),
-                        (MediaKind::Image, Some(t)) => Some((m.event_id.clone(), t.clone(), false, false)),
-                        (MediaKind::Image, None) => Some((m.event_id.clone(), media.source.clone(), true, false)),
-                        (MediaKind::Video, Some(t)) => Some((m.event_id.clone(), t.clone(), false, false)),
+                        (MediaKind::Image, _) if animated => Some((m.event_id.clone(), media.source.clone(), false, Preview::Animated)),
+                        (MediaKind::Image, Some(t)) => Some((m.event_id.clone(), t.clone(), false, Preview::Still)),
+                        (MediaKind::Image, None) => Some((m.event_id.clone(), media.source.clone(), true, Preview::Still)),
+                        (MediaKind::Video, Some(t)) => Some((m.event_id.clone(), t.clone(), false, Preview::Still)),
+                        // Sent without a poster: make one from the video.
+                        (MediaKind::Video, None) if media.size.is_none_or(|s| s <= MAX_POSTER_VIDEO_BYTES) => {
+                            Some((m.event_id.clone(), media.source.clone(), false, Preview::Video))
+                        }
                         _ => {
                             loading.remove(m.event_id.as_str());
                             None
@@ -374,15 +401,16 @@ impl Ctl {
         self.spawn(async move {
             let Some(client) = c.mgr.client(account).await else { return };
             let slots = Arc::new(tokio::sync::Semaphore::new(4));
-            for (id, src, thumb, animated) in wanted {
+            for (id, src, thumb, what) in wanted {
                 let (c, client, room, slots) = (c.clone(), client.clone(), room.clone(), slots.clone());
                 tokio::spawn(async move {
                     let _slot = slots.acquire().await;
                     let bytes = timeline::download(&client, &src, thumb.then_some(640)).await.ok();
                     let decoded = match bytes {
-                        Some(b) => tokio::task::spawn_blocking(move || {
-                            let frames = if animated { ui::decode_frames(&b, 720, 600) } else { None };
-                            (decode(&b, 720, 600, false), frames)
+                        Some(b) => tokio::task::spawn_blocking(move || match what {
+                            Preview::Video => (poster_of(&b).and_then(|jpeg| decode(&jpeg, 720, 600, false)), None),
+                            Preview::Animated => (decode(&b, 720, 600, false), ui::decode_frames(&b, 720, 600)),
+                            Preview::Still => (decode(&b, 720, 600, false), None),
                         })
                         .await
                         .unwrap_or((None, None)),
@@ -1877,10 +1905,43 @@ impl Ctl {
         self.st.lock().unwrap().messages.get(key)?.iter().find(|m| m.event_id.as_str() == id).cloned()
     }
 
+    /// The text of the run of messages `id` is in: the ones shown together
+    /// under one name, oldest first, one per line.
+    fn group_text(&self, key: &RoomKey, id: &str) -> Option<String> {
+        let st = self.st.lock().unwrap();
+        let msgs: Vec<&HistoryItem> = st.messages.get(key)?.iter().filter(|m| !m.notice).collect();
+        let at = msgs.iter().position(|m| m.event_id.as_str() == id)?;
+        let together = |a: &HistoryItem, b: &HistoryItem| {
+            a.sender == b.sender && a.thread == b.thread && b.reply_to.is_none() && i64::from(b.ts.get()) - i64::from(a.ts.get()) <= 5 * 60 * 1000
+        };
+        let mut start = at;
+        while start > 0 && together(msgs[start - 1], msgs[start]) {
+            start -= 1;
+        }
+        let mut end = at;
+        while end + 1 < msgs.len() && together(msgs[end], msgs[end + 1]) {
+            end += 1;
+        }
+        Some(msgs[start..=end].iter().map(|m| m.body.as_str()).collect::<Vec<_>>().join("\n"))
+    }
+
     async fn message_action(&self, action: String, id: String) {
         let Some((key, room)) = self.current_room().await else { return };
         let Some(m) = self.find(&key, &id) else { return };
         match action.as_str() {
+            "copy-group" => {
+                if let Some(text) = self.group_text(&key, &id) {
+                    self.ui(move |u| u.invoke_copy_text(s(text)));
+                }
+            }
+            "select-group" => {
+                if let Some(text) = self.group_text(&key, &id) {
+                    self.ui(move |u| {
+                        u.set_select_title(s("Select text"));
+                        u.set_select_text(s(text));
+                    });
+                }
+            }
             "reply" => {
                 self.st.lock().unwrap().reply_to = Some(m.event_id.clone());
                 let label = format!("{}: {}", m.sender_label(), m.body.lines().next().unwrap_or_default());
@@ -3124,6 +3185,7 @@ impl Ctl {
         let mut agent = AgentForm::default();
         let mut models: Vec<SharedString> = Vec::new();
         let mut image_models: Vec<SharedString> = Vec::new();
+        let mut defaults = (String::new(), String::new());
         let mut detect = String::new();
         if let Some(rest) = id.strip_prefix("account:")
             && let Ok(aid) = rest.parse::<AccountId>()
@@ -3159,6 +3221,7 @@ impl Ctl {
             if let Some(d) = self.st.lock().unwrap().detected.get(&aid) {
                 models = d.models.iter().map(s).collect();
                 image_models = d.vision.iter().map(s).collect();
+                defaults = (d.default_model.clone().unwrap_or_default(), d.default_vision.clone().unwrap_or_default());
                 *VISION.lock().unwrap() = Some(d.vision.iter().cloned().collect());
                 detect = format!("✓ {} · {} models", d.service, d.models.len());
             } else if let Some(c) = cfg
@@ -3219,6 +3282,8 @@ impl Ctl {
             u.set_agent_form(agent);
             u.set_models(ModelRc::new(VecModel::from(models)));
             u.set_image_models(ModelRc::new(VecModel::from(image_models)));
+            u.set_default_model(s(&defaults.0));
+            u.set_default_image_model(s(&defaults.1));
             u.set_detect_status(s(detect));
             u.set_test_status(s(""));
             u.set_settings_message(s(""));
@@ -3310,10 +3375,14 @@ impl Ctl {
                 let models: Vec<SharedString> = d.models.iter().map(s).collect();
                 let vision: Vec<SharedString> = d.vision.iter().map(s).collect();
                 *VISION.lock().unwrap() = Some(d.vision.iter().cloned().collect());
+                let chat = d.default_model.clone().unwrap_or_default();
+                let eyes = d.default_vision.clone().unwrap_or_default();
                 self.st.lock().unwrap().detected.insert(account, d);
                 self.ui(move |u| {
                     u.set_models(ModelRc::new(VecModel::from(models)));
                     u.set_image_models(ModelRc::new(VecModel::from(vision)));
+                    u.set_default_model(s(chat));
+                    u.set_default_image_model(s(eyes));
                     u.set_detect_status(s(status));
                 });
             }

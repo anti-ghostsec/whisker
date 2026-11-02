@@ -56,6 +56,52 @@ pub struct Detected {
     /// The ones among `models` that can see pictures (by what the service
     /// says, or by name).
     pub vision: Vec<String>,
+    /// The service's own pick for chatting (Venice marks one), else a
+    /// widely liked model it offers.
+    pub default_model: Option<String>,
+    /// Likewise for looking at pictures.
+    pub default_vision: Option<String>,
+}
+
+/// A service's model list.
+#[derive(Debug, Default)]
+struct Listed {
+    models: Vec<String>,
+    vision: Vec<String>,
+    default_model: Option<String>,
+    default_vision: Option<String>,
+}
+
+impl Detected {
+    fn new(format: ApiFormat, endpoint: String, service: String, l: Listed) -> Self {
+        let default_model = l.default_model.or_else(|| popular(&l.models, CHAT_PICKS));
+        let default_vision = l.default_vision.or_else(|| popular(&l.vision, VISION_PICKS));
+        Detected { format, endpoint, service, models: l.models, vision: l.vision, default_model, default_vision }
+    }
+}
+
+/// Well-regarded, quick models, best first, matched by name for services
+/// that don't mark a default.
+const CHAT_PICKS: &[&str] = &[
+    "claude-sonnet-4", "gpt-4.1-mini", "gpt-4o-mini", "gemini-2.5-flash", "gemini-2.0-flash", "deepseek-chat", "deepseek-v3",
+    "grok-3-mini", "mistral-small", "llama-3.3-70b", "qwen3", "llama3", "mistral",
+];
+const VISION_PICKS: &[&str] = &[
+    "claude-sonnet-4", "gpt-4.1-mini", "gpt-4o-mini", "gemini-2.5-flash", "gemini-2.0-flash", "qwen2.5-vl", "pixtral", "llama-4",
+    "gemma-3", "gemma3", "llava", "minicpm-v", "moondream",
+];
+
+/// The first of `picks` that one of `models` is named like.
+fn popular(models: &[String], picks: &[&str]) -> Option<String> {
+    picks.iter().find_map(|p| models.iter().find(|m| m.to_lowercase().contains(p)).cloned())
+}
+
+/// The model a Venice-style list marks with `trait_name` in `model_spec.traits`.
+fn marked(v: &Value, trait_name: &str) -> Option<String> {
+    v.get("data")?.as_array()?.iter().find_map(|m| {
+        let traits = m.pointer("/model_spec/traits")?.as_array()?;
+        traits.iter().any(|t| t == trait_name).then(|| m.get("id")?.as_str().map(str::to_owned))?
+    })
 }
 
 fn http() -> reqwest::Client {
@@ -152,8 +198,8 @@ pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
     // A full endpoint URL was pasted: trust its shape.
     for (suffix, format) in [("/chat/completions", ApiFormat::OpenAiChat), ("/messages", ApiFormat::AnthropicMessages)] {
         if let Some(base) = full.strip_suffix(suffix) {
-            let (models, vision) = list_models(&c, base, format, key).await.unwrap_or_default();
-            return Ok(Detected { format, endpoint: full.clone(), service, models, vision });
+            let listed = list_models(&c, base, format, key).await.unwrap_or_default();
+            return Ok(Detected::new(format, full.clone(), service, listed));
         }
     }
 
@@ -175,9 +221,9 @@ pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
     for format in order {
         for base in &bases {
             match list_models(&c, base, format, key).await {
-                Ok((models, vision)) => {
+                Ok(listed) => {
                     let path = if format == ApiFormat::OpenAiChat { "chat/completions" } else { "messages" };
-                    return Ok(Detected { format, endpoint: format!("{base}/{path}"), service, models, vision });
+                    return Ok(Detected::new(format, format!("{base}/{path}"), service, listed));
                 }
                 Err(e) if e.to_string() == "unauthorized" => rejected = true,
                 Err(_) => {}
@@ -189,13 +235,9 @@ pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
     if let Ok((200, Some(v))) = get_json(c.get(format!("{origin}/api/tags"))).await
         && let Some(models) = ids(&v, "models", "name")
     {
-        return Ok(Detected {
-            format: ApiFormat::OpenAiChat,
-            endpoint: format!("{origin}/v1/chat/completions"),
-            service: "Ollama".into(),
-            vision: models.iter().filter(|m| looks_vision(m)).cloned().collect(),
-            models,
-        });
+        let vision = models.iter().filter(|m| looks_vision(m)).cloned().collect();
+        let listed = Listed { models, vision, ..Default::default() };
+        return Ok(Detected::new(ApiFormat::OpenAiChat, format!("{origin}/v1/chat/completions"), "Ollama".into(), listed));
     }
 
     if rejected {
@@ -204,8 +246,9 @@ pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
     bail!("couldn't find an AI API at that address")
 }
 
-/// The service's models, and the ones among them that can see pictures.
-async fn list_models(c: &reqwest::Client, base: &str, format: ApiFormat, key: Option<&str>) -> Result<(Vec<String>, Vec<String>)> {
+/// The service's models, the ones among them that can see pictures, and
+/// any it marks as its defaults.
+async fn list_models(c: &reqwest::Client, base: &str, format: ApiFormat, key: Option<&str>) -> Result<Listed> {
     let mut req = c.get(format!("{base}/models"));
     match format {
         ApiFormat::AnthropicMessages => {
@@ -234,12 +277,26 @@ async fn list_models(c: &reqwest::Client, base: &str, format: ApiFormat, key: Op
         bail!("not an Anthropic-style API");
     }
     let models = ids(&v, "data", "id").ok_or_else(|| anyhow!("no model list"))?;
-    Ok((models, vision(&v, "data", "id")))
+    Ok(Listed { models, vision: vision(&v, "data", "id"), default_model: marked(&v, "default"), default_vision: marked(&v, "default_vision") })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_defaults() {
+        let v = serde_json::json!({"data": [
+            {"id": "big", "model_spec": {"traits": ["most_intelligent"]}},
+            {"id": "quick", "model_spec": {"traits": ["default", "fastest"]}},
+            {"id": "eyes", "model_spec": {"traits": ["default_vision"]}},
+        ]});
+        assert_eq!(marked(&v, "default").as_deref(), Some("quick"));
+        assert_eq!(marked(&v, "default_vision").as_deref(), Some("eyes"));
+        assert_eq!(marked(&v, "default_code"), None);
+        let models = ["llama3.2:3b".to_owned(), "openai/gpt-4o-mini".to_owned()];
+        assert_eq!(popular(&models, CHAT_PICKS).as_deref(), Some("openai/gpt-4o-mini"));
+    }
 
     #[test]
     fn finds_vision_models() {

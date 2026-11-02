@@ -369,7 +369,9 @@ component MessageRow inherits Rectangle {
                 if Prefs.menu-forward: MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
                 if Prefs.menu-quote: MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
                 if Prefs.menu-copy: MenuItem { title: "Copy whole message"; activated => { root.copy(root.item.body); } }
+                if Prefs.menu-copy: MenuItem { title: "Copy with the messages around it"; activated => { root.action("copy-group", root.item.id); } }
                 if Prefs.menu-select: MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
+                if Prefs.menu-select: MenuItem { title: "Select text with the messages around it…"; activated => { root.action("select-group", root.item.id); } }
                 if root.item.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
                 if Prefs.menu-open-links: Menu {
                     title: "Open link";
@@ -1074,6 +1076,8 @@ export component AppWindow inherits Window {
     in property <AgentForm> agent-form;
     in property <[string]> models;
     in property <[string]> image-models;
+    in property <string> default-model;
+    in property <string> default-image-model;
     in-out property <string> settings-message;
     in-out property <string> detect-status;
     in-out property <string> test-status;
@@ -2055,6 +2059,8 @@ export component AppWindow inherits Window {
         agent: root.agent-form;
         models: root.models;
         image-models: root.image-models;
+        default-model: root.default-model;
+        default-image-model: root.default-image-model;
         message <=> root.settings-message;
         detect-status <=> root.detect-status;
         test-status <=> root.test-status;

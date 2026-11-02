@@ -615,6 +615,9 @@ component AgentPage inherits VerticalLayout {
     // Models that can see pictures, for the picture model.
     in property <[string]> image-models;
     callback filter-image-models(string);
+    // The service's recommended models, filled in when nothing is picked.
+    in property <string> default-model;
+    in property <string> default-image-model;
     in property <image> card-picture;
     callback card-action(string, AgentForm);
 
@@ -686,6 +689,17 @@ component AgentPage inherits VerticalLayout {
     property <int> a-max-grant: agent.max-grant;
     property <string> a-protected: agent.protected;
     property <string> a-audit: agent.audit-room;
+    function fill-defaults() {
+        if root.a-model == "" && root.default-model != "" {
+            root.a-model = root.default-model;
+        }
+        if root.a-image-model == "" && root.default-image-model != "" && ModelInfo.sees(root.a-model, root.image-models.length) == 2 {
+            root.a-image-model = root.default-image-model;
+        }
+    }
+    init => { root.fill-defaults(); }
+    changed default-model => { root.fill-defaults(); }
+    changed default-image-model => { root.fill-defaults(); }
 
     function form() -> AgentForm {
         return {
@@ -741,6 +755,15 @@ component AgentPage inherits VerticalLayout {
                 placeholder: "Pick a model";
                 search(q) => { root.filter-models(q); }
             }
+            if root.default-model != "" && root.a-model != root.default-model: HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                Text {
+                    text: "Recommended: " + root.default-model;
+                    font-size: 11px; color: Theme.muted; vertical-alignment: center;
+                }
+                Btn { text: "Use it"; clicked => { root.a-model = root.default-model; } }
+            }
         }
         Number { text: "Longest reply (tokens)"; minimum: 64; maximum: 32000; value <=> root.a-max-tokens; }
         Number { text: "Longest reply posted (characters, 0 = no limit)"; minimum: 0; maximum: 20000; value <=> root.a-reply-chars; }
@@ -763,6 +786,16 @@ component AgentPage inherits VerticalLayout {
                 none-text: "None: the chat model looks itself";
                 empty-text: root.models.length == 0 ? "Press Connect above to list the service's models." : "None of this service's models say they can see pictures. Type a name and press Enter.";
                 search(q) => { root.filter-image-models(q); }
+            }
+            if root.default-image-model != "" && root.a-image-model != root.default-image-model
+                && ModelInfo.sees(root.a-model, root.image-models.length) == 2: HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                Text {
+                    text: "Recommended: " + root.default-image-model;
+                    font-size: 11px; color: Theme.muted; vertical-alignment: center;
+                }
+                Btn { text: "Use it"; clicked => { root.a-image-model = root.default-image-model; } }
             }
         }
         Text {
@@ -935,6 +968,8 @@ export component SettingsPage inherits Rectangle {
     callback card-action(string, AgentForm);
     callback filter-models(string);
     // Models that can see pictures, for the picture model.
+    in property <string> default-model;
+    in property <string> default-image-model;
     in property <[string]> image-models;
     callback filter-image-models(string);
     callback change-passphrase(string, string);
@@ -1026,6 +1061,8 @@ export component SettingsPage inherits Rectangle {
                             agent: root.agent;
                             models: root.models;
                             image-models: root.image-models;
+                            default-model: root.default-model;
+                            default-image-model: root.default-image-model;
                             detect-status: root.detect-status;
                             test-status: root.test-status;
                             detect-api(u, k) => { root.detect-api(u, k); }

@@ -38,7 +38,10 @@ are clear; after any moderation action, say briefly what you did. Reply in plain
 to you next time.";
 
 /// Most pictures shown to the model per reply (the newest in the transcript).
-const MAX_PICTURES: usize = 4;
+const MAX_PICTURES: usize = 3;
+/// Only pictures this close to the end of the transcript are shown (and
+/// one being replied to): older ones slow every reply down for nothing.
+const RECENT_PICTURE_LINES: usize = 12;
 /// Pictures remembered per agent (their sources, not the files).
 const KEEP_PICTURES: usize = 64;
 /// Pictures are shrunk to fit this many pixels a side before sending.
@@ -167,6 +170,8 @@ pub struct AgentRunner {
     vision: Option<Llm>,
     /// What `vision` said about each picture, by message.
     descriptions: std::sync::Mutex<HashMap<OwnedEventId, String>>,
+    /// Pictures already fetched and shrunk (base64 JPEG), by message.
+    shrunk: std::sync::Mutex<HashMap<OwnedEventId, String>>,
 }
 
 impl AgentRunner {
@@ -199,6 +204,7 @@ impl AgentRunner {
             picture_order: VecDeque::new(),
             vision,
             descriptions: Default::default(),
+            shrunk: Default::default(),
         })
     }
 
@@ -242,7 +248,7 @@ impl AgentRunner {
                     return Ok(());
                 }
             };
-            let ClientEvent::Message { account, room_id, event_id, sender, sender_name, body, is_text, is_notice, media, reply_to, pills, .. } = ev else { continue };
+            let ClientEvent::Message { account, room_id, event_id, sender, sender_name, body, is_text, is_notice, media, reply_to, thread, pills, .. } = ev else { continue };
             let picture = media.filter(|m| self.cfg.see_images && m.kind == MediaKind::Image);
             if !(is_text || picture.is_some()) || account != self.cfg.account {
                 continue;
@@ -278,24 +284,45 @@ impl AgentRunner {
             {
                 self.remember_picture(to, source);
             }
-            // A reply to one of its messages, or a pill naming it, is talking to it.
-            let addressed = pills.iter().any(|(_, id)| id == me.as_str()) || match &reply_to {
-                Some(to) => self.replies_to_me(&room, &room_id, to, &me).await,
-                None => false,
-            };
-            if !addressed && !self.triggered(&room, &names, &body).await {
+            // A reply to one of its messages, a message in a thread it
+            // started, or a pill naming it, is talking to it.
+            let mut addressed = pills.iter().any(|(_, id)| id == me.as_str());
+            if !addressed && let Some(to) = &reply_to {
+                addressed = self.replies_to_me(&room, &room_id, to, &me).await;
+            }
+            if !addressed && let Some(root) = thread.as_ref().filter(|t| reply_to.as_ref() != Some(t)) {
+                addressed = self.replies_to_me(&room, &room_id, root, &me).await;
+            }
+            if addressed {
+                tracing::info!("agent {me} in {room_id}: {sender} is talking to it");
+            } else if !self.triggered(&room, &names, &body).await {
                 continue;
             }
             let pace = self.pace.entry(room_id.clone()).or_default();
             if pace.since_reply(Instant::now()).is_some_and(|d| d.as_secs() < self.cfg.cooldown_secs) {
                 continue;
             }
-            if !pace.may_reply(self.cfg.max_rapid_replies) {
+            // The rapid-exchange limit stops runaway chatter; a person
+            // talking to it directly always gets an answer.
+            if !addressed && !pace.may_reply(self.cfg.max_rapid_replies) {
                 tracing::debug!("agent {me} in {room_id}: waiting for a pause (rapid exchange)");
                 continue;
             }
             self.fold(&room_id).await;
-            match self.respond(&room, &me, &sender, &event_id, reply_to.as_ref()).await {
+            // "Typing…" while it thinks, so people know an answer is coming.
+            let typing = {
+                let room = room.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let _ = room.typing_notice(true).await;
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                })
+            };
+            let answer = self.respond(&room, &me, &sender, &event_id, reply_to.as_ref()).await;
+            typing.abort();
+            let _ = room.typing_notice(false).await;
+            match answer {
                 Ok((posted, state)) => {
                     if let Some(s) = state {
                         self.memory.set_state(&room_id, &s);
@@ -328,7 +355,7 @@ impl AgentRunner {
         // Pictures seen since the AI started, or (after a restart, which
         // forgets them) fetched again for the transcript's picture lines.
         let mut wanted: Vec<(OwnedEventId, MediaSource)> = Vec::new();
-        for l in lines.iter().rev() {
+        for l in lines.iter().rev().take(RECENT_PICTURE_LINES) {
             if wanted.len() >= MAX_PICTURES {
                 break;
             }
@@ -356,20 +383,25 @@ impl AgentRunner {
         }
         let mut out = Vec::new();
         for (id, source) in wanted.into_iter().rev() {
-            let bytes = match timeline::download(&room.client(), &source, Some(PICTURE_PX)).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("couldn't fetch picture {id} for the AI: {e:#}");
-                    continue;
+            let cached = self.shrunk.lock().unwrap().get(&id).cloned();
+            let data = match cached {
+                Some(d) => Some(d),
+                None => {
+                    // Failures aren't kept: the server may be back next time.
+                    let d = fetch_picture(room, &id, &source).await;
+                    if let Some(d) = &d {
+                        let mut cache = self.shrunk.lock().unwrap();
+                        if cache.len() > KEEP_PICTURES {
+                            cache.clear();
+                        }
+                        cache.insert(id.clone(), d.clone());
+                    }
+                    d
                 }
             };
-            let size = bytes.len();
-            match tokio::task::spawn_blocking(move || shrink_picture(&bytes)).await {
-                Ok(Some(data)) => {
-                    tracing::info!("showing the AI picture {id} ({size} bytes)");
-                    out.push((id, data));
-                }
-                _ => tracing::warn!("couldn't read picture {id} for the AI ({size} bytes; not PNG, JPEG, WebP or GIF?)"),
+            if let Some(data) = data {
+                tracing::info!("showing the AI picture {id}");
+                out.push((id, data));
             }
         }
         out
@@ -639,6 +671,30 @@ pub fn spawn(cfg: AgentConfig, mgr: AccountManager) -> Result<JoinHandle<()>> {
             tracing::warn!("agent stopped: {e:#}");
         }
     }))
+}
+
+/// Downloads a picture and shrinks it for the model. The server's
+/// thumbnail first (small and quick); when it can't make one (often for
+/// pictures forwarded from another server), the picture itself.
+async fn fetch_picture(room: &Room, id: &OwnedEventId, source: &MediaSource) -> Option<String> {
+    let client = room.client();
+    let mut bytes = timeline::download(&client, source, Some(PICTURE_PX)).await;
+    if bytes.is_err() && matches!(source, MediaSource::Plain(_)) {
+        bytes = timeline::download(&client, source, None).await;
+    }
+    let bytes = match bytes {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("couldn't fetch picture {id} for the AI: {e:#}");
+            return None;
+        }
+    };
+    let size = bytes.len();
+    let data = tokio::task::spawn_blocking(move || shrink_picture(&bytes)).await.ok().flatten();
+    if data.is_none() {
+        tracing::warn!("couldn't read picture {id} for the AI ({size} bytes; not PNG, JPEG, WebP or GIF?)");
+    }
+    data
 }
 
 /// Where to fetch the picture in message `id`, if it is one.

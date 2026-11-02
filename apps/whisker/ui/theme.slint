@@ -23,6 +23,8 @@ export global Theme {
 export global TextTools {
     // The part of `text` between two byte offsets (a selection), in either order.
     pure callback slice(string, int, int) -> string;
+    // Length of `text` in bytes (where a cursor at its end goes).
+    pure callback bytes(string) -> int;
     // A selection dragged across several messages is showing.
     in-out property <bool> spanning;
     // Copies the dragged selection, or `fallback` when there is none.
@@ -38,6 +40,8 @@ export global TextTools {
 export global Prefs {
     // Rich (styled, clickable links) vs plain drag-selectable message text.
     in-out property <bool> rich-text: false;
+    // Typed alone in the composer, opens "Clear messages" (moderators).
+    in-out property <string> clear-command: "/clear";
     // Joins, leaves, renames and other room events in the timeline.
     in-out property <bool> show-events: false;
     // 0 off, 1 "New message" only, 2 sender and room, 3 with message text.
@@ -142,6 +146,8 @@ export component Input inherits Rectangle {
     in-out property <string> text <=> ti.text;
     callback accepted(string);
     callback edited(string);
+    // A key before the box handles it (arrows, Enter…): true if used.
+    callback special-key(KeyEvent) -> bool;
     public function take-focus() { ti.focus(); }
     height: 38px;
     border-radius: 10px;
@@ -171,6 +177,10 @@ export component Input inherits Rectangle {
                 selection-background-color: Theme.accent-soft;
                 accepted => { root.accepted(self.text); }
                 edited => { root.edited(self.text); }
+                key-pressed(e) => {
+                    if root.special-key(e) { return accept; }
+                    return reject;
+                }
             }
         }
     }

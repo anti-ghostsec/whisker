@@ -904,6 +904,51 @@ pub async fn forward(from: &Room, event_id: &EventId, to: &Room, edited_body: Op
     Ok(to.send(content).with_request_config(config).await?.response.event_id)
 }
 
+/// Deletes (redacts) up to `limit` of a room's newest messages, reactions
+/// and the like, newest first (`None`: all of them). Room events (joins,
+/// names…) and what's already deleted stay. `progress` hears the count so
+/// far. Returns (deleted, failed).
+pub async fn clear_room(room: &Room, limit: Option<usize>, progress: impl Fn(usize)) -> Result<(usize, usize)> {
+    let limit = limit.unwrap_or(usize::MAX);
+    let (mut done, mut failed) = (0usize, 0usize);
+    let mut from = None;
+    loop {
+        let mut opts = MessagesOptions::backward();
+        opts.limit = UInt::from(100u32);
+        opts.from = from;
+        let page = room.messages(opts).await?;
+        for ev in &page.chunk {
+            if done + failed >= limit {
+                return Ok((done, failed));
+            }
+            let raw = ev.raw();
+            let kind = raw.get_field::<String>("type").ok().flatten().unwrap_or_default();
+            let is_state = raw.get_field::<serde_json::Value>("state_key").ok().flatten().is_some();
+            let gone = raw.get_field::<serde_json::Value>("unsigned").ok().flatten().is_some_and(|u| u.get("redacted_because").is_some());
+            if is_state || gone || kind == "m.room.redaction" {
+                continue;
+            }
+            let Some(id) = ev.event_id() else { continue };
+            match room.redact(id, None, None).await {
+                Ok(_) => {
+                    done += 1;
+                    progress(done);
+                }
+                Err(e) => {
+                    tracing::warn!("couldn't delete {id}: {e}");
+                    failed += 1;
+                }
+            }
+            // Gentle on the server's rate limits.
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        match page.end {
+            Some(end) if !page.chunk.is_empty() => from = Some(end),
+            _ => return Ok((done, failed)),
+        }
+    }
+}
+
 /// Most bytes we'll upload in one go, whatever the server allows: the
 /// file is held (and encrypted) in memory.
 pub const MAX_UPLOAD: u64 = 2 * 1024 * 1024 * 1024;

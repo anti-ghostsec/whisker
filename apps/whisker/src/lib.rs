@@ -1770,6 +1770,20 @@ impl Ctl {
             return;
         }
         let Some((key, room)) = self.current_room().await else { return };
+        // The clear command opens its confirmation instead of being posted.
+        let clear = self.settings.lock().unwrap().clear_command.trim().to_owned();
+        if !clear.is_empty() && text.eq_ignore_ascii_case(&clear) && self.st.lock().unwrap().editing.is_none() {
+            let allowed = match (room.power_levels().await, room.client().user_id()) {
+                (Ok(pl), Some(me)) => pl.user_can_redact_event_of_other(me),
+                _ => false,
+            };
+            if allowed {
+                self.ui(|u| u.set_clear_open(true));
+            } else {
+                self.status("Only moderators can clear messages here.");
+            }
+            return;
+        }
         if self.st.lock().unwrap().typing_sent.take().is_some() {
             let r = room.clone();
             tokio::spawn(async move { r.typing_notice(false).await });
@@ -1932,8 +1946,11 @@ impl Ctl {
             "quote" => {
                 let quoted: String = m.body.lines().map(|l| format!("> {l}\n")).collect();
                 self.ui(move |u| {
-                    let draft = u.get_draft();
-                    u.set_draft(s(format!("{quoted}\n{draft}")));
+                    let draft = format!("{quoted}\n{}", u.get_draft());
+                    // Ready to type the answer under the quote.
+                    u.set_cursor_at((quoted.len() + 1) as i32);
+                    u.set_draft(s(draft));
+                    u.set_cursor_request(u.get_cursor_request() + 1);
                 });
             }
             "source" => {
@@ -2685,6 +2702,24 @@ impl Ctl {
         let _ = st.save(self.mgr.data_dir());
         if let Some(u) = self.ui.upgrade() {
             apply_menu(&u, &st.menu_hidden);
+        }
+    }
+
+    fn set_clear_command(&self, cmd: String) {
+        let mut st = self.settings.lock().unwrap();
+        st.clear_command = cmd.trim().to_owned();
+        let _ = st.save(self.mgr.data_dir());
+    }
+
+    async fn clear_messages(&self, n: i32) {
+        let Some((_, room)) = self.current_room().await else { return };
+        self.status("Clearing messages…");
+        let me = self.clone();
+        let limit = usize::try_from(n).ok().filter(|n| *n > 0);
+        match timeline::clear_room(&room, limit, move |done| me.status(format!("Clearing messages… {done} deleted"))).await {
+            Ok((done, 0)) => self.status(format!("Deleted {done} messages.")),
+            Ok((done, failed)) => self.status(format!("Deleted {done} messages; {failed} couldn't be deleted.")),
+            Err(e) => self.status(format!("Couldn't clear messages: {e:#}")),
         }
     }
 
@@ -3969,6 +4004,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
+    ui.global::<Prefs>().set_clear_command(s(&prefs.clear_command));
     autocorrect::warm();
     ui.global::<ModelInfo>().on_sees(|model, _| {
         let model = model.trim();
@@ -3979,6 +4015,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
             None => 0,
         }
     });
+    ui.global::<TextTools>().on_bytes(|text| text.len() as i32);
     ui.global::<TextTools>().on_slice(|text, a, b| {
         let (a, b) = (a.clamp(0, text.len() as i32) as usize, b.clamp(0, text.len() as i32) as usize);
         let (from, to) = (a.min(b), a.max(b));
@@ -4045,6 +4082,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_search_rooms, |q| search_rooms);
     on!(on_send, |t| send);
     on!(on_message_action, |a, id| message_action);
+    on!(on_clear_messages, |n| clear_messages);
     #[cfg(target_os = "linux")]
     {
         let c = ctl.clone();
@@ -4182,6 +4220,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.on_set_send_typing(move |b| c.set_send_typing(b));
         let c = ctl.clone();
         ui.on_set_autocorrect(move |b| c.set_autocorrect(b));
+        let c = ctl.clone();
+        ui.on_set_clear_command(move |t| c.set_clear_command(t.to_string()));
         let c = ctl.clone();
         ui.on_set_menu_entry(move |k, b| c.set_menu_entry(k.to_string(), b));
     }

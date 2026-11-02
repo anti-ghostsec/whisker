@@ -96,10 +96,15 @@ operating system and the **Wisp** browser.
 - **Threads:** replies in a thread are tucked under the message that started it ("3
   replies"); click that, or right-click → *Reply in thread*, to read and answer in the side panel.
 - **Mentions and emoji shortcodes:** type `@` and part of a name for the closest matches
-  (Tab or Enter takes the first); picked people become real mentions, so they're notified,
+  (↑/↓ move through them, Tab or Enter takes the highlighted one); picked people become real mentions, so they're notified,
   and mentions show in the accent colour like links (click one for that person's profile).
   `:smile:` turns into 😄 as you type the closing colon; `:smi` offers matches, and a
-  whole-word `:smile` is converted when you send.
+  whole-word `:smile` is converted when you send. The ☺ button's picker takes the keyboard
+  too: type to search, arrows to move, Enter to insert, Escape to close. Replying, editing,
+  quoting, picking an emoji or switching rooms puts the cursor back in the message box.
+- **Clear messages (moderators):** Room info → *Clear messages…*, or type `/clear` on its own,
+  deletes the last 50, last 500 or all messages in the room for everyone (after asking).
+  The command can be renamed (e.g. `?clear`) or turned off in Settings → *Commands*.
 - **Notifications** (Linux desktops) for direct messages, mentions, and rooms you've set to
   notify, never for the room you're looking at or for messages from your own accounts.
   Settings → *Notifications and typing* picks how much they say: nothing, who and where

@@ -194,6 +194,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-notify-level(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
+    callback set-clear-command(string);
     callback set-menu-entry(string, bool);
     in-out property <int> auto-lock;
     in property <string> encryption-summary;
@@ -296,6 +297,15 @@ component GeneralPage inherits VerticalLayout {
                 checked: Prefs.autocorrect;
                 toggled => { root.set-autocorrect(self.checked); }
             }
+        }
+    }
+    Card {
+        title: "Commands";
+        subtitle: "Typed on its own in the message box. Only you see it: it isn't sent.";
+        Field {
+            label: "Clear messages";
+            hint: "In a room where you can delete others' messages, this asks which recent messages to delete. Leave it empty to turn the command off (Room info keeps its button).";
+            Input { text: Prefs.clear-command; placeholder: "e.g. /clear"; edited(t) => { root.set-clear-command(t); } }
         }
     }
     Card {
@@ -953,6 +963,7 @@ export component SettingsPage inherits Rectangle {
     callback set-show-events(bool);
     callback set-notify-level(int);
     callback set-send-typing(bool);
+    callback set-clear-command(string);
     callback set-autocorrect(bool);
     callback set-menu-entry(string, bool);
     callback save-account(AccountForm);
@@ -1043,6 +1054,7 @@ export component SettingsPage inherits Rectangle {
                             set-show-events(b) => { root.set-show-events(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-send-typing(b) => { root.set-send-typing(b); }
+                            set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }
                             set-menu-entry(k, b) => { root.set-menu-entry(k, b); }
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }

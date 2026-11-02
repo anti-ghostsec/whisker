@@ -59,6 +59,14 @@ pub struct AppSettings {
     /// Message menu entries turned off (see `Prefs.menu-*` in the UI).
     #[serde(default)]
     pub menu_hidden: std::collections::BTreeSet<String>,
+    /// What to send to clear a room's messages (moderators): it opens the
+    /// confirmation instead of being posted.
+    #[serde(default = "clear_command")]
+    pub clear_command: String,
+}
+
+fn clear_command() -> String {
+    "/clear".into()
 }
 
 fn yes() -> bool {

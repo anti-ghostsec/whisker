@@ -1106,6 +1106,30 @@ export component AppWindow inherits Window {
     // `cursor-at` (after Rust changes the draft).
     in-out property <int> cursor-request;
     in-out property <int> cursor-at;
+    // Bumping it puts the typing cursor back in the composer.
+    in-out property <int> focus-request;
+    changed reply-to => { if root.reply-to != "" { root.focus-request += 1; } }
+    changed editing => { root.focus-request += 1; }
+    changed current-room => { root.focus-request += 1; }
+    changed emoji-open => { if !root.emoji-open { root.focus-request += 1; } }
+    // The highlighted @/:emoji: suggestion (arrow keys move it).
+    property <int> sug-index;
+    changed suggestions => { root.sug-index = 0; }
+    // The highlighted emoji in the picker: row and column.
+    property <int> emoji-row;
+    property <int> emoji-col;
+    changed emoji-rows => { root.emoji-row = 0; root.emoji-col = 0; }
+    function pick-emoji(symbol: string, close: bool) {
+        if root.emoji-for == "" {
+            root.draft = root.draft + symbol;
+            root.cursor-at = TextTools.bytes(root.draft);
+            root.cursor-request += 1;
+            if close { root.emoji-open = false; }
+        } else {
+            root.message-action("react:" + symbol, root.emoji-for);
+            root.emoji-open = false;
+        }
+    }
 
     // Overlays
     in-out property <string> select-text;
@@ -1274,6 +1298,10 @@ export component AppWindow inherits Window {
     callback set-notify-level(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
+    callback set-clear-command(string);
+    // "Clear messages" dialog: open, and delete the newest `n` (0 = all).
+    in-out property <bool> clear-open;
+    callback clear-messages(int);
     callback set-menu-entry(string, bool);
 
     function apply-theme() {
@@ -1747,7 +1775,7 @@ export component AppWindow inherits Window {
                             for g[i] in root.suggestions: Rectangle {
                                 height: 30px;
                                 border-radius: 6px;
-                                background: i == 0 ? Theme.accent-soft : sg-ta.has-hover ? Theme.hover : transparent;
+                                background: i == root.sug-index ? Theme.accent-soft : sg-ta.has-hover ? Theme.hover : transparent;
                                 HorizontalLayout {
                                     padding-left: 8px;
                                     padding-right: 8px;
@@ -1755,7 +1783,7 @@ export component AppWindow inherits Window {
                                     if g.picture.width > 0: VerticalLayout { alignment: center; Image { source: g.picture; width: 20px; height: 20px; } }
                                     if g.picture.width == 0: Text { text: g.label; color: Theme.text; font-size: g.kind == 1 ? 18px : 13px; font-weight: 600; vertical-alignment: center; }
                                     Text { text: g.detail; color: Theme.muted; font-size: 11px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                                    if i == 0: Text { text: "Tab"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+                                    if i == root.sug-index: Text { text: "Tab"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
                                 }
                                 sg-ta := TouchArea { mouse-cursor: pointer; clicked => { root.pick-suggestion(g.insert, g.kind == 0 ? g.detail : ""); } }
                             }
@@ -1820,9 +1848,19 @@ export component AppWindow inherits Window {
                                         self.set-selection-offsets(root.cursor-at, root.cursor-at);
                                         self.focus();
                                     }
+                                    property <int> focus-wanted: root.focus-request;
+                                    changed focus-wanted => { self.focus(); }
                                     key-pressed(e) => {
+                                        if root.suggestions.length > 0 && e.text == Key.DownArrow {
+                                            root.sug-index = mod(root.sug-index + 1, root.suggestions.length);
+                                            return accept;
+                                        }
+                                        if root.suggestions.length > 0 && e.text == Key.UpArrow {
+                                            root.sug-index = mod(root.sug-index - 1 + root.suggestions.length, root.suggestions.length);
+                                            return accept;
+                                        }
                                         if root.suggestions.length > 0 && (e.text == Key.Tab || (e.text == Key.Return && !e.modifiers.shift)) {
-                                            root.pick-suggestion(root.suggestions[0].insert, root.suggestions[0].kind == 0 ? root.suggestions[0].detail : "");
+                                            root.pick-suggestion(root.suggestions[min(root.sug-index, root.suggestions.length - 1)].insert, root.suggestions[min(root.sug-index, root.suggestions.length - 1)].kind == 0 ? root.suggestions[min(root.sug-index, root.suggestions.length - 1)].detail : "");
                                             return accept;
                                         }
                                         if e.text == Key.Return && !e.modifiers.shift {
@@ -2163,6 +2201,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Rectangle { height: 6px; }
+                            if root.can-moderate && !root.current-space: Btn { text: "Clear messages…"; danger: true; clicked => { root.clear-open = true; } }
                             Btn { text: root.current-space ? "Leave space" : "Leave room"; danger: true; clicked => { root.room-menu("leave", root.room-details.id); root.room-info-open = false; } }
                         }
                     }
@@ -2196,6 +2235,7 @@ export component AppWindow inherits Window {
         set-notify-level(i) => { root.set-notify-level(i); }
         set-send-typing(b) => { root.set-send-typing(b); }
         set-autocorrect(b) => { root.set-autocorrect(b); }
+        set-clear-command(t) => { root.set-clear-command(t); }
         set-menu-entry(k, b) => { root.set-menu-entry(k, b); }
         save-account(f) => { root.activity(); root.save-account(f); }
         profile-edit(a, id, v) => { root.activity(); root.profile-edit(a, id, v); }
@@ -2343,7 +2383,34 @@ export component AppWindow inherits Window {
                     Text { text: root.emoji-for == "" ? "Emoji" : "React"; font-size: 14px; font-weight: 800; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; }
                     IconBtn { icon: "✕"; size: 26px; clicked => { root.emoji-open = false; } }
                 }
-                esearch := Input { placeholder: "Search emoji, e.g. cat, heart, thumbs"; edited(t) => { root.emoji-search(t); } }
+                esearch := Input {
+                    placeholder: "Search emoji, e.g. cat, heart, thumbs";
+                    init => { self.take-focus(); }
+                    edited(t) => { root.emoji-search(t); }
+                    // Arrows move the highlight, Enter takes it, Escape closes.
+                    special-key(e) => {
+                        if e.text == Key.Escape { root.emoji-open = false; return true; }
+                        if root.emoji-rows.length == 0 { return false; }
+                        if e.text == Key.Return {
+                            root.pick-emoji(root.emoji-rows[root.emoji-row].items[min(root.emoji-col, root.emoji-rows[root.emoji-row].items.length - 1)].symbol, true);
+                            return true;
+                        }
+                        if e.text == Key.RightArrow && root.emoji-col < root.emoji-rows[root.emoji-row].items.length - 1 { root.emoji-col += 1; return true; }
+                        if e.text == Key.LeftArrow && root.emoji-col > 0 { root.emoji-col -= 1; return true; }
+                        if e.text == Key.DownArrow && root.emoji-row < root.emoji-rows.length - 1 {
+                            root.emoji-row += 1;
+                            root.emoji-col = min(root.emoji-col, root.emoji-rows[root.emoji-row].items.length - 1);
+                            esv.content-y = min(esv.content-y, esv.visible-height - (root.emoji-row + 1) * 38px);
+                            return true;
+                        }
+                        if e.text == Key.UpArrow && root.emoji-row > 0 {
+                            root.emoji-row -= 1;
+                            esv.content-y = max(esv.content-y, -root.emoji-row * 38px);
+                            return true;
+                        }
+                        return false;
+                    }
+                }
                 if root.emoji-rows.length == 0: Text { text: "No emoji found."; color: Theme.muted; font-size: 12px; horizontal-alignment: center; }
                 esv := ScrollView {
                     vertical-stretch: 1;
@@ -2351,25 +2418,18 @@ export component AppWindow inherits Window {
                     content-height: egrid.preferred-height;
                     egrid := VerticalLayout {
                         width: esv.visible-width;
-                        for row in root.emoji-rows: HorizontalLayout {
+                        for row[r] in root.emoji-rows: HorizontalLayout {
                             alignment: start;
-                            for e in row.items: Rectangle {
+                            for e[c] in row.items: Rectangle {
                                 width: 38px;
                                 height: 38px;
                                 border-radius: 8px;
-                                background: eta.has-hover ? Theme.hover : transparent;
+                                background: r == root.emoji-row && c == root.emoji-col ? Theme.accent-soft : eta.has-hover ? Theme.hover : transparent;
                                 if e.picture.width > 0: Image { source: e.picture; width: 26px; height: 26px; }
                                 if e.picture.width == 0: Text { text: e.symbol; font-size: 22px; }
                                 eta := TouchArea {
                                     mouse-cursor: pointer;
-                                    clicked => {
-                                        if root.emoji-for == "" {
-                                            root.draft = root.draft + e.symbol;
-                                        } else {
-                                            root.message-action("react:" + e.symbol, root.emoji-for);
-                                            root.emoji-open = false;
-                                        }
-                                    }
+                                    clicked => { root.pick-emoji(e.symbol, false); esearch.take-focus(); }
                                 }
                             }
                         }
@@ -2377,6 +2437,22 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    if root.clear-open: Overlay {
+        dismiss => { root.clear-open = false; }
+        Text { text: "Clear messages"; font-size: 18px; font-weight: 800; color: Theme.text; }
+        Text {
+            text: "Deletes messages in " + root.current-room-name + " for everyone, newest first. Their text is gone from the server and every app; this can't be undone. Room events (joins, renames) stay.";
+            color: Theme.muted; font-size: 12px; wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Btn { text: "Last 50"; danger: true; clicked => { root.clear-open = false; root.clear-messages(50); } }
+            Btn { text: "Last 500"; danger: true; clicked => { root.clear-open = false; root.clear-messages(500); } }
+            Btn { text: "All"; danger: true; clicked => { root.clear-open = false; root.clear-messages(0); } }
+        }
+        Btn { text: "Cancel"; primary: true; clicked => { root.clear-open = false; } }
     }
 
     if root.forward-open: Overlay {

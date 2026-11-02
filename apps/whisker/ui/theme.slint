@@ -23,6 +23,16 @@ export global Theme {
 export global TextTools {
     // The part of `text` between two byte offsets (a selection), in either order.
     pure callback slice(string, int, int) -> string;
+    // A selection dragged across several messages is showing.
+    in-out property <bool> spanning;
+    // Copies the dragged selection, or `fallback` when there is none.
+    callback copy-selection(string);
+    // Shading over selected text that can't show a selection itself:
+    // whether piece "list|id|part" is shaded (asked again when the
+    // version changes).
+    out property <brush> highlight: Theme.accent.transparentize(0.6);
+    pure callback shaded(string, int) -> bool;
+    in-out property <int> shade-version;
 }
 
 export global Prefs {
@@ -37,16 +47,16 @@ export global Prefs {
     // Which entries the message right-click menu shows.
     in-out property <bool> menu-react: true;
     in-out property <bool> menu-reply: true;
-    in-out property <bool> menu-thread: true;
+    in-out property <bool> menu-thread: false;
     in-out property <bool> menu-forward: true;
-    in-out property <bool> menu-quote: true;
+    in-out property <bool> menu-quote: false;
     in-out property <bool> menu-copy: true;
-    in-out property <bool> menu-select: true;
+    in-out property <bool> menu-open-media: false;
     in-out property <bool> menu-open-links: true;
-    in-out property <bool> menu-copy-link: true;
-    in-out property <bool> menu-profile: true;
-    in-out property <bool> menu-copy-id: true;
-    in-out property <bool> menu-source: true;
+    in-out property <bool> menu-copy-link: false;
+    in-out property <bool> menu-profile: false;
+    in-out property <bool> menu-copy-id: false;
+    in-out property <bool> menu-source: false;
 }
 
 export component Avatar inherits Rectangle {

@@ -245,14 +245,17 @@ component Blocks inherits VerticalLayout {
     // height at the width it will really have.
     in property <length> avail;
     callback link(string);
+    // Names this message's text for selecting across messages ("list|id").
+    in property <string> key;
     // The text selected in one of the blocks ("" when none is).
     callback selected(string);
     spacing: 2px;
-    for b in root.blocks: VerticalLayout {
+    for b[i] in root.blocks: VerticalLayout {
         if b.kind == 0 && !Prefs.rich-text && !b.mention: TextInput {
             width: root.avail;
             text: b.plain;
             read-only: true;
+            accessible-description: "sel|" + root.key + "|" + (i + 1);
             single-line: false;
             wrap: word-wrap;
             color: root.faint ? Theme.muted : Theme.text;
@@ -267,6 +270,8 @@ component Blocks inherits VerticalLayout {
             default-color: root.faint ? Theme.muted : Theme.text;
             link-color: Theme.accent;
             link-clicked(l) => { root.link(l); }
+            // Shown over it while a dragged selection covers it.
+            Rectangle { width: parent.width; height: parent.height; background: TextTools.shaded(root.key + "|" + (i + 1), TextTools.shade-version) ? TextTools.highlight : transparent; accessible-role: text; accessible-label: b.plain; accessible-description: "selbox|" + root.key + "|" + (i + 1); }
         }
         if b.kind == 1: HorizontalLayout {
             spacing: 8px;
@@ -275,6 +280,7 @@ component Blocks inherits VerticalLayout {
                 width: root.avail - 11px;
                 text: b.plain;
                 read-only: true;
+            accessible-description: "sel|" + root.key + "|" + (i + 1);
                 single-line: false;
                 wrap: word-wrap;
                 color: Theme.muted;
@@ -288,6 +294,8 @@ component Blocks inherits VerticalLayout {
                 default-color: Theme.muted;
                 link-color: Theme.accent;
                 link-clicked(l) => { root.link(l); }
+            // Shown over it while a dragged selection covers it.
+            Rectangle { width: parent.width; height: parent.height; background: TextTools.shaded(root.key + "|" + (i + 1), TextTools.shade-version) ? TextTools.highlight : transparent; accessible-role: text; accessible-label: b.plain; accessible-description: "selbox|" + root.key + "|" + (i + 1); }
             }
         }
         if b.kind == 2: Rectangle {
@@ -301,6 +309,7 @@ component Blocks inherits VerticalLayout {
                     width: root.avail - 16px;
                     text: b.plain;
                     read-only: true;
+            accessible-description: "sel|" + root.key + "|" + (i + 1);
                     single-line: false;
                     wrap: word-wrap;
                     font-family: "monospace";
@@ -316,6 +325,7 @@ component Blocks inherits VerticalLayout {
             width: root.avail;
             text: b.plain;
             read-only: true;
+            accessible-description: "sel|" + root.key + "|" + (i + 1);
             single-line: false;
             wrap: word-wrap;
             font-size: 17px;
@@ -325,13 +335,46 @@ component Blocks inherits VerticalLayout {
             changed cursor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
             changed anchor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
         }
-        if b.kind == 3 && (Prefs.rich-text || b.mention): StyledText { width: root.avail; text: b.text; default-color: Theme.text; default-font-size: 17px; link-color: Theme.accent; link-clicked(l) => { root.link(l); } }
+        if b.kind == 3 && (Prefs.rich-text || b.mention): StyledText { width: root.avail; text: b.text; default-color: Theme.text; default-font-size: 17px; link-color: Theme.accent; link-clicked(l) => { root.link(l); }
+            // Shown over it while a dragged selection covers it.
+            Rectangle { width: parent.width; height: parent.height; background: TextTools.shaded(root.key + "|" + (i + 1), TextTools.shade-version) ? TextTools.highlight : transparent; accessible-role: text; accessible-label: b.plain; accessible-description: "selbox|" + root.key + "|" + (i + 1); } }
         if b.kind == 4: Rectangle { height: 6px; }
     }
 }
 
+// The video playing inside a message (one at a time).
+export global Player {
+    // The message it's in ("" for none).
+    in-out property <string> id;
+    in-out property <image> frame;
+    in-out property <bool> playing;
+    // Fetching the video or starting up.
+    in-out property <bool> loading;
+    in-out property <bool> muted;
+    // Seconds.
+    in-out property <float> position;
+    in-out property <float> duration;
+    // Play or pause message `id`'s video.
+    callback toggle(string);
+    // Jump to a fraction (0–1) of the way through.
+    callback seek(float);
+    callback mute();
+}
+
+// "1:05" from seconds.
+component Clock inherits Text {
+    in property <float> seconds;
+    property <int> whole: floor(max(0, root.seconds));
+    text: floor(self.whole / 60) + ":" + (mod(self.whole, 60) < 10 ? "0" : "") + mod(self.whole, 60);
+    color: white;
+    font-size: 11px;
+    vertical-alignment: center;
+}
+
 component MessageRow inherits Rectangle {
     in property <MessageItem> item;
+    // Which list it's in ("m" the room, "t" a thread), for drag selection.
+    in property <string> list: "m";
     in property <bool> can-moderate;
     in property <string> room-id;
     in property <[string]> quick-reactions;
@@ -351,13 +394,13 @@ component MessageRow inherits Rectangle {
     area := TouchArea {
         cm := ContextMenuArea {
             Menu {
-                if root.selection != "": MenuItem { title: "Copy"; activated => { root.copy(root.selection); } }
-                if root.selection != "": MenuSeparator {}
+                if root.selection != "" || TextTools.spanning: MenuItem { title: "Copy"; activated => { TextTools.copy-selection(root.selection); } }
+                if root.selection != "" || TextTools.spanning: MenuSeparator {}
                 if root.item.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.item.id); } }
-                if root.item.media == 2 || root.item.media == 3: MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
+                if Prefs.menu-open-media && (root.item.media == 2 || root.item.media == 3): MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
                 if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
                 if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
-                if root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
+                if Prefs.menu-open-media && root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
                 if root.item.media > 0 && root.item.media < 4: MenuSeparator {}
                 if Prefs.menu-react: Menu {
                     title: "React";
@@ -369,9 +412,6 @@ component MessageRow inherits Rectangle {
                 if Prefs.menu-forward: MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
                 if Prefs.menu-quote: MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
                 if Prefs.menu-copy: MenuItem { title: "Copy whole message"; activated => { root.copy(root.item.body); } }
-                if Prefs.menu-copy: MenuItem { title: "Copy with the messages around it"; activated => { root.action("copy-group", root.item.id); } }
-                if Prefs.menu-select: MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
-                if Prefs.menu-select: MenuItem { title: "Select text with the messages around it…"; activated => { root.action("select-group", root.item.id); } }
                 if root.item.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
                 if Prefs.menu-open-links: Menu {
                     title: "Open link";
@@ -433,8 +473,11 @@ component MessageRow inherits Rectangle {
                         if root.item.first: HorizontalLayout {
                             spacing: 8px;
                             alignment: start;
-                            Text {
+                            TextInput {
                                 text: root.item.name;
+                                read-only: true;
+                                accessible-description: "sel|" + root.list + "|" + root.item.id + "|0";
+                                selection-background-color: Theme.accent.transparentize(0.55);
                                 font-weight: 700;
                                 color: root.item.mine ? Theme.accent : Theme.text;
                                 font-size: 14px;
@@ -453,12 +496,15 @@ component MessageRow inherits Rectangle {
                         }
                         // Narrow chat (side panel open): shrink, keeping the shape.
                         // Pictures, and videos that came with a preview frame.
-                        if root.item.media == 1 || (root.item.media == 2 && root.item.picture.width > 0): Rectangle {
-                            property <float> fit: min(1, max(60px, root.width - 100px) / max(1px, root.item.picture-width));
+                        if root.item.media == 1 || (root.item.media == 2 && (root.item.picture.width > 0 || (Player.id == root.item.id && Player.frame.width > 0))): pic := Rectangle {
+                            // A video sent without a preview takes the size of its frames.
+                            property <length> pw: root.item.media == 1 || root.item.picture.width > 0 ? root.item.picture-width : Player.frame.width * 1px;
+                            property <length> ph: root.item.media == 1 || root.item.picture.width > 0 ? root.item.picture-height : Player.frame.height * 1px;
+                            property <float> fit: min(1, max(60px, root.width - 100px) / max(1px, self.pw));
                             // Animated pictures step through their frames, looping.
                             property <int> frame: 0;
-                            width: root.item.picture-width * self.fit;
-                            height: root.item.picture-height * self.fit;
+                            width: self.pw * self.fit;
+                            height: self.ph * self.fit;
                             border-radius: 8px;
                             clip: true;
                             background: Theme.raised;
@@ -469,22 +515,91 @@ component MessageRow inherits Rectangle {
                             }
                             if root.item.picture.width > 0 && root.item.frames.length == 0: Image { source: root.item.picture; width: parent.width; height: parent.height; image-fit: cover; }
                             if root.item.frames.length > 0: Image { source: root.item.frames[min(parent.frame, root.item.frames.length - 1)]; width: parent.width; height: parent.height; image-fit: cover; }
-                            if root.item.picture.width == 0: Text { text: "Loading image…"; color: Theme.muted; font-size: 12px; }
-                            if root.item.media == 2: Rectangle {
+                            if root.item.media == 1 && root.item.picture.width == 0: Text { text: "Loading image…"; color: Theme.muted; font-size: 12px; }
+                            property <bool> here: root.item.media == 2 && Player.id == root.item.id;
+                            if pic.here && Player.frame.width > 0: Image { source: Player.frame; width: parent.width; height: parent.height; image-fit: contain; }
+                            if root.item.media == 2 && !(pic.here && Player.playing): Rectangle {
                                 width: 48px; height: 48px; border-radius: 24px;
                                 background: #000000a0;
                                 Text { text: "▶"; color: white; font-size: 20px; }
                             }
+                            if pic.here && Player.loading: Rectangle {
+                                width: 48px; height: 48px; border-radius: 24px;
+                                background: #000000a0;
+                                Text { text: "…"; color: white; font-size: 20px; }
+                            }
                             // Takes every button, so it opens the menu itself on right-click.
-                            TouchArea {
+                            pic-area := TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { root.action(root.item.media == 2 ? "play" : "view", root.item.id); }
+                                clicked => {
+                                    if root.item.media == 2 { Player.toggle(root.item.id); } else { root.action("view", root.item.id); }
+                                }
                                 pointer-event(e) => {
                                     if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
                                 }
+                                // Controls, while it plays (on hover) or is paused.
+                                if pic.here && (pic-area.has-hover || !Player.playing): Rectangle {
+                                    y: parent.height - self.height;
+                                    height: 30px;
+                                    background: #000000a0;
+                                    // Clicks on the bar itself don't pause.
+                                    TouchArea {}
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 8px;
+                                        Rectangle {
+                                            width: 16px;
+                                            if Player.playing: HorizontalLayout {
+                                                alignment: center;
+                                                spacing: 3px;
+                                                padding-top: 9px;
+                                                padding-bottom: 9px;
+                                                Rectangle { width: 3px; background: white; }
+                                                Rectangle { width: 3px; background: white; }
+                                            }
+                                            if !Player.playing: Text { text: "▶"; color: white; font-size: 13px; }
+                                            TouchArea { mouse-cursor: pointer; clicked => { Player.toggle(root.item.id); } }
+                                        }
+                                        Clock { seconds: Player.position; }
+                                        track := Rectangle {
+                                            horizontal-stretch: 1;
+                                            Rectangle {
+                                                height: 4px; border-radius: 2px;
+                                                background: #ffffff50;
+                                                Rectangle {
+                                                    x: 0;
+                                                    width: parent.width * (Player.duration > 0 ? min(1, Player.position / Player.duration) : 0);
+                                                    border-radius: 2px;
+                                                    background: Theme.accent;
+                                                }
+                                            }
+                                            TouchArea { mouse-cursor: pointer; clicked => { Player.seek(self.mouse-x / max(1px, self.width)); } }
+                                        }
+                                        Clock { seconds: Player.duration; }
+                                        Rectangle {
+                                            width: 18px;
+                                            // A speaker, with sound waves or a cross.
+                                            Path {
+                                                width: 16px; height: 14px;
+                                                viewbox-width: 16; viewbox-height: 14;
+                                                fill: white;
+                                                commands: "M 0 4 L 4 4 L 8 0 L 8 14 L 4 10 L 0 10 Z";
+                                            }
+                                            Path {
+                                                width: 16px; height: 14px;
+                                                viewbox-width: 16; viewbox-height: 14;
+                                                stroke: white;
+                                                stroke-width: 1.5px;
+                                                commands: Player.muted ? "M 10.5 4.5 L 15 9.5 M 15 4.5 L 10.5 9.5" : "M 10.5 4.5 Q 12.5 7 10.5 9.5 M 12.5 2.5 Q 16 7 12.5 11.5";
+                                            }
+                                            TouchArea { mouse-cursor: pointer; clicked => { Player.mute(); } }
+                                        }
+                                    }
+                                }
                             }
                         }
-                        if root.item.media > 2 || (root.item.media == 2 && root.item.picture.width == 0): Rectangle {
+                        if root.item.media > 2 || (root.item.media == 2 && root.item.picture.width == 0 && !(Player.id == root.item.id && Player.frame.width > 0)): Rectangle {
                             height: 52px;
                             max-width: 340px;
                             border-radius: 8px;
@@ -523,7 +638,7 @@ component MessageRow inherits Rectangle {
                             spacing: 4px;
                             for pic in root.item.big-emoji: Image { source: pic; width: 40px; height: 40px; }
                         }
-                        if root.item.media == 0 && root.item.big-emoji.length == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } selected(t) => { root.selection = t; } }
+                        if root.item.media == 0 && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } selected(t) => { root.selection = t; } }
                         if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
                         // Who really sent it: the warning always, the reason on hover.
                         if root.item.shield > 0: Text {
@@ -623,6 +738,8 @@ component RailAccount inherits Rectangle {
     in property <int> drag-from: -1;
     in property <length> drag-dy;
     callback clicked;
+    // Double-clicked: hides or shows the room list.
+    callback double-clicked;
     callback menu(string);
     callback dragging(length);
     callback dropped(int);
@@ -687,6 +804,7 @@ component RailAccount inherits Rectangle {
     ta := TouchArea {
         mouse-cursor: root.lifted ? MouseCursor.grabbing : MouseCursor.pointer;
         clicked => { if abs(self.mouse-y - self.pressed-y) <= 6px { root.clicked(); } }
+        double-clicked => { if abs(self.mouse-y - self.pressed-y) <= 6px { root.double-clicked(); } }
         pointer-event(e) => {
             if e.button == PointerEventButton.right && e.kind == PointerEventKind.down {
                 cm.show({ x: self.mouse-x, y: self.mouse-y });
@@ -1095,6 +1213,8 @@ export component AppWindow inherits Window {
 
     // On phones one pane shows at a time: 1 rooms, 2 chat.
     in-out property <int> pane: 1;
+    // The room list is folded away (double-clicking an account toggles it).
+    in-out property <bool> rooms-hidden;
     property <bool> narrow: root.width < 760px;
 
     callback unlock(string);
@@ -1211,6 +1331,7 @@ export component AppWindow inherits Window {
                             drag-dy: root.rail-drag-dy;
                             selected: a.id == root.current-account;
                             clicked => { root.activity(); root.current-account = a.id; root.select-account(a.id); root.pane = 1; }
+                            double-clicked => { if !root.narrow { root.rooms-hidden = !root.rooms-hidden; } }
                             dragging(dy) => {
                                 root.rail-drag-from = dy != 0 ? i : -1;
                                 root.rail-drag-dy = dy;
@@ -1247,8 +1368,8 @@ export component AppWindow inherits Window {
             }
         }
 
-        // Rooms
-        if !root.narrow || root.pane == 1: Rectangle {
+        // Rooms (double-click an account to hide or show them)
+        if (!root.narrow && !root.rooms-hidden) || (root.narrow && root.pane == 1): Rectangle {
             width: root.narrow ? root.width - 64px : 290px;
             background: Theme.panel;
             VerticalLayout {
@@ -1889,6 +2010,7 @@ export component AppWindow inherits Window {
                             spacing: 6px;
                             for m in root.thread-messages: MessageRow {
                                 item: m;
+                                list: "t";
                                 can-moderate: root.can-moderate;
                                 room-id: root.current-room;
                                 quick-reactions: root.quick-reactions;

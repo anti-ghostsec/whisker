@@ -969,23 +969,42 @@ pub struct Poster {
 /// Widest poster frame made.
 const POSTER_PX: u32 = 640;
 
-/// A frame from early in the video file at `path`, as a JPEG.
-pub fn video_poster(path: &Path) -> Option<Poster> {
+/// What ffprobe says about a video file.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoInfo {
+    pub width: u32,
+    pub height: u32,
+    pub duration: Option<std::time::Duration>,
+    /// It has a sound track.
+    pub audio: bool,
+}
+
+/// Size, length and whether there's sound, via ffprobe (when installed).
+pub fn probe_video(path: &Path) -> Option<VideoInfo> {
     use std::process::{Command, Stdio};
     let probe = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration", "-of", "default=nw=1"])
+        .args(["-v", "error", "-show_entries", "stream=codec_type,width,height:format=duration", "-of", "default=nw=1"])
         .arg(path)
+        .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&probe.stdout);
-    let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=').map(str::trim));
-    let w: u32 = field("width")?.parse().ok()?;
-    let h: u32 = field("height")?.parse().ok()?;
-    if w == 0 || h == 0 {
+    let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=').map(str::trim).filter(|v| *v != "N/A"));
+    let width: u32 = field("width")?.parse().ok()?;
+    let height: u32 = field("height")?.parse().ok()?;
+    if width == 0 || height == 0 {
         return None;
     }
     let duration = field("duration").and_then(|d| d.parse::<f64>().ok()).filter(|d| d.is_finite() && *d >= 0.0).map(std::time::Duration::from_secs_f64);
+    let audio = text.lines().any(|l| l.trim() == "codec_type=audio");
+    Some(VideoInfo { width, height, duration, audio })
+}
+
+/// A frame from early in the video file at `path`, as a JPEG.
+pub fn video_poster(path: &Path) -> Option<Poster> {
+    use std::process::{Command, Stdio};
+    let VideoInfo { width: w, height: h, duration, .. } = probe_video(path)?;
     let pw = w.min(POSTER_PX) & !1;
     let ph = ((u64::from(h) * u64::from(pw) / u64::from(w)) as u32).max(2) & !1;
     // A second in skips black fade-ins; short clips use their first frame.

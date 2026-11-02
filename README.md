@@ -71,9 +71,11 @@ operating system and the **Wisp** browser.
   viewer has Save / Forward / Close buttons and its own right-click menu. **GIFs and
   animated WebP play and loop**, in the timeline and the viewer. Videos show their preview
   frame (when they were sent without one, and are under 200 MB, Whisker makes one with
-  ffmpeg if it's installed; videos you send get one the same way); click to **play** in mpv (looping, sound off to start) or, without mpv, your
-  system's player. The copy goes to the RAM folder and is deleted when you lock or quit
-  (your player may still list it under recent files).
+  ffmpeg if it's installed; videos you send get one the same way). Click a video to **play it
+  right there in the message**, with sound, pause, a seek bar and mute (on Linux, with ffmpeg
+  installed; it plays through PulseAudio/PipeWire, else ALSA). One plays at a time, and it stops
+  when you switch rooms. Without ffmpeg, and on other systems, it opens in mpv or your
+  system's player. The copy goes to the RAM folder and is deleted when you lock or quit.
 - **Spaces** show as folders in the room list, holding their rooms and sub-spaces (a folded
   space shows the unread count of everything inside). Clicking a space opens its page: every
   room it lists, with **Join** for the ones you aren't in yet and **Open** for the rest, plus
@@ -88,9 +90,7 @@ operating system and the **Wisp** browser.
   straight after a fix keeps what you typed (and that word isn't fixed again). Turn it off
   in Settings. The word list comes from SCOWL (`apps/whisker/assets/words-LICENSE.txt`).
 - **Right-click to cut, copy, paste or select all** in every text box and the composer, and
-  to copy addresses, descriptions and pinned messages in the side panel. A message's menu
-  also has *Copy with the messages around it* and *Select text with the messages around it…*,
-  for a run of messages shown together under one name.
+  to copy addresses, descriptions and pinned messages in the side panel.
 - **Room keys:** Settings → account → *Export or import room keys* saves your message keys
   to a passphrase-locked file (the format Element uses), or reads one in.
 - **Threads:** replies in a thread are tucked under the message that started it ("3
@@ -111,7 +111,8 @@ operating system and the **Wisp** browser.
   Click a **name** to reply to that message; click an **avatar** to open the person's
   profile (direct chat, mention, copy id, kick/ban if you're a moderator, ignore).
 - **Drag an account** up or down the rail to reorder; the others slide aside like tabs (or
-  right-click it for Move up/down). Room admins can **change a room's picture** from Room info. **Right-click a room** to
+  right-click it for Move up/down). **Double-click an account** to fold the room list away
+  for more room to read, and again to bring it back. Room admins can **change a room's picture** from Room info. **Right-click a room** to
   pin it to the top (saved as a favourite, so other apps see it), mark it read, copy its
   address or leave it. Opening a room clears its unread badge using a *private* read
   receipt, so the server's counter resets without telling anyone you read it.
@@ -152,10 +153,13 @@ operating system and the **Wisp** browser.
   (click anyone to see their profile), inviting people, and editing the name/description if
   you're allowed.
 - **Your profile**: change your display name and picture in Settings → your account.
-- **Select part of a message** and right-click for *Copy* (or Ctrl+C).
-- **Right-click a message** to reply, quote, copy its text, select part of it, save its
-  file, copy a link to it, show its source, edit or delete it, or kick/ban its sender if
-  you're a moderator. Settings → *Message menu* turns each entry on or off.
+- **Select text by dragging, like in a web browser:** from the middle of one message, over
+  names and whole messages, to the middle of another (hold the mouse above or below the list
+  to scroll while selecting). Ctrl+C or right-click → *Copy* copies it, names on their own lines.
+- **Right-click a message** to react, reply, forward, copy it, open its links, save its file,
+  edit or delete it, or kick/ban its sender if you're a moderator. Settings → *Message menu*
+  also offers Reply in thread, Quote, Play / Open image, Copy link to message, View profile,
+  Copy user id and Show source, which start off.
 - **Settings page** (⚙): dark (the default), light or follow-system theme; auto-lock after
   5/15/60 minutes idle; change a vault's passphrase; nickname, tags and proxy per account;
   a full AI agent setup form (model, API key, effort, permissions, commanders, audit room).

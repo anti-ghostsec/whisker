@@ -300,7 +300,7 @@ component GeneralPage inherits VerticalLayout {
     }
     Card {
         title: "Message menu";
-        subtitle: "What right-clicking (or long-pressing) a message offers. Saving files, editing, deleting and moderating are always there when they apply.";
+        subtitle: "What right-clicking (or long-pressing) a message offers. Saving files, editing, deleting and moderating are always there when they apply. To copy part of a message, or several, drag across them like in a web browser.";
         GridLayout {
             spacing: 8px;
             Row {
@@ -316,7 +316,7 @@ component GeneralPage inherits VerticalLayout {
                 MenuToggle { key: "copy"; label: "Copy whole message"; checked: Prefs.menu-copy; changed(k, b) => { root.set-menu-entry(k, b); } }
             }
             Row {
-                MenuToggle { key: "select"; label: "Select text…"; checked: Prefs.menu-select; changed(k, b) => { root.set-menu-entry(k, b); } }
+                MenuToggle { key: "open-media"; label: "Play / Open image"; checked: Prefs.menu-open-media; changed(k, b) => { root.set-menu-entry(k, b); } }
                 MenuToggle { key: "open-links"; label: "Open links"; checked: Prefs.menu-open-links; changed(k, b) => { root.set-menu-entry(k, b); } }
             }
             Row {

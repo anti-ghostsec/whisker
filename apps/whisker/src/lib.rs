@@ -6,6 +6,11 @@ mod agent_form;
 mod autocorrect;
 mod emoji;
 mod notify;
+#[cfg(target_os = "linux")]
+mod player;
+#[cfg(not(target_os = "android"))]
+#[doc(hidden)]
+pub mod select;
 mod format;
 mod settings;
 pub mod share;
@@ -1017,6 +1022,9 @@ impl Ctl {
 
     async fn select_room(&self, id: String) {
         let Ok(room_id) = OwnedRoomId::try_from(id) else { return };
+        // A video playing in the room being left stops.
+        #[cfg(target_os = "linux")]
+        player::stop(&self.ui);
         let Some(account) = self.st.lock().unwrap().account else { return };
         let Some(client) = self.mgr.client(account).await else { return };
         let Some(room) = client.get_room(&room_id) else { return };
@@ -1905,43 +1913,13 @@ impl Ctl {
         self.st.lock().unwrap().messages.get(key)?.iter().find(|m| m.event_id.as_str() == id).cloned()
     }
 
-    /// The text of the run of messages `id` is in: the ones shown together
-    /// under one name, oldest first, one per line.
-    fn group_text(&self, key: &RoomKey, id: &str) -> Option<String> {
-        let st = self.st.lock().unwrap();
-        let msgs: Vec<&HistoryItem> = st.messages.get(key)?.iter().filter(|m| !m.notice).collect();
-        let at = msgs.iter().position(|m| m.event_id.as_str() == id)?;
-        let together = |a: &HistoryItem, b: &HistoryItem| {
-            a.sender == b.sender && a.thread == b.thread && b.reply_to.is_none() && i64::from(b.ts.get()) - i64::from(a.ts.get()) <= 5 * 60 * 1000
-        };
-        let mut start = at;
-        while start > 0 && together(msgs[start - 1], msgs[start]) {
-            start -= 1;
-        }
-        let mut end = at;
-        while end + 1 < msgs.len() && together(msgs[end], msgs[end + 1]) {
-            end += 1;
-        }
-        Some(msgs[start..=end].iter().map(|m| m.body.as_str()).collect::<Vec<_>>().join("\n"))
-    }
-
     async fn message_action(&self, action: String, id: String) {
         let Some((key, room)) = self.current_room().await else { return };
         let Some(m) = self.find(&key, &id) else { return };
         match action.as_str() {
-            "copy-group" => {
-                if let Some(text) = self.group_text(&key, &id) {
-                    self.ui(move |u| u.invoke_copy_text(s(text)));
-                }
-            }
-            "select-group" => {
-                if let Some(text) = self.group_text(&key, &id) {
-                    self.ui(move |u| {
-                        u.set_select_title(s("Select text"));
-                        u.set_select_text(s(text));
-                    });
-                }
-            }
+            // Clicking a name replies, but not when that "click" ended a drag selection.
+            #[cfg(not(target_os = "android"))]
+            "reply" if select::take_just_dragged() => {}
             "reply" => {
                 self.st.lock().unwrap().reply_to = Some(m.event_id.clone());
                 let label = format!("{}: {}", m.sender_label(), m.body.lines().next().unwrap_or_default());
@@ -1956,13 +1934,6 @@ impl Ctl {
                 self.ui(move |u| {
                     let draft = u.get_draft();
                     u.set_draft(s(format!("{quoted}\n{draft}")));
-                });
-            }
-            "select" => {
-                let body = m.body.clone();
-                self.ui(move |u| {
-                    u.set_select_title(s("Select text"));
-                    u.set_select_text(s(body));
                 });
             }
             "source" => {
@@ -2445,6 +2416,16 @@ impl Ctl {
         let Some(media) = m.media else { return };
         let Some(client) = self.mgr.client(key.0).await else { return };
         self.status("Loading…");
+        #[cfg(target_os = "linux")]
+        if media.kind == MediaKind::Video && player::available() {
+            player::stop(&self.ui);
+            let id = m.event_id.to_string();
+            self.ui(move |u| {
+                let p = u.global::<Player>();
+                p.set_id(s(id));
+                p.set_loading(true);
+            });
+        }
         let dir = media_dir(self.mgr.data_dir());
         let ext = std::path::Path::new(&media.name).extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 5 && e.chars().all(char::is_alphanumeric)).unwrap_or("bin").to_owned();
         let path = dir.join(format!("{}.{ext}", &whisker_core::vault::random_secret()[..16]));
@@ -2459,9 +2440,23 @@ impl Ctl {
         match r {
             Ok(()) => {
                 self.status("");
+                // Videos play in the message itself where ffmpeg can show them.
+                #[cfg(target_os = "linux")]
+                if media.kind == MediaKind::Video && player::available() {
+                    let (ui, id, path) = (self.ui.clone(), m.event_id.to_string(), path.clone());
+                    let played = tokio::task::spawn_blocking(move || player::play(ui, id, path)).await.unwrap_or(false);
+                    if played {
+                        return;
+                    }
+                    self.ui(|u| u.global::<Player>().set_loading(false));
+                }
                 play_file(&path, media.kind == MediaKind::Video);
             }
-            Err(e) => self.status(format!("Couldn't open it: {e:#}")),
+            Err(e) => {
+                #[cfg(target_os = "linux")]
+                self.ui(|u| u.global::<Player>().set_loading(false));
+                self.status(format!("Couldn't open it: {e:#}"));
+            }
         }
     }
 
@@ -2681,10 +2676,11 @@ impl Ctl {
 
     fn set_menu_entry(&self, key: String, on: bool) {
         let mut st = self.settings.lock().unwrap();
-        if on {
-            st.menu_hidden.remove(&key);
+        let (mark, set) = if MENU_OFF_BY_DEFAULT.contains(&key.as_str()) { (format!("+{key}"), on) } else { (key, !on) };
+        if set {
+            st.menu_hidden.insert(mark);
         } else {
-            st.menu_hidden.insert(key);
+            st.menu_hidden.remove(&mark);
         }
         let _ = st.save(self.mgr.data_dir());
         if let Some(u) = self.ui.upgrade() {
@@ -3958,6 +3954,8 @@ fn split_login(hs: &str, user: &str) -> (String, String) {
 pub fn run(data_dir: PathBuf) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let ui = AppWindow::new()?;
+    #[cfg(not(target_os = "android"))]
+    select::install(&ui);
     ui::install(&ui);
     let mgr = AccountManager::new(data_dir);
     ui.set_first_run(mgr.is_empty());
@@ -4047,6 +4045,30 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_search_rooms, |q| search_rooms);
     on!(on_send, |t| send);
     on!(on_message_action, |a, id| message_action);
+    #[cfg(target_os = "linux")]
+    {
+        let c = ctl.clone();
+        ui.global::<Player>().on_toggle(move |id| {
+            if player::is_loaded(&id) {
+                player::toggle(&c.ui);
+            } else {
+                let (c2, id) = (c.clone(), id.to_string());
+                c.spawn(async move { c2.message_action("play".into(), id).await });
+            }
+        });
+        let c = ctl.clone();
+        ui.global::<Player>().on_seek(move |f| player::seek(&c.ui, f));
+        let c = ctl.clone();
+        ui.global::<Player>().on_mute(move || player::mute(&c.ui));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let c = ctl.clone();
+        ui.global::<Player>().on_toggle(move |id| {
+            let (c2, id) = (c.clone(), id.to_string());
+            c.spawn(async move { c2.message_action("play".into(), id).await });
+        });
+    }
     on!(on_profile_action, |a, user| profile_action);
     on!(on_profile_requested, |user| profile_requested);
     on!(on_verify_action, |a| verify_action);
@@ -4235,16 +4257,25 @@ fn android_main(app: slint::android::AndroidApp) {
 static VISION: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Shows the message menu entries that aren't in `hidden`.
+/// Message menu entries that are off until turned on in Settings.
+const MENU_OFF_BY_DEFAULT: &[&str] = &["thread", "quote", "open-media", "copy-link", "profile", "copy-id", "source"];
+
+/// Whether a message menu entry shows. `hidden` holds the entries turned
+/// off, and "+entry" for ones that are off by default but turned on.
+fn menu_entry_on(hidden: &std::collections::BTreeSet<String>, key: &str) -> bool {
+    if MENU_OFF_BY_DEFAULT.contains(&key) { hidden.contains(&format!("+{key}")) } else { !hidden.contains(key) }
+}
+
 fn apply_menu(ui: &AppWindow, hidden: &std::collections::BTreeSet<String>) {
     let p = ui.global::<Prefs>();
-    let on = |k: &str| !hidden.contains(k);
+    let on = |k: &str| menu_entry_on(hidden, k);
     p.set_menu_react(on("react"));
     p.set_menu_reply(on("reply"));
     p.set_menu_thread(on("thread"));
     p.set_menu_forward(on("forward"));
     p.set_menu_quote(on("quote"));
     p.set_menu_copy(on("copy"));
-    p.set_menu_select(on("select"));
+    p.set_menu_open_media(on("open-media"));
     p.set_menu_open_links(on("open-links"));
     p.set_menu_copy_link(on("copy-link"));
     p.set_menu_profile(on("profile"));
@@ -4255,6 +4286,17 @@ fn apply_menu(ui: &AppWindow, hidden: &std::collections::BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_entries_keep_their_defaults() {
+        let mut hidden = std::collections::BTreeSet::new();
+        assert!(menu_entry_on(&hidden, "reply"));
+        assert!(!menu_entry_on(&hidden, "source"));
+        hidden.insert("reply".to_owned());
+        hidden.insert("+source".to_owned());
+        assert!(!menu_entry_on(&hidden, "reply"));
+        assert!(menu_entry_on(&hidden, "source"));
+    }
 
     #[test]
     fn repeated_joins_are_dropped() {

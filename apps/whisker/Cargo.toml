@@ -29,6 +29,10 @@ slint = "1.18.1"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = "0.17.2"
+# Drag selection across messages (select.rs) reads the window's mouse and
+# Slint's item tree, which only these expose. Pinned: unstable APIs.
+slint = { version = "1.18.1", features = ["unstable-winit-030"] }
+i-slint-core = "=1.18.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Already in the tree (accessibility, file dialogs); used for notifications.

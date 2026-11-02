@@ -313,7 +313,7 @@ component GeneralPage inherits VerticalLayout {
             }
             Row {
                 MenuToggle { key: "quote"; label: "Quote"; checked: Prefs.menu-quote; changed(k, b) => { root.set-menu-entry(k, b); } }
-                MenuToggle { key: "copy"; label: "Copy text"; checked: Prefs.menu-copy; changed(k, b) => { root.set-menu-entry(k, b); } }
+                MenuToggle { key: "copy"; label: "Copy whole message"; checked: Prefs.menu-copy; changed(k, b) => { root.set-menu-entry(k, b); } }
             }
             Row {
                 MenuToggle { key: "select"; label: "Select text…"; checked: Prefs.menu-select; changed(k, b) => { root.set-menu-entry(k, b); } }
@@ -504,6 +504,45 @@ component AccountPage inherits VerticalLayout {
     }
 }
 
+/// A list of model names to pick from: a plain list, not a dropdown, so
+/// there's no popup to get stuck and long lists can be narrowed by typing.
+component ModelList inherits Rectangle {
+    in property <[string]> models;
+    in property <string> picked;
+    callback chosen(string);
+    height: min(220px, root.models.length * 30px + 8px);
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.raised;
+    msv := ScrollView {
+        x: 4px;
+        y: 4px;
+        width: parent.width - 8px;
+        height: parent.height - 8px;
+        content-width: self.visible-width;
+        content-height: mlist.preferred-height;
+        mlist := VerticalLayout {
+            width: msv.visible-width;
+            for name in root.models: Rectangle {
+                height: 30px;
+                border-radius: 6px;
+                background: name == root.picked ? Theme.accent-soft : mta.has-hover ? Theme.hover : transparent;
+                Text {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    text: name;
+                    color: name == root.picked ? Theme.accent : Theme.text;
+                    font-size: 12px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                mta := TouchArea { mouse-cursor: pointer; clicked => { root.chosen(name); } }
+            }
+        }
+    }
+}
+
 component AgentPage inherits VerticalLayout {
     in property <AgentForm> agent;
     in property <[string]> models;
@@ -514,6 +553,9 @@ component AgentPage inherits VerticalLayout {
     callback test-agent(AgentForm);
     callback remove-agent();
     callback filter-models(string);
+    // Models that can see pictures, for the picture model.
+    in property <[string]> image-models;
+    callback filter-image-models(string);
     in property <image> card-picture;
     callback card-action(string, AgentForm);
 
@@ -638,39 +680,7 @@ component AgentPage inherits VerticalLayout {
         }
         // A plain list, not a dropdown: no popup to get stuck, and long
         // model lists can be narrowed by typing.
-        if root.models.length > 0: Rectangle {
-            height: min(220px, root.models.length * 30px + 8px);
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: Theme.raised;
-            msv := ScrollView {
-                x: 4px;
-                y: 4px;
-                width: parent.width - 8px;
-                height: parent.height - 8px;
-                content-width: self.visible-width;
-                content-height: mlist.preferred-height;
-                mlist := VerticalLayout {
-                    width: msv.visible-width;
-                    for name in root.models: Rectangle {
-                        height: 30px;
-                        border-radius: 6px;
-                        background: name == root.a-model ? Theme.accent-soft : mta.has-hover ? Theme.hover : transparent;
-                        Text {
-                            x: 8px;
-                            width: parent.width - 16px;
-                            text: name;
-                            color: name == root.a-model ? Theme.accent : Theme.text;
-                            font-size: 12px;
-                            overflow: elide;
-                            vertical-alignment: center;
-                        }
-                        mta := TouchArea { mouse-cursor: pointer; clicked => { root.a-model = name; } }
-                    }
-                }
-            }
-        }
+        if root.models.length > 0: ModelList { models: root.models; picked: root.a-model; chosen(m) => { root.a-model = m; } }
         Number { text: "Longest reply (tokens)"; minimum: 64; maximum: 32000; value <=> root.a-max-tokens; }
         Number { text: "Longest reply posted (characters, 0 = no limit)"; minimum: 0; maximum: 20000; value <=> root.a-reply-chars; }
         Toggle { text: "Let the AI see pictures posted in the room"; checked <=> root.a-see-images; }
@@ -681,7 +691,16 @@ component AgentPage inherits VerticalLayout {
         if root.a-see-images: Field {
             label: "Picture model";
             hint: "Same API. A model that can see images (e.g. gpt-4o-mini, claude-haiku-4-5, qwen-2.5-vl) describes each picture for the chat model, so the chat model doesn't need to see images itself. Leave empty if the chat model can.";
-            Input { text <=> root.a-image-model; placeholder: "Chat model sees pictures itself"; }
+            Input { text <=> root.a-image-model; placeholder: "Chat model sees pictures itself"; edited(t) => { root.filter-image-models(t); } }
+        }
+        if root.a-see-images && root.image-models.length > 0: ModelList {
+            models: root.image-models;
+            picked: root.a-image-model;
+            chosen(m) => { root.a-image-model = m; }
+        }
+        if root.a-see-images && root.image-models.length == 0: Text {
+            text: root.models.length == 0 ? "Press Connect above to list the service's models." : "None of this service's models say they can see pictures; type a name if you know one.";
+            font-size: 11px; color: Theme.muted; wrap: word-wrap;
         }
         Text {
             text: "Venice only (api.venice.ai). Both stay off unless you turn them on.";
@@ -852,6 +871,9 @@ export component SettingsPage inherits Rectangle {
     in property <image> card-picture;
     callback card-action(string, AgentForm);
     callback filter-models(string);
+    // Models that can see pictures, for the picture model.
+    in property <[string]> image-models;
+    callback filter-image-models(string);
     callback change-passphrase(string, string);
     callback unlock-hidden(string);
     callback create-hidden(string);
@@ -940,6 +962,7 @@ export component SettingsPage inherits Rectangle {
                         if root.selected != "" && root.agent.account != "" && root.selected == "ai:" + root.agent.account: AgentPage {
                             agent: root.agent;
                             models: root.models;
+                            image-models: root.image-models;
                             detect-status: root.detect-status;
                             test-status: root.test-status;
                             detect-api(u, k) => { root.detect-api(u, k); }
@@ -949,6 +972,7 @@ export component SettingsPage inherits Rectangle {
                             card-picture: root.card-picture;
                             card-action(a, f) => { root.card-action(a, f); }
                             filter-models(q) => { root.filter-models(q); }
+                            filter-image-models(q) => { root.filter-image-models(q); }
                         }
                     }
                 }

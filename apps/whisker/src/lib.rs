@@ -3123,6 +3123,7 @@ impl Ctl {
         let mut identity = (false, false);
         let mut agent = AgentForm::default();
         let mut models: Vec<SharedString> = Vec::new();
+        let mut image_models: Vec<SharedString> = Vec::new();
         let mut detect = String::new();
         if let Some(rest) = id.strip_prefix("account:")
             && let Ok(aid) = rest.parse::<AccountId>()
@@ -3156,11 +3157,15 @@ impl Ctl {
             self.show_card_picture(png);
             if let Some(d) = self.st.lock().unwrap().detected.get(&aid) {
                 models = d.models.iter().map(s).collect();
+                image_models = d.vision.iter().map(s).collect();
                 detect = format!("✓ {} · {} models", d.service, d.models.len());
             } else if let Some(c) = cfg
-                && !c.api.service.is_empty()
+                && !c.api.url.is_empty()
             {
+                // List the models in the background, so both pickers have them.
                 detect = format!("✓ {}", c.api.service);
+                let (me, url) = (self.clone(), c.api.url.clone());
+                self.spawn(async move { me.detect_api(aid, url, String::new()).await });
             }
         }
         let px = self.avatars.clone();
@@ -3211,6 +3216,7 @@ impl Ctl {
             u.set_account_form(account_form);
             u.set_agent_form(agent);
             u.set_models(ModelRc::new(VecModel::from(models)));
+            u.set_image_models(ModelRc::new(VecModel::from(image_models)));
             u.set_detect_status(s(detect));
             u.set_test_status(s(""));
             u.set_settings_message(s(""));
@@ -3300,9 +3306,11 @@ impl Ctl {
                     d.models.len()
                 );
                 let models: Vec<SharedString> = d.models.iter().map(s).collect();
+                let vision: Vec<SharedString> = d.vision.iter().map(s).collect();
                 self.st.lock().unwrap().detected.insert(account, d);
                 self.ui(move |u| {
                     u.set_models(ModelRc::new(VecModel::from(models)));
+                    u.set_image_models(ModelRc::new(VecModel::from(vision)));
                     u.set_detect_status(s(status));
                 });
             }
@@ -3362,7 +3370,22 @@ impl Ctl {
         } else {
             "Saved. The AI is turned off."
         };
-        self.settings_msg(msg);
+        // Pictures on, but nothing that can look at them.
+        let blind = cfg.see_images && cfg.image_model.trim().is_empty() && {
+            let st = self.st.lock().unwrap();
+            match st.detected.get(&id) {
+                Some(d) if !d.vision.is_empty() => !d.vision.contains(&cfg.api.model),
+                _ => !whisker_agent::api::looks_vision(&cfg.api.model),
+            }
+        };
+        if blind {
+            self.settings_msg(format!(
+                "{msg} But {} may not be able to see pictures: pick a Picture model under \"Let the AI see pictures\", or it will guess at them.",
+                cfg.api.model
+            ));
+        } else {
+            self.settings_msg(msg);
+        }
         let name = f.name.to_string();
         let form = agent_form::to_form(id, &name, Some(&cfg));
         self.ui(move |u| u.set_agent_form(form));
@@ -3489,6 +3512,18 @@ impl Ctl {
             all.iter().filter(|m| m.to_lowercase().contains(&q)).map(s).collect()
         };
         self.ui(move |u| u.set_models(ModelRc::new(VecModel::from(models))));
+    }
+
+    async fn filter_image_models(&self, q: String) {
+        let Some(id) = self.settings_account() else { return };
+        let q = q.trim().to_lowercase();
+        let all = self.st.lock().unwrap().detected.get(&id).map(|d| d.vision.clone()).unwrap_or_default();
+        let models: Vec<SharedString> = if q.is_empty() || all.iter().any(|m| m.to_lowercase() == q) {
+            all.iter().map(s).collect()
+        } else {
+            all.iter().filter(|m| m.to_lowercase().contains(&q)).map(s).collect()
+        };
+        self.ui(move |u| u.set_image_models(ModelRc::new(VecModel::from(models))));
     }
 
     async fn test_agent(&self, f: AgentForm) {
@@ -3863,6 +3898,12 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
+    autocorrect::warm();
+    ui.global::<TextTools>().on_slice(|text, a, b| {
+        let (a, b) = (a.clamp(0, text.len() as i32) as usize, b.clamp(0, text.len() as i32) as usize);
+        let (from, to) = (a.min(b), a.max(b));
+        text.get(from..to).map(s).unwrap_or_default()
+    });
     apply_menu(&ui, &prefs.menu_hidden);
     let servers: Vec<SharedString> = SUGGESTED_SERVERS.iter().map(s).chain([s("Other server…")]).collect();
     ui.set_login_servers(slint::ModelRc::new(slint::VecModel::from(servers)));
@@ -3907,7 +3948,12 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         let c = ctl.clone();
         ui.on_share_cancel(move || c.share_cancel());
     }
-    share::listen(ctl.mgr.data_dir());
+    // A newer build opened: close (locking everything) so it takes over.
+    share::listen(ctl.mgr.data_dir(), || {
+        let _ = slint::invoke_from_event_loop(|| {
+            let _ = slint::quit_event_loop();
+        });
+    });
     {
         let c = ctl.clone();
         share::on_share(move |items| c.receive_share(items));
@@ -3976,6 +4022,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_test_agent, |f| test_agent);
     on!(on_card_action, |a, f| card_action);
     on!(on_filter_models, |q| filter_models);
+    on!(on_filter_image_models, |q| filter_image_models);
     on!(on_change_passphrase, |o, n| change_passphrase);
     on!(on_attach, attach);
     on!(on_load_older, load_older);

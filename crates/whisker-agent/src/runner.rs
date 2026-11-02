@@ -522,7 +522,7 @@ impl AgentRunner {
                     content.push(json!({ "type": "text", "text": format!("Picture from message {id}, as described by an image model: {said}") }));
                 }
                 None => {
-                    content.push(json!({ "type": "text", "text": format!("Picture from message {id}:") }));
+                    content.push(json!({ "type": "text", "text": format!("Picture from message {id} (if you can't actually see it, say so rather than guess):") }));
                     content.push(json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": data } }));
                 }
             }

@@ -1,11 +1,11 @@
 import { ListView, ScrollView, Palette, TextEdit, Switch, ComboBox } from "std-widgets.slint";
-import { Theme, Prefs, Avatar, Btn, IconBtn, Input, Pill } from "theme.slint";
+import { Theme, Prefs, TextTools, Avatar, Btn, IconBtn, Input, Pill } from "theme.slint";
 import { SettingsPage, AccountForm, AgentForm, NavItem } from "settings.slint";
 // Colour emoji for all text (a trimmed Noto Color Emoji: no letters, digits
 // or spaces, so text still comes from the normal fonts). See assets/fonts.
 import "../assets/fonts/WhiskerEmoji.ttf";
 
-export { AccountForm, AgentForm, NavItem, Prefs }
+export { AccountForm, AgentForm, NavItem, Prefs, TextTools }
 
 // `initial`/`hue`/`avatar` are worked out in Rust so a name looks the same everywhere.
 export struct AccountItem {
@@ -245,6 +245,8 @@ component Blocks inherits VerticalLayout {
     // height at the width it will really have.
     in property <length> avail;
     callback link(string);
+    // The text selected in one of the blocks ("" when none is).
+    callback selected(string);
     spacing: 2px;
     for b in root.blocks: VerticalLayout {
         if b.kind == 0 && !Prefs.rich-text && !b.mention: TextInput {
@@ -256,6 +258,8 @@ component Blocks inherits VerticalLayout {
             color: root.faint ? Theme.muted : Theme.text;
             font-italic: root.faint;
             selection-background-color: Theme.accent.transparentize(0.55);
+            changed cursor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
+            changed anchor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
         }
         if b.kind == 0 && (Prefs.rich-text || b.mention): StyledText {
             width: root.avail;
@@ -275,6 +279,8 @@ component Blocks inherits VerticalLayout {
                 wrap: word-wrap;
                 color: Theme.muted;
                 selection-background-color: Theme.accent.transparentize(0.55);
+                changed cursor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
+                changed anchor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
             }
             if Prefs.rich-text || b.mention: StyledText {
                 width: root.avail - 11px;
@@ -301,6 +307,8 @@ component Blocks inherits VerticalLayout {
                     font-size: 13px;
                     color: Theme.text;
                     selection-background-color: Theme.accent.transparentize(0.55);
+                    changed cursor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
+                    changed anchor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
                 }
             }
         }
@@ -314,6 +322,8 @@ component Blocks inherits VerticalLayout {
             font-weight: 700;
             color: Theme.text;
             selection-background-color: Theme.accent.transparentize(0.55);
+            changed cursor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
+            changed anchor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
         }
         if b.kind == 3 && (Prefs.rich-text || b.mention): StyledText { width: root.avail; text: b.text; default-color: Theme.text; default-font-size: 17px; link-color: Theme.accent; link-clicked(l) => { root.link(l); } }
         if b.kind == 4: Rectangle { height: 6px; }
@@ -332,6 +342,8 @@ component MessageRow inherits Rectangle {
     callback pick-reaction();
     // Clicked the read receipts: everyone who read up to here.
     callback show-readers([Reader]);
+    // Text selected in the message, for the menu's Copy.
+    property <string> selection;
 
     background: area.has-hover ? Theme.hover : transparent;
     // Wraps the whole row, so it keeps its hover over names, pictures,
@@ -339,6 +351,8 @@ component MessageRow inherits Rectangle {
     area := TouchArea {
         cm := ContextMenuArea {
             Menu {
+                if root.selection != "": MenuItem { title: "Copy"; activated => { root.copy(root.selection); } }
+                if root.selection != "": MenuSeparator {}
                 if root.item.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.item.id); } }
                 if root.item.media == 2 || root.item.media == 3: MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
                 if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
@@ -354,7 +368,7 @@ component MessageRow inherits Rectangle {
                 if Prefs.menu-thread: MenuItem { title: "Reply in thread"; activated => { root.action("thread", root.item.id); } }
                 if Prefs.menu-forward: MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
                 if Prefs.menu-quote: MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
-                if Prefs.menu-copy: MenuItem { title: "Copy text"; activated => { root.copy(root.item.body); } }
+                if Prefs.menu-copy: MenuItem { title: "Copy whole message"; activated => { root.copy(root.item.body); } }
                 if Prefs.menu-select: MenuItem { title: "Select text…"; activated => { root.action("select", root.item.id); } }
                 if root.item.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
                 if Prefs.menu-open-links: Menu {
@@ -507,7 +521,7 @@ component MessageRow inherits Rectangle {
                             spacing: 4px;
                             for pic in root.item.big-emoji: Image { source: pic; width: 40px; height: 40px; }
                         }
-                        if root.item.media == 0 && root.item.big-emoji.length == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } }
+                        if root.item.media == 0 && root.item.big-emoji.length == 0: Blocks { avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } selected(t) => { root.selection = t; } }
                         if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
                         // Who really sent it: the warning always, the reason on hover.
                         if root.item.shield > 0: Text {
@@ -1059,6 +1073,7 @@ export component AppWindow inherits Window {
     in property <AccountForm> account-form;
     in property <AgentForm> agent-form;
     in property <[string]> models;
+    in property <[string]> image-models;
     in-out property <string> settings-message;
     in-out property <string> detect-status;
     in-out property <string> test-status;
@@ -1119,6 +1134,7 @@ export component AppWindow inherits Window {
     in property <image> card-picture;
     callback card-action(string, AgentForm);
     callback filter-models(string);
+    callback filter-image-models(string);
     callback create-room(string, string, bool, string, bool, string);
 
     // Opens a profile card at once with what we already know; Rust fills in the rest.
@@ -2038,6 +2054,7 @@ export component AppWindow inherits Window {
         account: root.account-form;
         agent: root.agent-form;
         models: root.models;
+        image-models: root.image-models;
         message <=> root.settings-message;
         detect-status <=> root.detect-status;
         test-status <=> root.test-status;
@@ -2064,6 +2081,7 @@ export component AppWindow inherits Window {
         card-picture: root.card-picture;
         card-action(a, f) => { root.activity(); root.card-action(a, f); }
         filter-models(q) => { root.filter-models(q); }
+        filter-image-models(q) => { root.filter-image-models(q); }
         change-passphrase(o, n) => { root.activity(); root.change-passphrase(o, n); }
         unlock-hidden(p) => { root.unlock-more(p); }
         create-hidden(p) => { root.create-hidden(p); }

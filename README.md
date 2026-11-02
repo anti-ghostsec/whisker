@@ -60,8 +60,9 @@ operating system and the **Wisp** browser.
   account should send it (skipped if you only have one), then which room, sends it, and opens
   that room. Several files at once are fine. On FerroOS it's in the Share box; elsewhere use
   "Open with" or run `whisker FILE…`. If Whisker is already open, the share goes to that
-  window; if it's locked, the share waits until you unlock. On Android it's in the system
-  Share menu.
+  window; if it's locked, the share waits until you unlock. Starting a different (newer)
+  build while an older one is open closes the old one, so the new one takes over. On
+  Android it's in the system Share menu.
 - **Forward** any message from its right-click menu to one or more of your rooms. Images
   and files are re-posted as the same file (nothing is downloaded or uploaded again);
   replies lose their reply link. Forwarding from an encrypted room into an unencrypted
@@ -79,9 +80,12 @@ operating system and the **Wisp** browser.
   joined shows as a space straight away (Whisker asks the server if its copy doesn't know).
   Right-click a room on the page to open or join it, see its info, invite people, mark it
   read, copy its address or leave it.
-- **Autocorrect** fixes common typos when you finish a word: "teh" → "the", "dont" →
-  "don't", a lone "i" → "I". Backspace straight after a fix keeps what you typed (and that
-  word isn't fixed again). Turn it off in Settings.
+- **Autocorrect** fixes typos when you finish a word: common ones ("teh" → "the", "dont" →
+  "don't", a lone "i" → "I"), and any word that isn't English but is one slip (swapped,
+  extra, missing or wrong letter) from exactly one word that is: "thnig" → "thing",
+  "messgae" → "message". When two words fit equally it leaves yours alone. Backspace
+  straight after a fix keeps what you typed (and that word isn't fixed again). Turn it off
+  in Settings. The word list comes from SCOWL (`apps/whisker/assets/words-LICENSE.txt`).
 - **Right-click to cut, copy, paste or select all** in every text box and the composer, and
   to copy addresses, descriptions and pinned messages in the side panel.
 - **Room keys:** Settings → account → *Export or import room keys* saves your message keys
@@ -145,6 +149,7 @@ operating system and the **Wisp** browser.
   (click anyone to see their profile), inviting people, and editing the name/description if
   you're allowed.
 - **Your profile**: change your display name and picture in Settings → your account.
+- **Select part of a message** and right-click for *Copy* (or Ctrl+C).
 - **Right-click a message** to reply, quote, copy its text, select part of it, save its
   file, copy a link to it, show its source, edit or delete it, or kick/ban its sender if
   you're a moderator. Settings → *Message menu* turns each entry on or off.
@@ -158,8 +163,9 @@ operating system and the **Wisp** browser.
   *Longest reply posted* caps replies in characters (cut at the last sentence that fits),
   and *Let the AI see pictures* (off by default) sends the newest pictures in the
   conversation (and a picture someone replies to), shrunk to 1024 px, to models that can
-  see images. For a chat model that can't, set a *Picture model* on the same API: it
-  describes each picture in words for the chat model. An AI answers when it's named,
+  see images. For a chat model that can't, pick a *Picture model* from the list of the
+  service's models that can see (or type one): it describes each picture in words for the
+  chat model. Saving warns when the chat model probably can't see and no picture model is set. An AI answers when it's named,
   mentioned, or someone replies to one of its messages.
 - **Character cards.** On an AI's page, *Import card…* reads Tavern / SillyTavern character
   cards, versions 1, 2 and 3, as `.json` or as `.png` (the card hidden in the picture,

@@ -181,15 +181,62 @@ fn socket(dir: &Path) -> PathBuf {
 }
 
 /// If Whisker is already open on `dir`, gives it `items` (or just brings it
-/// forward) and returns true: this copy should then quit.
+/// forward) and returns true: this copy should then quit. An open Whisker
+/// from an older build closes instead, and this one takes over (false).
 #[cfg(unix)]
 pub fn hand_off(dir: &Path, items: &[Shared]) -> bool {
-    use std::io::Write;
-    let Ok(mut s) = std::os::unix::net::UnixStream::connect(socket(dir)) else { return false };
-    if let Err(e) = s.write_all(&encode(items)) {
+    use std::io::{Read, Write};
+    let path = socket(dir);
+    let Ok(mut s) = std::os::unix::net::UnixStream::connect(&path) else { return false };
+    let mut msg = BUILD.to_vec();
+    let me = build_id();
+    msg.extend((me.len() as u32).to_le_bytes());
+    msg.extend(me.as_bytes());
+    msg.extend(encode(items));
+    if let Err(e) = s.write_all(&msg) {
         tracing::warn!("couldn't pass the share to the open Whisker: {e}");
+        return true;
     }
-    true
+    let _ = s.shutdown(std::net::Shutdown::Write);
+    // It answers "new" when it's an older build and is closing.
+    let mut answer = Vec::new();
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = s.read_to_end(&mut answer);
+    if answer != b"new" {
+        return true;
+    }
+    // Wait for it to lock up and let go of the socket.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while path.exists() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+/// Which build of Whisker this is: the program file's size and time.
+fn build_id() -> String {
+    let meta = std::env::current_exe().and_then(std::fs::metadata);
+    match meta {
+        Ok(m) => format!("{}-{:?}", m.len(), m.modified().ok()),
+        Err(_) => env!("CARGO_PKG_VERSION").to_owned(),
+    }
+}
+
+/// Before a share: who's sending it ([`build_id`]).
+const BUILD: &[u8; 4] = b"WSKB";
+
+/// The sender's build and the rest of the message.
+fn split_build(b: &[u8]) -> (Option<String>, &[u8]) {
+    let parse = || {
+        let rest = b.strip_prefix(BUILD.as_slice())?;
+        let n = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let id = std::str::from_utf8(rest.get(4..4 + n)?).ok()?.to_owned();
+        Some((id, rest.get(4 + n..)?))
+    };
+    match parse() {
+        Some((id, rest)) => (Some(id), rest),
+        None => (None, b),
+    }
 }
 
 #[cfg(not(unix))]
@@ -197,9 +244,10 @@ pub fn hand_off(_dir: &Path, _items: &[Shared]) -> bool {
     false
 }
 
-/// Listens for later copies of Whisker handing over shares.
+/// Listens for later copies of Whisker handing over shares. A copy from a
+/// newer build gets told so, and `on_newer` runs (to close this one).
 #[cfg(unix)]
-pub fn listen(dir: &Path) {
+pub fn listen(dir: &Path, on_newer: impl Fn() + Send + 'static) {
     use std::io::Read;
     use std::os::unix::net::UnixListener;
     let path = socket(dir);
@@ -217,15 +265,24 @@ pub fn listen(dir: &Path) {
         for conn in listener.incoming().flatten() {
             let mut buf = Vec::new();
             // Room for a handful of files at the upload limit, no more.
-            if conn.take(8 * (MAX_FILE + 4096)).read_to_end(&mut buf).is_ok() {
-                deliver(decode(&buf).unwrap_or_default());
+            let mut conn = conn;
+            if (&mut conn).take(8 * (MAX_FILE + 4096)).read_to_end(&mut buf).is_ok() {
+                let (sender, rest) = split_build(&buf);
+                if sender.is_some_and(|b| b != build_id()) {
+                    use std::io::Write;
+                    let _ = conn.write_all(b"new");
+                    drop(conn);
+                    on_newer();
+                    return;
+                }
+                deliver(decode(rest).unwrap_or_default());
             }
         }
     });
 }
 
 #[cfg(not(unix))]
-pub fn listen(_dir: &Path) {}
+pub fn listen(_dir: &Path, _on_newer: impl Fn() + Send + 'static) {}
 
 /// Removes the socket when Whisker closes.
 pub fn stop_listening(dir: &Path) {
@@ -460,6 +517,8 @@ mod tests {
         assert_eq!(decode(&encode(&[])), Some(Vec::new()));
         assert_eq!(decode(b"WSK1\0\x09"), None);
         assert_eq!(decode(b"nope"), None);
+        assert_eq!(split_build(b"WSKB\x03\0\0\0abcWSK1"), (Some("abc".to_owned()), b"WSK1".as_slice()));
+        assert_eq!(split_build(b"WSK1"), (None, b"WSK1".as_slice()));
     }
 
     #[test]

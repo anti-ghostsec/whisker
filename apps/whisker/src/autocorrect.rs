@@ -1,8 +1,31 @@
-//! Fixing common typos as you type, like a phone keyboard: when a word is
-//! finished (space or punctuation after it), a known misspelling is swapped
-//! for the right word. Only sure fixes: misspellings that aren't words
-//! themselves, missing apostrophes, and a lone "i". Pressing Backspace right
-//! after a fix puts your word back (see `draft_edited`).
+//! Fixing typos as you type, like a phone keyboard: when a word is finished
+//! (space or punctuation after it), a misspelling is swapped for the right
+//! word. First a list of common ones (missing apostrophes, a lone "i"),
+//! then any word that isn't in the English word list but is one slip away
+//! from exactly one word that is: two letters swapped, one letter extra,
+//! missing or wrong. When two words are equally close it's left alone.
+//! Pressing Backspace right after a fix puts your word back (see
+//! `fix_typing`).
+//!
+//! The word list is made from the SCOWL en_US Hunspell dictionary (see
+//! `assets/words-LICENSE.txt`).
+
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+static WORD_LIST: &str = include_str!("../assets/words.txt");
+
+fn words() -> &'static HashSet<&'static str> {
+    static WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    WORDS.get_or_init(|| WORD_LIST.lines().collect())
+}
+
+/// Loads the word list ahead of the first finished word.
+pub fn warm() {
+    std::thread::spawn(|| {
+        words();
+    });
+}
 
 /// The word `word` should become, keeping a capital first letter.
 pub fn fix(word: &str) -> Option<String> {
@@ -19,12 +42,91 @@ pub fn fix(word: &str) -> Option<String> {
     if !rest_lower {
         return None;
     }
-    let right = FIXES.binary_search_by(|(w, _)| w.cmp(&lower.as_str())).ok().map(|i| FIXES[i].1)?;
+    let right = match FIXES.binary_search_by(|(w, _)| w.cmp(&lower.as_str())) {
+        Ok(i) => FIXES[i].1.to_owned(),
+        Err(_) => nearest(&lower)?,
+    };
     if first_upper {
         let mut c = right.chars();
         Some(c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default())
     } else {
-        Some(right.to_owned())
+        Some(right)
+    }
+}
+
+/// The one word `typed` is a slip away from, if it isn't a word itself.
+/// Two words at the same distance is a guess, so none (unless one is a
+/// swap, or a neighbouring key, and the other candidates are few).
+fn nearest(typed: &str) -> Option<String> {
+    let words = words();
+    // Short words are too often names, slang or other languages.
+    if typed.chars().count() < 4 || !typed.is_ascii() || words.contains(typed) {
+        return None;
+    }
+    let b = typed.as_bytes();
+    let n = b.len();
+    let letters = b'a'..=b'z';
+    let swapped = (0..n - 1).map(|i| {
+        let mut v = b.to_vec();
+        v.swap(i, i + 1);
+        v
+    });
+    let extra = (0..n).map(|i| [&b[..i], &b[i + 1..]].concat());
+    let missing = (0..=n).flat_map(|i| letters.clone().map(move |c| [&b[..i], &[c], &b[i..]].concat()));
+    let next_key = (0..n).flat_map(|i| neighbours(b[i]).iter().map(move |&c| [&b[..i], &[c], &b[i + 1..]].concat()));
+    let wrong = (0..n).flat_map(|i| letters.clone().map(move |c| [&b[..i], &[c], &b[i + 1..]].concat()));
+    let found = |slips: Box<dyn Iterator<Item = Vec<u8>> + '_>| -> HashSet<String> {
+        slips.filter_map(|v| String::from_utf8(v).ok()).filter(|w| w != typed && words.contains(w.as_str())).collect()
+    };
+    // Two letters swapped is the likeliest slip of all.
+    let swaps = found(Box::new(swapped));
+    if swaps.len() == 1 {
+        return swaps.into_iter().next();
+    }
+    let mut near = found(Box::new(extra.chain(missing).chain(wrong)));
+    near.extend(swaps);
+    if near.len() == 1 {
+        return near.into_iter().next();
+    }
+    // Several: only a wrong letter on a key next to the right one, if
+    // that's a single word.
+    let keyed = found(Box::new(next_key));
+    if keyed.len() == 1 && near.len() <= 3 {
+        return keyed.into_iter().next();
+    }
+    None
+}
+
+/// Keys next to `c` on a QWERTY keyboard.
+fn neighbours(c: u8) -> &'static [u8] {
+    match c {
+        b'q' => b"wa",
+        b'w' => b"qeas",
+        b'e' => b"wrsd",
+        b'r' => b"etdf",
+        b't' => b"ryfg",
+        b'y' => b"tugh",
+        b'u' => b"yihj",
+        b'i' => b"uojk",
+        b'o' => b"ipkl",
+        b'p' => b"ol",
+        b'a' => b"qwsz",
+        b's' => b"weadzx",
+        b'd' => b"ersfxc",
+        b'f' => b"rtdgcv",
+        b'g' => b"tyfhvb",
+        b'h' => b"yugjbn",
+        b'j' => b"uihknm",
+        b'k' => b"iojlm",
+        b'l' => b"opk",
+        b'z' => b"asx",
+        b'x' => b"zsdc",
+        b'c' => b"xdfv",
+        b'v' => b"cfgb",
+        b'b' => b"vghn",
+        b'n' => b"bhjm",
+        b'm' => b"njk",
+        _ => b"",
     }
 }
 
@@ -236,5 +338,23 @@ mod tests {
         assert_eq!(fix("the"), None);
         assert_eq!(fix("http"), None);
         assert_eq!(fix("don't"), None);
+    }
+
+    #[test]
+    fn fixes_slips_from_the_word_list() {
+        assert_eq!(fix("thnig").as_deref(), Some("thing"));
+        assert_eq!(fix("turnming").as_deref(), Some("turning"));
+        // "hing" and "hiding" are both one slip away: a guess, so left alone.
+        assert_eq!(fix("hidng"), None);
+        assert_eq!(fix("exspected").as_deref(), Some("expected"));
+        assert_eq!(fix("messgae").as_deref(), Some("message"));
+        assert_eq!(fix("intresting").as_deref(), Some("interesting"));
+        // "correct" or "current"? Without knowing which is commoner, neither.
+        assert_eq!(fix("currect"), None);
+        assert_eq!(fix("Contexr").as_deref(), Some("Context"));
+        // Real words, short words and close calls stay as typed.
+        assert_eq!(fix("context"), None);
+        assert_eq!(fix("ther"), None);
+        assert_eq!(fix("meny"), None);
     }
 }

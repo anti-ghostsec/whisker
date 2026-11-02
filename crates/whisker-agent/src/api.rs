@@ -53,6 +53,9 @@ pub struct Detected {
     pub endpoint: String,
     pub service: String,
     pub models: Vec<String>,
+    /// The ones among `models` that can see pictures (by what the service
+    /// says, or by name).
+    pub vision: Vec<String>,
 }
 
 fn http() -> reqwest::Client {
@@ -95,6 +98,35 @@ fn service_name(url: &reqwest::Url) -> String {
     host.to_owned()
 }
 
+/// Whether a model's name says it can see pictures (for services whose
+/// model list doesn't).
+pub fn looks_vision(name: &str) -> bool {
+    let n = name.to_lowercase();
+    ["vision", "-vl", "_vl", "vl-", "llava", "pixtral", "gpt-4o", "gpt-4.1", "gpt-5", "claude", "gemini", "gemma-3", "gemma3",
+        "mistral-small-3", "mistral-31", "mistral-medium", "llama-4", "llama4", "minicpm-v", "moondream", "qwen2.5-vl", "qwen-vl", "grok-2-vision", "grok-4"]
+        .iter()
+        .any(|k| n.contains(k))
+}
+
+/// The models in a model list that can see pictures: what the service
+/// says (Venice, OpenRouter), else a guess from the name.
+fn vision(v: &Value, list: &str, field: &str) -> Vec<String> {
+    let Some(arr) = v.get(list).and_then(Value::as_array) else { return Vec::new() };
+    let mut out: Vec<String> = arr
+        .iter()
+        .filter_map(|m| {
+            let id = m.get(field)?.as_str()?;
+            let said = m.pointer("/model_spec/capabilities/supportsVision").and_then(Value::as_bool).or_else(|| {
+                let inputs = m.pointer("/architecture/input_modalities")?.as_array()?;
+                Some(inputs.iter().any(|i| i == "image"))
+            });
+            said.unwrap_or_else(|| looks_vision(id)).then(|| id.to_owned())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 fn ids(v: &Value, list: &str, field: &str) -> Option<Vec<String>> {
     let arr = v.get(list)?.as_array()?;
     let mut out: Vec<String> = arr.iter().filter_map(|m| m.get(field)?.as_str().map(str::to_owned)).collect();
@@ -120,8 +152,8 @@ pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
     // A full endpoint URL was pasted: trust its shape.
     for (suffix, format) in [("/chat/completions", ApiFormat::OpenAiChat), ("/messages", ApiFormat::AnthropicMessages)] {
         if let Some(base) = full.strip_suffix(suffix) {
-            let models = list_models(&c, base, format, key).await.unwrap_or_default();
-            return Ok(Detected { format, endpoint: full.clone(), service, models });
+            let (models, vision) = list_models(&c, base, format, key).await.unwrap_or_default();
+            return Ok(Detected { format, endpoint: full.clone(), service, models, vision });
         }
     }
 
@@ -143,9 +175,9 @@ pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
     for format in order {
         for base in &bases {
             match list_models(&c, base, format, key).await {
-                Ok(models) => {
+                Ok((models, vision)) => {
                     let path = if format == ApiFormat::OpenAiChat { "chat/completions" } else { "messages" };
-                    return Ok(Detected { format, endpoint: format!("{base}/{path}"), service, models });
+                    return Ok(Detected { format, endpoint: format!("{base}/{path}"), service, models, vision });
                 }
                 Err(e) if e.to_string() == "unauthorized" => rejected = true,
                 Err(_) => {}
@@ -161,6 +193,7 @@ pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
             format: ApiFormat::OpenAiChat,
             endpoint: format!("{origin}/v1/chat/completions"),
             service: "Ollama".into(),
+            vision: models.iter().filter(|m| looks_vision(m)).cloned().collect(),
             models,
         });
     }
@@ -171,7 +204,8 @@ pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
     bail!("couldn't find an AI API at that address")
 }
 
-async fn list_models(c: &reqwest::Client, base: &str, format: ApiFormat, key: Option<&str>) -> Result<Vec<String>> {
+/// The service's models, and the ones among them that can see pictures.
+async fn list_models(c: &reqwest::Client, base: &str, format: ApiFormat, key: Option<&str>) -> Result<(Vec<String>, Vec<String>)> {
     let mut req = c.get(format!("{base}/models"));
     match format {
         ApiFormat::AnthropicMessages => {
@@ -199,12 +233,26 @@ async fn list_models(c: &reqwest::Client, base: &str, format: ApiFormat, key: Op
     if format == ApiFormat::AnthropicMessages && !looks_anthropic && v["data"].as_array().is_some_and(|a| !a.is_empty()) {
         bail!("not an Anthropic-style API");
     }
-    ids(&v, "data", "id").ok_or_else(|| anyhow!("no model list"))
+    let models = ids(&v, "data", "id").ok_or_else(|| anyhow!("no model list"))?;
+    Ok((models, vision(&v, "data", "id")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_vision_models() {
+        let v = serde_json::json!({"data": [
+            {"id": "venice-uncensored", "model_spec": {"capabilities": {"supportsVision": false}}},
+            {"id": "mistral-31-24b", "model_spec": {"capabilities": {"supportsVision": true}}},
+            {"id": "a/text", "architecture": {"input_modalities": ["text"]}},
+            {"id": "a/sees", "architecture": {"input_modalities": ["text", "image"]}},
+            {"id": "llava:13b"},
+            {"id": "llama3:8b"},
+        ]});
+        assert_eq!(vision(&v, "data", "id"), ["a/sees", "llava:13b", "mistral-31-24b"]);
+    }
 
     #[test]
     fn normalizes() {

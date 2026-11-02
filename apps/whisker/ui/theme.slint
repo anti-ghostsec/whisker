@@ -19,6 +19,12 @@ export global Theme {
     out property <[color]> hues: [#7b6cf6, #2f9e8f, #d9822b, #c2477e, #3d7be0, #7f8f25, #b5523b, #5a6be0];
 }
 
+// Helpers the Rust side provides.
+export global TextTools {
+    // The part of `text` between two byte offsets (a selection), in either order.
+    pure callback slice(string, int, int) -> string;
+}
+
 export global Prefs {
     // Rich (styled, clickable links) vs plain drag-selectable message text.
     in-out property <bool> rich-text: false;

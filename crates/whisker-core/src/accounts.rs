@@ -466,7 +466,9 @@ impl AccountManager {
         if let Some(p) = proxy {
             b = b.proxy(p);
         }
-        Ok(b.build().await?)
+        let client = b.build().await?;
+        client.set_media_fetcher(std::sync::Arc::new(crate::media_fetch::WithFallback)).await;
+        Ok(client)
     }
 
     async fn restore(&self, vault: &str, mut record: AccountRecord) -> Result<()> {

@@ -17,6 +17,8 @@ eyeball = "0.8.8"
 # Same version matrix-sdk-sqlite uses, for consistent snapshots of its databases.
 rusqlite = { version = "0.40.2", default-features = false }
 matrix-sdk.workspace = true
+# Its media decryptor, which matrix-sdk doesn't re-export.
+matrix-sdk-base = { version = "0.19.1", default-features = false, features = ["e2e-encryption"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

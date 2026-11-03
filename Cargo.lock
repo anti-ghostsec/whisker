@@ -8482,6 +8482,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "matrix-sdk",
+ "matrix-sdk-base",
  "matrix-sdk-test",
  "mime_guess",
  "reqwest",

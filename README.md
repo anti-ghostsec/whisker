@@ -82,7 +82,9 @@ operating system and the **Wisp** browser.
   (the sender's thumbnail, the server's, the file itself; a server thumbnail also turns pictures
   Whisker can't read, like AVIF or HEIC, into ones it can). If the server doesn't answer, it
   tries again a few times over the next minutes, then shows "Couldn't load the image"; click it
-  to try again.
+  to try again. Servers that list the newer logged-in media addresses but turn some files down
+  there ("Unrecognized request"), as some matrix-media-repo setups do, get asked at the older
+  address instead.
 - **Images and videos:** right-click the picture or video itself to save it; the full-size
   viewer has Save / Forward / Close buttons and its own right-click menu. **GIFs and
   animated WebP play and loop**, in the timeline and the viewer. Videos show their preview

@@ -194,6 +194,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-notify-level(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
+    callback set-link-posters(bool);
     callback set-clear-command(string);
     callback set-menu-entry(string, bool);
     in-out property <int> auto-lock;
@@ -296,6 +297,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.autocorrect;
                 toggled => { root.set-autocorrect(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Preview frames for video links"; color: Theme.text; }
+                Text {
+                    text: "Sending a video's link (mxc://…) uploads one small still from it, so other apps show a picture instead of a blank box. The video itself is never uploaded again.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.link-posters;
+                toggled => { root.set-link-posters(self.checked); }
             }
         }
     }
@@ -968,6 +985,7 @@ export component SettingsPage inherits Rectangle {
     callback set-send-typing(bool);
     callback set-clear-command(string);
     callback set-autocorrect(bool);
+    callback set-link-posters(bool);
     callback set-menu-entry(string, bool);
     callback save-account(AccountForm);
     callback profile-edit(string, string, string);
@@ -1059,6 +1077,7 @@ export component SettingsPage inherits Rectangle {
                             set-send-typing(b) => { root.set-send-typing(b); }
                             set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }
+                            set-link-posters(b) => { root.set-link-posters(b); }
                             set-menu-entry(k, b) => { root.set-menu-entry(k, b); }
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }
                             unlock-hidden(p) => { root.unlock-hidden(p); }

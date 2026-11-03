@@ -74,15 +74,27 @@ operating system and the **Wisp** browser.
   app as text) shows the file itself. Media download addresses
   (`https://…/_matrix/…/download/server/id`) work too. An encrypted file's address can't
   open it without the message's key, so its link is a matrix.to link to the message: sending
-  that re-posts the file, for people who can see the original room.
+  that re-posts the file, for people who can see the original room. A video's link goes with
+  its size and length, read from just the parts of the video that hold them, and a small preview
+  frame is uploaded so other apps show a picture (Settings can turn that off). Whisker reads the
+  video through a private relay on this computer, so your login never reaches ffmpeg.
+- **Pictures from other servers:** when one doesn't load, Whisker tries its other forms in turn
+  (the sender's thumbnail, the server's, the file itself; a server thumbnail also turns pictures
+  Whisker can't read, like AVIF or HEIC, into ones it can). If the server doesn't answer, it
+  tries again a few times over the next minutes, then shows "Couldn't load the image"; click it
+  to try again.
 - **Images and videos:** right-click the picture or video itself to save it; the full-size
   viewer has Save / Forward / Close buttons and its own right-click menu. **GIFs and
   animated WebP play and loop**, in the timeline and the viewer. Videos show their preview
   frame (when they were sent without one, and are under 200 MB, Whisker makes one with
-  ffmpeg if it's installed; videos you send get one the same way). Click a video to **play it
-  right there in the message**, with sound, pause, a seek bar and mute (on Linux, with ffmpeg
-  installed; it plays through PulseAudio/PipeWire, else ALSA). One plays at a time, and it stops
-  when you switch rooms. Without ffmpeg, and on other systems, it opens in mpv or your
+  ffmpeg if it's installed, reading only the parts of the video it needs where it can; videos
+  you send get one the same way). Click a video to **play it right there in the message**, with
+  pause, a seek bar, sound and its subtitles (on Linux, with ffmpeg installed; sound goes through
+  PulseAudio/PipeWire, else ALSA). Videos start muted: click the speaker for sound. Subtitles
+  inside the video (SRT, ASS, WebVTT, MP4 text, or picture subtitles from Blu-ray and DVD rips)
+  are drawn on it; the CC button hides them. The corners button (or a double-click) shows it
+  **large**, over the whole window; Esc, ✕ or the button again brings it back. One plays at a
+  time, and it stops when you switch rooms. Without ffmpeg, and on other systems, it opens in mpv or your
   system's player. The copy goes to the RAM folder and is deleted when you lock or quit.
 - **Spaces** show as folders in the room list, holding their rooms and sub-spaces (a folded
   space shows the unread count of everything inside). Clicking a space opens its page: every

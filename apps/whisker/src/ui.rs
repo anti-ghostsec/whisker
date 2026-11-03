@@ -220,6 +220,8 @@ pub struct MsgRow {
     pub day: String,
     pub reply: Option<(String, String)>,
     pub picture: Option<Pixels>,
+    /// Its preview couldn't be loaded.
+    pub picture_failed: bool,
     /// Animated pictures: all frames.
     pub frames: Option<Frames>,
     /// People whose read receipt lands on this message: (name, avatar).
@@ -270,7 +272,7 @@ impl Models {
         let loaded = |m: &Option<OwnedMxcUri>| m.as_ref().is_some_and(|m| matches!(pixels.lock().unwrap().get(m), Some(Some(_))));
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", r.item).hash(&mut h);
-        (r.mine, r.first, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust, RICH.get()).hash(&mut h);
+        (r.mine, r.first, r.picture_failed, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust, RICH.get()).hash(&mut h);
         r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
         r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
         loaded(&r.item.sender_avatar).hash(&mut h);
@@ -354,6 +356,7 @@ impl Models {
             media_name: s(media_name),
             media_info: s(media_info),
             picture: r.picture.as_ref().map(|p| Image::from_rgba8(p.clone())).unwrap_or_default(),
+            picture_failed: r.picture_failed,
             frames: ModelRc::new(VecModel::from(
                 r.frames.as_ref().map(|f| f.0.iter().map(|p| Image::from_rgba8(p.clone())).collect::<Vec<_>>()).unwrap_or_default(),
             )),

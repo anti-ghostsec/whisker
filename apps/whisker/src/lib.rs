@@ -112,6 +112,8 @@ struct State {
     /// What the servers said about files linked in messages (`None`: they
     /// couldn't say), by address.
     linked: HashMap<OwnedMxcUri, Option<files::LinkedFile>>,
+    /// Previews whose server didn't answer: how many times tried.
+    picture_tries: HashMap<OwnedEventId, u8>,
     /// Decoded image previews, by event.
     pictures: HashMap<OwnedEventId, Option<Pixels>>,
     /// Read receipts per room, worked out when they change (it reads every
@@ -227,14 +229,77 @@ fn play_file(path: &std::path::Path, video: bool) {
     }
 }
 
+/// One way to get a message's preview: what to download (a thumbnail the
+/// server makes, this many pixels across, or the file itself), and what it is.
+type Attempt = (MediaSource, Option<u32>, Preview);
+
+/// Times a preview is tried before it shows as failed, when the server
+/// doesn't answer.
+const PREVIEW_TRIES: u8 = 4;
+
+/// Biggest picture downloaded whole when no thumbnail can be had.
+const MAX_FULL_PICTURE_BYTES: u64 = 25 * 1024 * 1024;
+
+/// The ways to get `media`'s preview, best first: the sender's thumbnail,
+/// one the server makes (it also turns pictures we can't read, like AVIF
+/// or HEIC, into ones we can), then the file itself.
+fn preview_attempts(media: &timeline::Media) -> Vec<Attempt> {
+    let plain = matches!(media.source, MediaSource::Plain(_));
+    let fits = |max: u64| media.size.is_none_or(|s| s <= max);
+    let mut out = Vec::new();
+    match media.kind {
+        MediaKind::Image => {
+            let animated = matches!(media.mime.as_deref(), Some("image/gif" | "image/webp")) && fits(MAX_ANIMATION_BYTES);
+            if animated {
+                out.push((media.source.clone(), None, Preview::Animated));
+            }
+            if let Some(t) = &media.thumbnail {
+                out.push((t.clone(), None, Preview::Still));
+            }
+            if plain {
+                out.push((media.source.clone(), Some(640), Preview::Still));
+            }
+            if !animated && fits(MAX_FULL_PICTURE_BYTES) {
+                out.push((media.source.clone(), None, Preview::Still));
+            }
+        }
+        MediaKind::Video => {
+            if let Some(t) = &media.thumbnail {
+                out.push((t.clone(), None, Preview::Still));
+            }
+            // Sent without a poster (or it won't load): make one from the
+            // video, reading only what's needed of it where it can.
+            if plain {
+                out.push((media.source.clone(), None, Preview::Remote));
+            }
+            if fits(MAX_POSTER_VIDEO_BYTES) {
+                out.push((media.source.clone(), None, Preview::Video));
+            }
+        }
+        MediaKind::Audio | MediaKind::File => {}
+    }
+    out
+}
+
+/// A file's `mxc://` address, for messages.
+fn media_address(src: &MediaSource) -> &str {
+    match src {
+        MediaSource::Plain(u) => u.as_str(),
+        MediaSource::Encrypted(f) => f.url.as_str(),
+    }
+}
+
 /// What a message preview is made from.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Preview {
     Still,
     /// A GIF or WebP: every frame.
     Animated,
     /// A whole video, for a poster frame.
     Video,
+    /// A poster frame read from a video on the server, through a relay
+    /// (only the parts needed are fetched).
+    Remote,
 }
 
 /// A poster frame (JPEG) for a downloaded video, via ffmpeg.
@@ -375,34 +440,18 @@ impl Ctl {
     /// the network threads.
     fn fetch_pictures(&self, key: &RoomKey, items: &[HistoryItem]) {
         let items = &self.resolve_links(key, items);
-        // (event, source, ask the server for a thumbnail, what it is)
-        let wanted: Vec<(OwnedEventId, MediaSource, bool, Preview)> = {
+        let wanted: Vec<(OwnedEventId, Vec<Attempt>)> = {
             let st = self.st.lock().unwrap();
             let mut loading = self.loading.lock().unwrap();
             items
                 .iter()
                 .filter_map(|m| {
                     let media = m.media.as_ref()?;
-                    if st.pictures.contains_key(&m.event_id) || !loading.insert(m.event_id.to_string()) {
+                    if st.pictures.contains_key(&m.event_id) {
                         return None;
                     }
-                    let animated = media.kind == MediaKind::Image
-                        && matches!(media.mime.as_deref(), Some("image/gif" | "image/webp"))
-                        && media.size.is_none_or(|s| s <= MAX_ANIMATION_BYTES);
-                    match (media.kind, &media.thumbnail) {
-                        (MediaKind::Image, _) if animated => Some((m.event_id.clone(), media.source.clone(), false, Preview::Animated)),
-                        (MediaKind::Image, Some(t)) => Some((m.event_id.clone(), t.clone(), false, Preview::Still)),
-                        (MediaKind::Image, None) => Some((m.event_id.clone(), media.source.clone(), true, Preview::Still)),
-                        (MediaKind::Video, Some(t)) => Some((m.event_id.clone(), t.clone(), false, Preview::Still)),
-                        // Sent without a poster: make one from the video.
-                        (MediaKind::Video, None) if media.size.is_none_or(|s| s <= MAX_POSTER_VIDEO_BYTES) => {
-                            Some((m.event_id.clone(), media.source.clone(), false, Preview::Video))
-                        }
-                        _ => {
-                            loading.remove(m.event_id.as_str());
-                            None
-                        }
-                    }
+                    let attempts = preview_attempts(media);
+                    (!attempts.is_empty() && loading.insert(m.event_id.to_string())).then(|| (m.event_id.clone(), attempts))
                 })
                 .collect()
         };
@@ -413,21 +462,67 @@ impl Ctl {
         self.spawn(async move {
             let Some(client) = c.mgr.client(account).await else { return };
             let slots = Arc::new(tokio::sync::Semaphore::new(4));
-            for (id, src, thumb, what) in wanted {
+            for (id, attempts) in wanted {
                 let (c, client, room, slots) = (c.clone(), client.clone(), room.clone(), slots.clone());
                 tokio::spawn(async move {
                     let _slot = slots.acquire().await;
-                    let bytes = timeline::download(&client, &src, thumb.then_some(640)).await.ok();
-                    let decoded = match bytes {
-                        Some(b) => tokio::task::spawn_blocking(move || match what {
-                            Preview::Video => (poster_of(&b).and_then(|jpeg| decode(&jpeg, 720, 600, false)), None),
-                            Preview::Animated => (decode(&b, 720, 600, false), ui::decode_frames(&b, 720, 600)),
-                            Preview::Still => (decode(&b, 720, 600, false), None),
-                        })
-                        .await
-                        .unwrap_or((None, None)),
-                        None => (None, None),
-                    };
+                    // Each way in turn: another server may not make thumbnails,
+                    // or send one we can't read.
+                    let (mut decoded, mut unreachable) = ((None, None), false);
+                    for (src, thumb, what) in attempts {
+                        if let (Preview::Remote, MediaSource::Plain(mxc)) = (what, &src) {
+                            let poster = files::look_at_video(&client, mxc, true).await.and_then(|(_, p)| p);
+                            match poster {
+                                Some(p) => {
+                                    decoded = (tokio::task::spawn_blocking(move || decode(&p.jpeg, 720, 600, false)).await.ok().flatten(), None);
+                                    if decoded.0.is_some() {
+                                        break;
+                                    }
+                                }
+                                None => tracing::debug!("couldn't read a frame of {mxc} through the relay"),
+                            }
+                            continue;
+                        }
+                        match timeline::download(&client, &src, thumb).await {
+                            Ok(b) => {
+                                decoded = tokio::task::spawn_blocking(move || match what {
+                                    Preview::Video => (poster_of(&b).and_then(|jpeg| decode(&jpeg, 720, 600, false)), None),
+                                    Preview::Animated => (decode(&b, 720, 600, false), ui::decode_frames(&b, 720, 600)),
+                                    Preview::Still | Preview::Remote => (decode(&b, 720, 600, false), None),
+                                })
+                                .await
+                                .unwrap_or((None, None));
+                                if decoded.0.is_some() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                unreachable = true;
+                                tracing::warn!("couldn't fetch a preview of {id} ({}): {e:#}", media_address(&src));
+                            }
+                        }
+                    }
+                    // The server didn't answer (a busy one fetching it from
+                    // another server, or offline): try again a little later.
+                    if decoded.0.is_none() && unreachable {
+                        let tries = {
+                            let mut st = c.st.lock().unwrap();
+                            let n = st.picture_tries.entry(id.clone()).or_default();
+                            *n += 1;
+                            *n
+                        };
+                        if tries < PREVIEW_TRIES {
+                            drop(_slot);
+                            tokio::time::sleep(Duration::from_secs(15 << tries)).await;
+                            c.loading.lock().unwrap().remove(id.as_str());
+                            let key = (account, room);
+                            let item = c.st.lock().unwrap().messages.get(&key).and_then(|l| l.iter().find(|m| m.event_id == id).cloned());
+                            if let Some(item) = item {
+                                c.fetch_pictures(&key, &[item]);
+                            }
+                            return;
+                        }
+                    }
                     {
                         let mut st = c.st.lock().unwrap();
                         st.pictures.insert(id.clone(), decoded.0);
@@ -440,6 +535,17 @@ impl Ctl {
                 });
             }
         });
+    }
+
+    /// Forgets a preview that couldn't be loaded and tries again.
+    fn retry_picture(&self, key: &RoomKey, m: HistoryItem) {
+        {
+            let mut st = self.st.lock().unwrap();
+            st.pictures.remove(&m.event_id);
+            st.picture_tries.remove(&m.event_id);
+        }
+        self.update_message(key, &m.event_id);
+        self.fetch_pictures(key, &[m]);
     }
 
     /// Messages that are only a file's link show that file: asks its
@@ -897,6 +1003,7 @@ impl Ctl {
                 });
                 MsgRow {
                     picture: st.pictures.get(&m.event_id).cloned().flatten(),
+                    picture_failed: matches!(st.pictures.get(&m.event_id), Some(None)),
                     frames: st.animations.get(&m.event_id).cloned(),
                     mine: me.as_ref() == Some(&m.sender),
                     first,
@@ -1954,16 +2061,30 @@ impl Ctl {
                         return true;
                     }
                 };
-                // A picture's size, so it gets its space before it loads.
-                let size = match file.kind() {
+                // A picture's or video's size (so it gets its space before
+                // it loads), a video's length, and its preview frame.
+                let mut details = files::Details::default();
+                match file.kind() {
                     MediaKind::Image if file.size.is_none_or(|n| n <= MAX_LINKED_PICTURE_BYTES) => {
-                        timeline::download(&client, &MediaSource::Plain(mxc.clone()), None).await.ok().and_then(|b| {
+                        details.size = timeline::download(&client, &MediaSource::Plain(mxc.clone()), None).await.ok().and_then(|b| {
                             image::ImageReader::new(std::io::Cursor::new(b)).with_guessed_format().ok()?.into_dimensions().ok()
-                        })
+                        });
                     }
-                    _ => None,
-                };
-                match files::send_linked(room, &mxc, &file, size, reply_to).await {
+                    MediaKind::Video => {
+                        self.status("Reading the video…");
+                        let posters = self.settings.lock().unwrap().link_posters;
+                        if let Some((info, poster)) = files::look_at_video(&client, &mxc, posters).await {
+                            details.size = Some((info.width, info.height));
+                            details.duration = info.duration;
+                            if let Some(p) = poster {
+                                self.status("Sending the preview frame…");
+                                details.thumbnail = files::upload_poster(&client, &p).await.inspect_err(|e| tracing::warn!("couldn't upload the preview frame: {e:#}")).ok();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                match files::send_linked(room, &mxc, &file, &details, reply_to).await {
                     Ok(_) => self.status(""),
                     Err(e) => self.status(format!("Not sent: {e:#}")),
                 }
@@ -2128,6 +2249,7 @@ impl Ctl {
                     Err(e) => self.status(format!("Failed: {e}")),
                 }
             }
+            "retry-media" => self.retry_picture(&key, m),
             "copy-file" => {
                 let Some(media) = &m.media else { return };
                 let (link, keyed) = files::link_for(&media.source, &room, &m.event_id);
@@ -2862,6 +2984,15 @@ impl Ctl {
             Ok((done, 0)) => self.status(format!("Deleted {done} messages.")),
             Ok((done, failed)) => self.status(format!("Deleted {done} messages; {failed} couldn't be deleted.")),
             Err(e) => self.status(format!("Couldn't clear messages: {e:#}")),
+        }
+    }
+
+    fn set_link_posters(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.link_posters = on;
+        let _ = st.save(self.mgr.data_dir());
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_link_posters(on);
         }
     }
 
@@ -4146,6 +4277,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
+    ui.global::<Prefs>().set_link_posters(prefs.link_posters);
     ui.global::<Prefs>().set_clear_command(s(&prefs.clear_command));
     autocorrect::warm();
     ui.global::<ModelInfo>().on_sees(|model, _| {
@@ -4240,6 +4372,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.global::<Player>().on_seek(move |f| player::seek(&c.ui, f));
         let c = ctl.clone();
         ui.global::<Player>().on_mute(move || player::mute(&c.ui));
+        let c = ctl.clone();
+        ui.global::<Player>().on_toggle_subtitles(move || player::subtitles(&c.ui));
+        let c = ctl.clone();
+        ui.global::<Player>().on_set_large(move |on| player::set_large(&c.ui, on));
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -4363,6 +4499,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         let c = ctl.clone();
         ui.on_set_autocorrect(move |b| c.set_autocorrect(b));
         let c = ctl.clone();
+        ui.on_set_link_posters(move |b| c.set_link_posters(b));
+        let c = ctl.clone();
         ui.on_set_clear_command(move |t| c.set_clear_command(t.to_string()));
         let c = ctl.clone();
         ui.on_set_menu_entry(move |k, b| c.set_menu_entry(k.to_string(), b));
@@ -4469,6 +4607,34 @@ fn apply_menu(ui: &AppWindow, hidden: &std::collections::BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previews_try_every_way() {
+        let mxc = |s: &str| MediaSource::Plain(OwnedMxcUri::from(format!("mxc://other.org/{s}")));
+        let media = |kind, thumbnail: Option<MediaSource>, mime: &str, size| timeline::Media {
+            kind,
+            source: mxc("file"),
+            thumbnail,
+            name: "x".into(),
+            mime: Some(mime.into()),
+            size: Some(size),
+            width: None,
+            height: None,
+            linked: false,
+        };
+        let ways = |m: &timeline::Media| preview_attempts(m).into_iter().map(|(s, px, p)| (media_address(&s).rsplit('/').next().unwrap().to_owned(), px, p)).collect::<Vec<_>>();
+        // The sender's thumbnail, the server's, then the picture itself.
+        assert_eq!(
+            ways(&media(MediaKind::Image, Some(mxc("thumb")), "image/jpeg", 1000)),
+            [("thumb".into(), None, Preview::Still), ("file".into(), Some(640), Preview::Still), ("file".into(), None, Preview::Still)]
+        );
+        // Too big to fetch whole: thumbnails only.
+        assert_eq!(ways(&media(MediaKind::Image, None, "image/avif", 90 << 20)), [("file".into(), Some(640), Preview::Still)]);
+        assert_eq!(ways(&media(MediaKind::Image, None, "image/gif", 1000))[0], ("file".into(), None, Preview::Animated));
+        // A video without a poster: read a frame through the relay, else download it.
+        assert_eq!(ways(&media(MediaKind::Video, None, "video/mp4", 1000)), [("file".into(), None, Preview::Remote), ("file".into(), None, Preview::Video)]);
+        assert!(ways(&media(MediaKind::File, None, "application/pdf", 10)).is_empty());
+    }
 
     #[test]
     fn menu_entries_keep_their_defaults() {

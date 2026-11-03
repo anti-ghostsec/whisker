@@ -156,6 +156,8 @@ export struct MessageItem {
     media-name: string,
     media-info: string,
     picture: image,
+    // Its preview couldn't be loaded (click to try again).
+    picture-failed: bool,
     // Animated GIF/WebP: every frame, shown in turn (looping).
     frames: [image],
     frame-ms: int,
@@ -351,6 +353,11 @@ export global Player {
     // Fetching the video or starting up.
     in-out property <bool> loading;
     in-out property <bool> muted;
+    // It has subtitles, and they're drawn.
+    in-out property <bool> has-subtitles;
+    in-out property <bool> subtitles;
+    // Shown big over the whole window.
+    in-out property <bool> large;
     // Seconds.
     in-out property <float> position;
     in-out property <float> duration;
@@ -359,6 +366,8 @@ export global Player {
     // Jump to a fraction (0–1) of the way through.
     callback seek(float);
     callback mute();
+    callback toggle-subtitles();
+    callback set-large(bool);
 }
 
 // "1:05" from seconds.
@@ -370,6 +379,93 @@ component Clock inherits Text {
     font-size: 11px;
     vertical-alignment: center;
 }
+
+// Play/pause, time, seek bar, length, subtitles, sound and size, over a playing video.
+component VideoBar inherits Rectangle {
+    in property <string> id;
+    height: 30px;
+    background: #000000a0;
+    // Clicks on the bar itself don't pause.
+    TouchArea {}
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+        Rectangle {
+            width: 16px;
+            if Player.playing: HorizontalLayout {
+                alignment: center;
+                spacing: 3px;
+                padding-top: 9px;
+                padding-bottom: 9px;
+                Rectangle { width: 3px; background: white; }
+                Rectangle { width: 3px; background: white; }
+            }
+            if !Player.playing: Text { text: "▶"; color: white; font-size: 13px; }
+            TouchArea { mouse-cursor: pointer; clicked => { Player.toggle(root.id); } }
+        }
+        Clock { seconds: Player.position; }
+        Rectangle {
+            horizontal-stretch: 1;
+            Rectangle {
+                height: 4px; border-radius: 2px;
+                background: #ffffff50;
+                Rectangle {
+                    x: 0;
+                    width: parent.width * (Player.duration > 0 ? min(1, Player.position / Player.duration) : 0);
+                    border-radius: 2px;
+                    background: Theme.accent;
+                }
+            }
+            TouchArea { mouse-cursor: pointer; clicked => { Player.seek(self.mouse-x / max(1px, self.width)); } }
+        }
+        Clock { seconds: Player.duration; }
+        if Player.has-subtitles: Rectangle {
+            width: 22px;
+            // "CC", lit while subtitles show.
+            Rectangle {
+                width: 20px; height: 14px; border-radius: 3px;
+                border-width: 1.5px;
+                border-color: Player.subtitles ? white : #ffffff70;
+                Text { text: "CC"; color: Player.subtitles ? white : #ffffff70; font-size: 8px; font-weight: 700; }
+            }
+            TouchArea { mouse-cursor: pointer; clicked => { Player.toggle-subtitles(); } }
+        }
+        Rectangle {
+            width: 18px;
+            // A speaker, with sound waves or a cross.
+            Path {
+                width: 16px; height: 14px;
+                viewbox-width: 16; viewbox-height: 14;
+                fill: white;
+                commands: "M 0 4 L 4 4 L 8 0 L 8 14 L 4 10 L 0 10 Z";
+            }
+            Path {
+                width: 16px; height: 14px;
+                viewbox-width: 16; viewbox-height: 14;
+                stroke: white;
+                stroke-width: 1.5px;
+                commands: Player.muted ? "M 10.5 4.5 L 15 9.5 M 15 4.5 L 10.5 9.5" : "M 10.5 4.5 Q 12.5 7 10.5 9.5 M 12.5 2.5 Q 16 7 12.5 11.5";
+            }
+            TouchArea { mouse-cursor: pointer; clicked => { Player.mute(); } }
+        }
+        Rectangle {
+            width: 16px;
+            // Four corners: out to enlarge, in to shrink back.
+            Path {
+                width: 14px; height: 14px;
+                viewbox-width: 14; viewbox-height: 14;
+                stroke: white;
+                stroke-width: 1.5px;
+                commands: Player.large
+                    ? "M 5 1 L 5 5 L 1 5 M 9 1 L 9 5 L 13 5 M 5 13 L 5 9 L 1 9 M 9 13 L 9 9 L 13 9"
+                    : "M 1 5 L 1 1 L 5 1 M 9 1 L 13 1 L 13 5 M 1 9 L 1 13 L 5 13 M 13 9 L 13 13 L 9 13";
+            }
+            TouchArea { mouse-cursor: pointer; clicked => { Player.set-large(!Player.large); } }
+        }
+    }
+}
+
 
 component MessageRow inherits Rectangle {
     in property <MessageItem> item;
@@ -516,9 +612,9 @@ component MessageRow inherits Rectangle {
                             }
                             if root.item.picture.width > 0 && root.item.frames.length == 0: Image { source: root.item.picture; width: parent.width; height: parent.height; image-fit: cover; }
                             if root.item.frames.length > 0: Image { source: root.item.frames[min(parent.frame, root.item.frames.length - 1)]; width: parent.width; height: parent.height; image-fit: cover; }
-                            if root.item.media == 1 && root.item.picture.width == 0: Text { text: "Loading image…"; color: Theme.muted; font-size: 12px; }
+                            if root.item.media == 1 && root.item.picture.width == 0: Text { text: root.item.picture-failed ? "Couldn't load the image.\nClick to try again." : "Loading image…"; color: Theme.muted; font-size: 12px; horizontal-alignment: center; }
                             property <bool> here: root.item.media == 2 && Player.id == root.item.id;
-                            if pic.here && Player.frame.width > 0: Image { source: Player.frame; width: parent.width; height: parent.height; image-fit: contain; }
+                            if pic.here && !Player.large && Player.frame.width > 0: Image { source: Player.frame; width: parent.width; height: parent.height; image-fit: contain; }
                             if root.item.media == 2 && !(pic.here && Player.playing): Rectangle {
                                 width: 48px; height: 48px; border-radius: 24px;
                                 background: #000000a0;
@@ -532,71 +628,19 @@ component MessageRow inherits Rectangle {
                             // Takes every button, so it opens the menu itself on right-click.
                             pic-area := TouchArea {
                                 mouse-cursor: pointer;
+                                double-clicked => {
+                                    if pic.here { Player.set-large(true); }
+                                }
                                 clicked => {
-                                    if root.item.media == 2 { Player.toggle(root.item.id); } else { root.action("view", root.item.id); }
+                                    if root.item.media == 2 { Player.toggle(root.item.id); } else if root.item.picture-failed { root.action("retry-media", root.item.id); } else { root.action("view", root.item.id); }
                                 }
                                 pointer-event(e) => {
                                     if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
                                 }
                                 // Controls, while it plays (on hover) or is paused.
-                                if pic.here && (pic-area.has-hover || !Player.playing): Rectangle {
+                                if pic.here && !Player.large && (pic-area.has-hover || !Player.playing): VideoBar {
+                                    id: root.item.id;
                                     y: parent.height - self.height;
-                                    height: 30px;
-                                    background: #000000a0;
-                                    // Clicks on the bar itself don't pause.
-                                    TouchArea {}
-                                    HorizontalLayout {
-                                        padding-left: 8px;
-                                        padding-right: 8px;
-                                        spacing: 8px;
-                                        Rectangle {
-                                            width: 16px;
-                                            if Player.playing: HorizontalLayout {
-                                                alignment: center;
-                                                spacing: 3px;
-                                                padding-top: 9px;
-                                                padding-bottom: 9px;
-                                                Rectangle { width: 3px; background: white; }
-                                                Rectangle { width: 3px; background: white; }
-                                            }
-                                            if !Player.playing: Text { text: "▶"; color: white; font-size: 13px; }
-                                            TouchArea { mouse-cursor: pointer; clicked => { Player.toggle(root.item.id); } }
-                                        }
-                                        Clock { seconds: Player.position; }
-                                        track := Rectangle {
-                                            horizontal-stretch: 1;
-                                            Rectangle {
-                                                height: 4px; border-radius: 2px;
-                                                background: #ffffff50;
-                                                Rectangle {
-                                                    x: 0;
-                                                    width: parent.width * (Player.duration > 0 ? min(1, Player.position / Player.duration) : 0);
-                                                    border-radius: 2px;
-                                                    background: Theme.accent;
-                                                }
-                                            }
-                                            TouchArea { mouse-cursor: pointer; clicked => { Player.seek(self.mouse-x / max(1px, self.width)); } }
-                                        }
-                                        Clock { seconds: Player.duration; }
-                                        Rectangle {
-                                            width: 18px;
-                                            // A speaker, with sound waves or a cross.
-                                            Path {
-                                                width: 16px; height: 14px;
-                                                viewbox-width: 16; viewbox-height: 14;
-                                                fill: white;
-                                                commands: "M 0 4 L 4 4 L 8 0 L 8 14 L 4 10 L 0 10 Z";
-                                            }
-                                            Path {
-                                                width: 16px; height: 14px;
-                                                viewbox-width: 16; viewbox-height: 14;
-                                                stroke: white;
-                                                stroke-width: 1.5px;
-                                                commands: Player.muted ? "M 10.5 4.5 L 15 9.5 M 15 4.5 L 10.5 9.5" : "M 10.5 4.5 Q 12.5 7 10.5 9.5 M 12.5 2.5 Q 16 7 12.5 11.5";
-                                            }
-                                            TouchArea { mouse-cursor: pointer; clicked => { Player.mute(); } }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -1299,6 +1343,7 @@ export component AppWindow inherits Window {
     callback set-notify-level(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
+    callback set-link-posters(bool);
     callback set-clear-command(string);
     // "Clear messages" dialog: open, and delete the newest `n` (0 = all).
     in-out property <bool> clear-open;
@@ -2236,6 +2281,7 @@ export component AppWindow inherits Window {
         set-notify-level(i) => { root.set-notify-level(i); }
         set-send-typing(b) => { root.set-send-typing(b); }
         set-autocorrect(b) => { root.set-autocorrect(b); }
+        set-link-posters(b) => { root.set-link-posters(b); }
         set-clear-command(t) => { root.set-clear-command(t); }
         set-menu-entry(k, b) => { root.set-menu-entry(k, b); }
         save-account(f) => { root.activity(); root.save-account(f); }
@@ -2357,6 +2403,58 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    // A video shown big. Esc, the corners button or a double-click shrink it back.
+    if Player.large && Player.id != "": Rectangle {
+        background: black;
+        big-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if e.text == Key.Escape { Player.set-large(false); return accept; }
+                if e.text == " " { Player.toggle(Player.id); return accept; }
+                reject
+            }
+        }
+        big-area := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { Player.toggle(Player.id); }
+            double-clicked => { Player.set-large(false); }
+        }
+        if Player.frame.width > 0: Image {
+            x: 20px;
+            y: 20px;
+            width: parent.width - 40px;
+            height: parent.height - 80px;
+            source: Player.frame;
+            image-fit: contain;
+        }
+        if Player.loading: Rectangle {
+            width: 56px; height: 56px; border-radius: 28px;
+            background: #000000a0;
+            Text { text: "…"; color: white; font-size: 22px; }
+        }
+        if !Player.playing && !Player.loading: Rectangle {
+            width: 56px; height: 56px; border-radius: 28px;
+            background: #000000a0;
+            Text { text: "▶"; color: white; font-size: 22px; }
+        }
+        VideoBar {
+            id: Player.id;
+            x: 20px;
+            width: parent.width - 40px;
+            y: parent.height - self.height - 16px;
+        }
+        Rectangle {
+            x: parent.width - self.width - 12px;
+            y: 10px;
+            width: 38px;
+            height: 38px;
+            border-radius: 19px;
+            background: big-close.has-hover ? #ffffff30 : #ffffff14;
+            Text { text: "✕"; color: white; font-size: 18px; }
+            big-close := TouchArea { mouse-cursor: pointer; clicked => { Player.set-large(false); } }
         }
     }
 

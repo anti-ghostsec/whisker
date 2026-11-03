@@ -63,6 +63,10 @@ pub struct AppSettings {
     /// confirmation instead of being posted.
     #[serde(default = "clear_command")]
     pub clear_command: String,
+    /// When sending a video's link, upload a preview frame made from it,
+    /// so other apps show a picture (the video itself isn't uploaded).
+    #[serde(default = "yes")]
+    pub link_posters: bool,
 }
 
 fn clear_command() -> String {

@@ -1049,14 +1049,34 @@ pub struct VideoInfo {
     pub duration: Option<std::time::Duration>,
     /// It has a sound track.
     pub audio: bool,
+    /// Its first subtitle track, if it has one.
+    pub subtitles: Option<Subtitles>,
 }
 
-/// Size, length and whether there's sound, via ffprobe (when installed).
-pub fn probe_video(path: &Path) -> Option<VideoInfo> {
+/// What kind of subtitles a video carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Subtitles {
+    /// Text (SRT, ASS, WebVTT, MP4 text), drawn with a font.
+    Text,
+    /// Pictures (Blu-ray PGS, DVD, DVB), laid over the video.
+    Bitmap,
+}
+
+fn subtitle_kind(codec: &str) -> Option<Subtitles> {
+    match codec {
+        "subrip" | "srt" | "ass" | "ssa" | "mov_text" | "webvtt" | "text" | "microdvd" => Some(Subtitles::Text),
+        "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub" => Some(Subtitles::Bitmap),
+        _ => None,
+    }
+}
+
+/// Size, length, sound and subtitles, via ffprobe (when installed). `input`
+/// is a file, or an address ffprobe can read.
+pub fn probe_video(input: impl AsRef<std::ffi::OsStr>) -> Option<VideoInfo> {
     use std::process::{Command, Stdio};
     let probe = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "stream=codec_type,width,height:format=duration", "-of", "default=nw=1"])
-        .arg(path)
+        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:format=duration", "-of", "default=nw=1"])
+        .arg(input)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -1070,12 +1090,20 @@ pub fn probe_video(path: &Path) -> Option<VideoInfo> {
     }
     let duration = field("duration").and_then(|d| d.parse::<f64>().ok()).filter(|d| d.is_finite() && *d >= 0.0).map(std::time::Duration::from_secs_f64);
     let audio = text.lines().any(|l| l.trim() == "codec_type=audio");
-    Some(VideoInfo { width, height, duration, audio })
+    // Each stream lists its codec, then its type.
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let subtitles = lines.windows(2).find_map(|w| match (w[0].strip_prefix("codec_name="), w[1]) {
+        (Some(codec), "codec_type=subtitle") => subtitle_kind(codec),
+        _ => None,
+    });
+    Some(VideoInfo { width, height, duration, audio, subtitles })
 }
 
-/// A frame from early in the video file at `path`, as a JPEG.
-pub fn video_poster(path: &Path) -> Option<Poster> {
+/// A frame from early in the video at `path` (a file, or an address
+/// ffmpeg can read), as a JPEG.
+pub fn video_poster(path: impl AsRef<std::ffi::OsStr>) -> Option<Poster> {
     use std::process::{Command, Stdio};
+    let path = path.as_ref();
     let VideoInfo { width: w, height: h, duration, .. } = probe_video(path)?;
     let pw = w.min(POSTER_PX) & !1;
     let ph = ((u64::from(h) * u64::from(pw) / u64::from(w)) as u32).max(2) & !1;

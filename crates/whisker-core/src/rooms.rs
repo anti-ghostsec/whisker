@@ -418,3 +418,138 @@ mod tests {
         assert!(parse_users("bob").is_err());
     }
 }
+
+/// A room seen from outside, before joining: what it is, and its newest
+/// messages when anyone may read them ("world readable" history).
+#[derive(Debug, Clone)]
+pub struct Preview {
+    pub room_id: OwnedRoomId,
+    pub name: String,
+    pub alias: Option<String>,
+    pub topic: Option<String>,
+    pub avatar: Option<OwnedMxcUri>,
+    pub members: u64,
+    pub is_space: bool,
+    /// Anyone may read its history, so `messages` could be fetched.
+    pub readable: bool,
+    /// Its messages are end-to-end encrypted: only members can read them.
+    pub encrypted: bool,
+    /// Servers to join through.
+    pub via: Vec<matrix_sdk::ruma::OwnedServerName>,
+    /// Oldest first.
+    pub messages: Vec<timeline::HistoryItem>,
+    pub reactions: Vec<timeline::Reaction>,
+    /// Why there are no messages, when there aren't.
+    pub note: Option<String>,
+}
+
+/// Looks at a room (`!id:server` or `#alias:server`) without joining it.
+pub async fn preview(client: &Client, id_or_alias: &str, mut via: Vec<matrix_sdk::ruma::OwnedServerName>) -> Result<Preview> {
+    use matrix_sdk::ruma::OwnedRoomOrAliasId;
+    let target: OwnedRoomOrAliasId = id_or_alias.trim().try_into().map_err(|_| anyhow!("that isn't a room address like #room:server"))?;
+    if let Some(s) = target.server_name() {
+        via.push(s.to_owned());
+    }
+    via.dedup();
+    let summary = client.get_room_preview(&target, via.clone()).await.context("the server wouldn't describe that room")?;
+    let room_id = summary.room_id.clone();
+    let name = summary.name.clone().or_else(|| summary.canonical_alias.as_ref().map(|a| a.to_string())).unwrap_or_else(|| room_id.to_string());
+    let mut p = Preview {
+        name,
+        alias: summary.canonical_alias.map(|a| a.to_string()),
+        topic: summary.topic,
+        avatar: summary.avatar_url,
+        members: summary.num_joined_members,
+        is_space: matches!(summary.room_type, Some(matrix_sdk::ruma::room::RoomType::Space)),
+        readable: summary.is_world_readable.unwrap_or(false),
+        encrypted: false,
+        via,
+        messages: Vec::new(),
+        reactions: Vec::new(),
+        note: None,
+        room_id,
+    };
+    // Some servers don't say whether it's readable: just try.
+    match preview_messages(client, &p.room_id).await {
+        Ok((messages, reactions, encrypted)) => {
+            p.readable = true;
+            p.encrypted = encrypted;
+            p.messages = messages;
+            p.reactions = reactions;
+            if p.messages.is_empty() {
+                p.note = Some(if encrypted { "Its messages are encrypted: only members can read them.".into() } else { "No messages yet.".into() });
+            }
+        }
+        Err(e) => {
+            tracing::debug!("no preview of {}'s messages: {e:#}", p.room_id);
+            p.readable = false;
+            p.note = Some("Only members can read this room's messages. Join to see them.".into());
+        }
+    }
+    Ok(p)
+}
+
+/// The newest messages of a room we're not in, if its history is open to
+/// anyone. Encrypted ones are left out; the flag says there were some.
+async fn preview_messages(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> Result<(Vec<timeline::HistoryItem>, Vec<timeline::Reaction>, bool)> {
+    use matrix_sdk::ruma::api::client::filter::{LazyLoadOptions, RoomEventFilter};
+    use matrix_sdk::ruma::api::client::message::get_message_events::v3::Request;
+    use matrix_sdk::ruma::events::room::member::RoomMemberEventContent;
+    use matrix_sdk::ruma::events::{AnyStateEvent, StateEvent};
+    let mut req = Request::backward(room_id.to_owned());
+    req.limit = matrix_sdk::ruma::UInt::from(50u32);
+    let mut filter = RoomEventFilter::default();
+    filter.lazy_load_options = LazyLoadOptions::Enabled { include_redundant_members: false };
+    req.filter = filter;
+    let res = client.send(req).await?;
+    // Names and pictures of the people in the page.
+    let mut people = std::collections::HashMap::new();
+    for raw in &res.state {
+        if let Ok(AnyStateEvent::RoomMember(StateEvent::Original(m))) = raw.deserialize() {
+            let RoomMemberEventContent { displayname, avatar_url, .. } = m.content;
+            if let Ok(user) = OwnedUserId::try_from(m.state_key.as_str()) {
+                people.insert(user, (displayname, avatar_url));
+            }
+        }
+    }
+    let (mut out, mut reactions, mut edits, mut encrypted) = (Vec::new(), Vec::new(), std::collections::HashMap::new(), false);
+    // Newest first: an edit comes before the message it changes.
+    for raw in &res.chunk {
+        // Read as a sync event: the room is known, and some servers leave out `room_id`.
+        let Ok(AnySyncTimelineEvent::MessageLike(ev)) = raw.deserialize_as_unchecked::<AnySyncTimelineEvent>() else { continue };
+        match ev {
+            AnySyncMessageLikeEvent::RoomEncrypted(_) => encrypted = true,
+            AnySyncMessageLikeEvent::Reaction(SyncMessageLikeEvent::Original(r)) => {
+                reactions.push(timeline::Reaction { event_id: r.event_id, target: r.content.relates_to.event_id, key: r.content.relates_to.key, sender: r.sender });
+            }
+            AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)) => match timeline::parse(&m.content) {
+                timeline::Parsed::Edit { target, body } => {
+                    edits.entry(target).or_insert(body);
+                }
+                timeline::Parsed::New { body, reply_to, media, thread, pills, .. } => {
+                    let (sender_name, sender_avatar) = people.get(&m.sender).cloned().unwrap_or_default();
+                    let edited = edits.remove(&m.event_id);
+                    out.push(timeline::HistoryItem {
+                        edited: edited.is_some(),
+                        body: edited.unwrap_or(body),
+                        event_id: m.event_id,
+                        sender: m.sender,
+                        sender_name,
+                        sender_avatar,
+                        ts: m.origin_server_ts,
+                        reply_to,
+                        media,
+                        notice: false,
+                        member: None,
+                        thread,
+                        pills,
+                        shield: None,
+                    });
+                }
+            },
+            _ => {}
+        }
+    }
+    out.reverse();
+    Ok((out, reactions, encrypted))
+}

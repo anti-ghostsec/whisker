@@ -156,6 +156,12 @@ operating system and the **Wisp** browser.
   directory, or join by address like `#room:matrix.org`. If your server won't fetch another
   server's directory, Whisker asks that server directly (anonymously, but it sees your IP
   unless the account uses a proxy).
+- **Preview before joining:** **Preview** on a public room, on a room listed on a space's page,
+  or on an address, and clicking a matrix.to room link in a message, shows the room without
+  joining it: its name, topic and member count and, when its history is open to anyone, its
+  newest messages (pictures, videos and reactions too). A bar with **Join** and **Close** takes
+  the place of the message box. Encrypted messages, and rooms whose history only members may
+  read, can't be shown until you join.
 - **Create rooms** (the **+** button above the room list): private and encrypted, or public
   with an address; invite people as you create it.
 - **Profiles**: click anyone's picture (in chat or the member list) to open their profile

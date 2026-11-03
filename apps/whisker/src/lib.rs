@@ -54,6 +54,9 @@ type CardAndPicture = (whisker_agent::card::Card, Option<Vec<u8>>);
 struct State {
     account: Option<AccountId>,
     room: Option<OwnedRoomId>,
+    /// A room looked at before joining (it's `room` while shown), and
+    /// where to go back to: Explore, or the room open before.
+    preview: Option<(whisker_core::rooms::Preview, PreviewFrom)>,
     tag_filter: Option<String>,
     room_search: String,
     /// New logins go here: the vault unlocked or created most recently.
@@ -286,6 +289,36 @@ fn media_address(src: &MediaSource) -> &str {
     match src {
         MediaSource::Plain(u) => u.as_str(),
         MediaSource::Encrypted(f) => f.url.as_str(),
+    }
+}
+
+/// Where a room preview was opened from, to go back there on Close.
+#[derive(Debug, Clone)]
+enum PreviewFrom {
+    Explore,
+    Room(Option<OwnedRoomId>),
+}
+
+/// What a matrix.to link in a message points at.
+#[derive(Debug, PartialEq)]
+enum RoomLink {
+    User(String),
+    /// A room's id or address, and servers that know it.
+    Room(String, Vec<String>),
+}
+
+fn room_link(url: &str) -> Option<RoomLink> {
+    use matrix_sdk::ruma::MatrixToUri;
+    use matrix_sdk::ruma::matrix_uri::MatrixId;
+    let u = MatrixToUri::parse(url).ok()?;
+    let via = u.via().iter().map(|v| v.to_string()).collect();
+    match u.id() {
+        MatrixId::User(user) => Some(RoomLink::User(user.to_string())),
+        MatrixId::Room(id) => Some(RoomLink::Room(id.to_string(), via)),
+        MatrixId::RoomAlias(alias) => Some(RoomLink::Room(alias.to_string(), via)),
+        // A link to a message opens its room.
+        MatrixId::Event(room, _) => Some(RoomLink::Room(room.to_string(), via)),
+        _ => None,
     }
 }
 
@@ -553,7 +586,7 @@ impl Ctl {
     /// `items` with what's already known filled in.
     fn resolve_links(&self, key: &RoomKey, items: &[HistoryItem]) -> Vec<HistoryItem> {
         let mut out = items.to_vec();
-        let mut ask = Vec::new();
+        let (mut ask, mut filled) = (Vec::new(), Vec::new());
         {
             let mut guard = self.st.lock().unwrap();
             let st = &mut *guard;
@@ -566,6 +599,7 @@ impl Ctl {
                         if let Some(x) = st.messages.get_mut(key).and_then(|l| l.iter_mut().find(|x| x.event_id == m.event_id)) {
                             x.media.clone_from(&m.media);
                         }
+                        filled.push(m.event_id.clone());
                     }
                     Some(_) => {}
                     None => {
@@ -575,6 +609,10 @@ impl Ctl {
                     }
                 }
             }
+        }
+        // Known from before: redraw them as the file they link to.
+        for id in &filled {
+            self.update_message(key, id);
         }
         if ask.is_empty() {
             return out;
@@ -822,6 +860,8 @@ impl Ctl {
         self.fetch_avatars(account, rooms.iter().filter_map(|r| r.avatar.clone()));
 
         let current = room.as_ref().and_then(|id| rooms.iter().find(|r| &r.room_id == id)).cloned();
+        // A room being previewed isn't in the list.
+        let previewing = self.st.lock().unwrap().preview.as_ref().filter(|(p, _)| Some(&p.room_id) == room.as_ref()).map(|(p, _)| p.clone());
         let cleared = {
             let mut st = self.st.lock().unwrap();
             // Forget a local "read" once the server's count moves on.
@@ -880,9 +920,10 @@ impl Ctl {
                 }
             })
             .collect();
-        let (room_id, room_name, topic, invite) = match current {
-            Some(r) => (r.room_id.to_string(), r.name, r.topic.unwrap_or_default(), r.invite),
-            None => Default::default(),
+        let (room_id, room_name, topic, invite) = match (current, previewing) {
+            (Some(r), _) => (r.room_id.to_string(), r.name, r.topic.unwrap_or_default(), r.invite),
+            (None, Some(p)) => (p.room_id.to_string(), p.name, p.topic.unwrap_or_default(), false),
+            (None, None) => Default::default(),
         };
         let px = self.avatars.clone();
         self.ui(move |u| {
@@ -1197,6 +1238,7 @@ impl Ctl {
 
     async fn select_room(&self, id: String) {
         let Ok(room_id) = OwnedRoomId::try_from(id) else { return };
+        self.end_preview();
         // A video playing in the room being left stops.
         #[cfg(target_os = "linux")]
         player::stop(&self.ui);
@@ -1515,6 +1557,177 @@ impl Ctl {
             u.set_stick_bottom(true);
         });
         self.select_room(room_id.to_string()).await;
+    }
+
+    /// Shows a room (`!id` or `#alias`) without joining it: its name, topic
+    /// and, when its history is open to anyone, its newest messages, with a
+    /// Join button where the message box goes. `via`: servers that know it.
+    async fn open_preview(&self, target: String, via: Vec<String>) {
+        let Some(account) = self.st.lock().unwrap().account else { return };
+        let Some(client) = self.mgr.client(account).await else { return };
+        let joined = |id: &OwnedRoomId| client.get_room(id).is_some_and(|r| r.state() == matrix_sdk::RoomState::Joined);
+        let from = {
+            let exploring = self.ui.upgrade().is_some_and(|u| u.get_exploring());
+            if exploring { PreviewFrom::Explore } else { PreviewFrom::Room(self.st.lock().unwrap().room.clone()) }
+        };
+        let show_room = |id: OwnedRoomId| {
+            self.ui(|u| {
+                u.set_exploring(false);
+                u.set_pane(2);
+                u.set_stick_bottom(true);
+            });
+            self.select_room(id.to_string())
+        };
+        if let Ok(id) = OwnedRoomId::try_from(target.trim())
+            && joined(&id)
+        {
+            return show_room(id).await;
+        }
+        let say = |m: String| {
+            self.ui(move |u| {
+                u.set_explore_status(s(&m));
+                u.set_space_status(s(&m));
+            })
+        };
+        say("Looking at the room…".into());
+        let via = via.iter().filter_map(|v| matrix_sdk::ruma::OwnedServerName::try_from(v.as_str()).ok()).collect();
+        let p = match whisker_core::rooms::preview(&client, &target, via).await {
+            Ok(p) => p,
+            Err(e) => return say(format!("Couldn't preview it: {e:#}")),
+        };
+        say(String::new());
+        if joined(&p.room_id) {
+            return show_room(p.room_id).await;
+        }
+        #[cfg(target_os = "linux")]
+        player::stop(&self.ui);
+        self.end_preview();
+        let key = (account, p.room_id.clone());
+        let info = [
+            Some(match p.members {
+                1 => "1 member".to_owned(),
+                n => format!("{n} members"),
+            }),
+            p.alias.clone(),
+            p.encrypted.then(|| "encrypted".to_owned()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let note = p.note.clone().unwrap_or_default();
+        let (id, name, topic) = (p.room_id.to_string(), p.name.clone(), p.topic.clone().unwrap_or_default());
+        {
+            let mut st = self.st.lock().unwrap();
+            st.room = Some(p.room_id.clone());
+            st.reply_to = None;
+            st.editing = None;
+            st.thread = None;
+            st.messages.insert(key.clone(), p.messages.clone());
+            st.reactions.insert(key, p.reactions.clone());
+            st.preview = Some((p, from));
+        }
+        self.ui(move |u| {
+            u.set_exploring(false);
+            u.set_pane(2);
+            u.set_current_space(false);
+            u.set_current_invite(false);
+            u.set_current_preview(true);
+            u.set_preview_info(s(info));
+            u.set_preview_note(s(note));
+            u.set_preview_busy(false);
+            u.set_current_room(s(&id));
+            u.set_current_room_name(s(name));
+            u.set_current_room_topic(s(topic.lines().next().unwrap_or_default()));
+            u.set_thread_open(false);
+            u.set_loading_history(false);
+            u.set_has_older(false);
+            u.set_reply_to(s(""));
+            u.set_editing(s(""));
+            u.set_can_moderate(false);
+            u.set_stick_bottom(true);
+        });
+        self.show_messages().await;
+    }
+
+    /// Forgets the room being previewed (and its messages), if any.
+    fn end_preview(&self) -> Option<(whisker_core::rooms::Preview, PreviewFrom)> {
+        let ended = {
+            let mut st = self.st.lock().unwrap();
+            let ended = st.preview.take();
+            if let (Some((p, _)), Some(account)) = (&ended, st.account) {
+                let key = (account, p.room_id.clone());
+                st.messages.remove(&key);
+                st.reactions.remove(&key);
+                if st.room.as_ref() == Some(&p.room_id) {
+                    st.room = None;
+                }
+            }
+            ended
+        };
+        if ended.is_some() {
+            self.ui(|u| u.set_current_preview(false));
+        }
+        ended
+    }
+
+    /// "Join" on a preview.
+    async fn preview_join(&self) {
+        let Some(account) = self.st.lock().unwrap().account else { return };
+        let Some(client) = self.mgr.client(account).await else { return };
+        let Some((p, _)) = self.st.lock().unwrap().preview.clone() else { return };
+        self.ui(|u| u.set_preview_busy(true));
+        let target: &matrix_sdk::ruma::RoomOrAliasId = (&*p.room_id).into();
+        match client.join_room_by_id_or_alias(target, &p.via).await {
+            Ok(room) => {
+                timeline::check_room_type(&room).await;
+                self.end_preview();
+                self.ui(|u| u.set_stick_bottom(true));
+                self.select_room(p.room_id.to_string()).await;
+            }
+            Err(e) => {
+                let m = format!("Couldn't join: {e}");
+                self.ui(move |u| {
+                    u.set_preview_busy(false);
+                    u.set_preview_note(s(m));
+                });
+            }
+        }
+    }
+
+    /// Leaves a preview without joining, back to where it was opened.
+    async fn preview_close(&self) {
+        let Some((_, from)) = self.end_preview() else { return };
+        match from {
+            PreviewFrom::Explore => {
+                self.ui(|u| {
+                    u.set_current_room(s(""));
+                    u.set_exploring(true);
+                });
+                self.show_messages().await;
+                self.refresh_rooms().await;
+            }
+            PreviewFrom::Room(Some(id)) => self.select_room(id.to_string()).await,
+            PreviewFrom::Room(None) => {
+                self.ui(|u| u.set_current_room(s("")));
+                self.show_messages().await;
+                self.refresh_rooms().await;
+            }
+        }
+    }
+
+    /// "Preview" on a room listed on the open space's page.
+    async fn space_preview(&self, id: String) {
+        let Some((key, _)) = self.current_room().await else { return };
+        let via = self.st.lock().unwrap().space_rooms.get(&key).and_then(|(_, l)| l.iter().find(|r| r.room_id.as_str() == id).map(|r| r.via.iter().map(|v| v.to_string()).collect()));
+        self.open_preview(id, via.unwrap_or_default()).await;
+    }
+
+    /// "Preview" on a room in Explore: its directory's server knows it.
+    async fn explore_preview(&self, id: String) {
+        let server = self.st.lock().unwrap().explore.0.clone();
+        let via = whisker_core::rooms::normalize_server(&server).into_iter().collect();
+        self.open_preview(id, via).await;
     }
 
     async fn profile_edit(&self, action: String, id: String, value: String) {
@@ -4331,6 +4544,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_unlock, |p| unlock);
     on!(on_share_pick_account, |id| share_pick_account);
     on!(on_space_join, |id| space_join);
+    on!(on_space_preview, |id| space_preview);
+    on!(on_explore_preview, |id| explore_preview);
+    on!(on_preview_join, preview_join);
+    on!(on_preview_close, preview_close);
     on!(on_share_search, |q| share_search);
     on!(on_share_to, |id| share_to);
     {
@@ -4461,10 +4678,15 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         // Mentions link to matrix.to: open that person's profile instead.
         let c = ctl.clone();
-        ui.on_open_link(move |l| match l.strip_prefix("https://matrix.to/#/").filter(|u| u.starts_with('@')) {
-            Some(user) => {
-                let (c2, user) = (c.clone(), user.to_owned());
+        ui.on_open_link(move |l| match room_link(&l) {
+            Some(RoomLink::User(user)) => {
+                let c2 = c.clone();
                 c.spawn(async move { c2.profile_requested(user).await });
+            }
+            // A room's link opens it, or a preview of it.
+            Some(RoomLink::Room(target, via)) => {
+                let c2 = c.clone();
+                c.spawn(async move { c2.open_preview(target, via).await });
             }
             None => open_link(&l),
         });
@@ -4607,6 +4829,18 @@ fn apply_menu(ui: &AppWindow, hidden: &std::collections::BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_room_links() {
+        assert_eq!(room_link("https://matrix.to/#/@amy:example.org"), Some(RoomLink::User("@amy:example.org".into())));
+        assert_eq!(room_link("https://matrix.to/#/#rust:matrix.org"), Some(RoomLink::Room("#rust:matrix.org".into(), vec![])));
+        assert_eq!(
+            room_link("https://matrix.to/#/!abc:example.org?via=example.org&via=matrix.org"),
+            Some(RoomLink::Room("!abc:example.org".into(), vec!["example.org".into(), "matrix.org".into()]))
+        );
+        assert_eq!(room_link("https://matrix.to/#/!abc:example.org/$ev?via=x.org"), Some(RoomLink::Room("!abc:example.org".into(), vec!["x.org".into()])));
+        assert_eq!(room_link("https://example.org/page"), None);
+    }
 
     #[test]
     fn previews_try_every_way() {

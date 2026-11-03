@@ -67,6 +67,14 @@ operating system and the **Wisp** browser.
   and files are re-posted as the same file (nothing is downloaded or uploaded again);
   replies lose their reply link. Forwarding from an encrypted room into an unencrypted
   one makes that file readable to the new room.
+- **File links:** *Copy file link* on a picture, video or file's menu copies its address
+  (`mxc://server/id`). Paste one on its own and send it, and it goes out as that picture,
+  video or file without being uploaded again; Whisker asks the server only for its type and
+  size (and a picture's dimensions). A message that is only such a link (sent from another
+  app as text) shows the file itself. Media download addresses
+  (`https://…/_matrix/…/download/server/id`) work too. An encrypted file's address can't
+  open it without the message's key, so its link is a matrix.to link to the message: sending
+  that re-posts the file, for people who can see the original room.
 - **Images and videos:** right-click the picture or video itself to save it; the full-size
   viewer has Save / Forward / Close buttons and its own right-click menu. **GIFs and
   animated WebP play and loop**, in the timeline and the viewer. Videos show their preview

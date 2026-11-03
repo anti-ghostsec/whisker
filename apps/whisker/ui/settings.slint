@@ -337,6 +337,9 @@ component GeneralPage inherits VerticalLayout {
                 MenuToggle { key: "copy-id"; label: "Copy user id"; checked: Prefs.menu-copy-id; changed(k, b) => { root.set-menu-entry(k, b); } }
                 MenuToggle { key: "source"; label: "Show source"; checked: Prefs.menu-source; changed(k, b) => { root.set-menu-entry(k, b); } }
             }
+            Row {
+                MenuToggle { key: "copy-file"; label: "Copy file link"; checked: Prefs.menu-copy-file; changed(k, b) => { root.set-menu-entry(k, b); } }
+            }
         }
     }
     Card {

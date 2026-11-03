@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use ui::{MsgRow, PixelCache, Pixels, initial_hue, s};
 use whisker_agent::{Detected, Llm, agents_in, save_agents};
+use whisker_core::files::{self, FileLink};
 use whisker_core::timeline::{self, HistoryItem, MediaKind};
 use whisker_core::{AccountId, AccountKind, AccountManager, AccountSummary, ClientEvent, LoginRequest, ModAction, VaultId};
 
@@ -40,6 +41,8 @@ const AVATAR_PX: u32 = 96;
 /// Animated pictures bigger than this show still (playing them means
 /// downloading and decoding every frame).
 const MAX_ANIMATION_BYTES: u64 = 12 * 1024 * 1024;
+/// Biggest linked picture fetched to learn its size before sending.
+const MAX_LINKED_PICTURE_BYTES: u64 = 50 * 1024 * 1024;
 /// Biggest video without a poster frame that's fetched to make one.
 const MAX_POSTER_VIDEO_BYTES: u64 = 200 * 1024 * 1024;
 
@@ -106,6 +109,9 @@ struct State {
     pending_cards: HashMap<AccountId, Option<CardAndPicture>>,
     reply_to: Option<OwnedEventId>,
     editing: Option<OwnedEventId>,
+    /// What the servers said about files linked in messages (`None`: they
+    /// couldn't say), by address.
+    linked: HashMap<OwnedMxcUri, Option<files::LinkedFile>>,
     /// Decoded image previews, by event.
     pictures: HashMap<OwnedEventId, Option<Pixels>>,
     /// Read receipts per room, worked out when they change (it reads every
@@ -368,6 +374,7 @@ impl Ctl {
     /// animated GIF/WebP files (so they play). A few at a time, decoded off
     /// the network threads.
     fn fetch_pictures(&self, key: &RoomKey, items: &[HistoryItem]) {
+        let items = &self.resolve_links(key, items);
         // (event, source, ask the server for a thumbnail, what it is)
         let wanted: Vec<(OwnedEventId, MediaSource, bool, Preview)> = {
             let st = self.st.lock().unwrap();
@@ -433,6 +440,67 @@ impl Ctl {
                 });
             }
         });
+    }
+
+    /// Messages that are only a file's link show that file: asks its
+    /// server what it is (once per file), fills that in, and returns
+    /// `items` with what's already known filled in.
+    fn resolve_links(&self, key: &RoomKey, items: &[HistoryItem]) -> Vec<HistoryItem> {
+        let mut out = items.to_vec();
+        let mut ask = Vec::new();
+        {
+            let mut guard = self.st.lock().unwrap();
+            let st = &mut *guard;
+            for m in &mut out {
+                let Some(media) = m.media.as_mut().filter(|x| x.linked) else { continue };
+                let MediaSource::Plain(mxc) = &media.source else { continue };
+                match st.linked.get(mxc) {
+                    Some(Some(file)) if media.mime.is_none() => {
+                        files::fill(media, file);
+                        if let Some(x) = st.messages.get_mut(key).and_then(|l| l.iter_mut().find(|x| x.event_id == m.event_id)) {
+                            x.media.clone_from(&m.media);
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if self.loading.lock().unwrap().insert(mxc.to_string()) {
+                            ask.push(mxc.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if ask.is_empty() {
+            return out;
+        }
+        let (c, key) = (self.clone(), key.clone());
+        self.spawn(async move {
+            let Some(client) = c.mgr.client(key.0).await else { return };
+            for mxc in ask {
+                let file = files::probe(&client, &mxc).await.inspect_err(|e| tracing::warn!("couldn't look up {mxc}: {e:#}")).ok();
+                c.loading.lock().unwrap().remove(mxc.as_str());
+                let filled: Vec<HistoryItem> = {
+                    let mut st = c.st.lock().unwrap();
+                    st.linked.insert(mxc.clone(), file.clone());
+                    let Some(file) = file else { continue };
+                    let Some(list) = st.messages.get_mut(&key) else { continue };
+                    list.iter_mut()
+                        .filter(|m| m.media.as_ref().is_some_and(|x| x.linked && matches!(&x.source, MediaSource::Plain(u) if *u == mxc)))
+                        .map(|m| {
+                            if let Some(x) = m.media.as_mut() {
+                                files::fill(x, &file);
+                            }
+                            m.clone()
+                        })
+                        .collect()
+                };
+                for m in &filled {
+                    c.update_message(&key, &m.event_id);
+                }
+                c.fetch_pictures(&key, &filled);
+            }
+        });
+        out
     }
 
     // ---- vaults ----
@@ -1804,6 +1872,12 @@ impl Ctl {
             }
             return;
         }
+        // A file's link goes as that file, nothing uploaded.
+        if let Some(link) = files::parse_link(&text)
+            && self.send_file_link(&room, link, reply_to.as_deref()).await
+        {
+            return;
+        }
         if let Some(cmd) = ModAction::parse_command(&text) {
             match cmd {
                 Ok(action) => match action.apply(&room).await {
@@ -1855,6 +1929,66 @@ impl Ctl {
                         u.set_draft(s(text));
                     }
                 });
+            }
+        }
+    }
+
+    /// Sends the file a pasted link points at as a picture, video or file
+    /// message, without uploading it again. False when the link isn't to a
+    /// file (or to a message this account can't see), so it goes as text.
+    async fn send_file_link(&self, room: &matrix_sdk::Room, link: FileLink, reply_to: Option<&matrix_sdk::ruma::EventId>) -> bool {
+        let client = room.client();
+        match link {
+            FileLink::Media(mxc) => {
+                self.status("Sending the file…");
+                let file = match files::probe(&client, &mxc).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.status(format!("Couldn't open that file link: {e:#}"));
+                        let text = mxc.to_string();
+                        self.ui(move |u| {
+                            if u.get_draft().is_empty() {
+                                u.set_draft(s(text));
+                            }
+                        });
+                        return true;
+                    }
+                };
+                // A picture's size, so it gets its space before it loads.
+                let size = match file.kind() {
+                    MediaKind::Image if file.size.is_none_or(|n| n <= MAX_LINKED_PICTURE_BYTES) => {
+                        timeline::download(&client, &MediaSource::Plain(mxc.clone()), None).await.ok().and_then(|b| {
+                            image::ImageReader::new(std::io::Cursor::new(b)).with_guessed_format().ok()?.into_dimensions().ok()
+                        })
+                    }
+                    _ => None,
+                };
+                match files::send_linked(room, &mxc, &file, size, reply_to).await {
+                    Ok(_) => self.status(""),
+                    Err(e) => self.status(format!("Not sent: {e:#}")),
+                }
+                true
+            }
+            FileLink::Event(from, event) => {
+                let from = match OwnedRoomId::try_from(from.as_str()) {
+                    Ok(id) => Some(id),
+                    Err(_) => match matrix_sdk::ruma::OwnedRoomAliasId::try_from(from.as_str()) {
+                        Ok(alias) => client.resolve_room_alias(&alias).await.ok().map(|r| r.room_id),
+                        Err(_) => None,
+                    },
+                };
+                let Some(from) = from.and_then(|id| client.get_room(&id)) else { return false };
+                match files::share_file_of(&from, &event, room, reply_to).await {
+                    Ok(Some(_)) => {
+                        self.status("");
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(e) => {
+                        tracing::warn!("couldn't share the file of {event}: {e:#}");
+                        false
+                    }
+                }
             }
         }
     }
@@ -1992,6 +2126,14 @@ impl Ctl {
                 match a.apply(&room).await {
                     Ok(()) => self.status(format!("Done: {a}")),
                     Err(e) => self.status(format!("Failed: {e}")),
+                }
+            }
+            "copy-file" => {
+                let Some(media) = &m.media else { return };
+                let (link, keyed) = files::link_for(&media.source, &room, &m.event_id);
+                self.ui(move |u| u.invoke_copy_text(s(link)));
+                if keyed {
+                    self.status("Copied. The file is encrypted, so the link works for people in this room.");
                 }
             }
             "profile" => self.open_profile(&key, m.sender.clone()).await,
@@ -4318,6 +4460,7 @@ fn apply_menu(ui: &AppWindow, hidden: &std::collections::BTreeSet<String>) {
     p.set_menu_open_media(on("open-media"));
     p.set_menu_open_links(on("open-links"));
     p.set_menu_copy_link(on("copy-link"));
+    p.set_menu_copy_file(on("copy-file"));
     p.set_menu_profile(on("profile"));
     p.set_menu_copy_id(on("copy-id"));
     p.set_menu_source(on("source"));

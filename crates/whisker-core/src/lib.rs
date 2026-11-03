@@ -5,6 +5,7 @@
 pub mod accounts;
 pub mod anoncat;
 pub mod events;
+pub mod files;
 pub mod moderation;
 pub mod notices;
 pub mod profile;

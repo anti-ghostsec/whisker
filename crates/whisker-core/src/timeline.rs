@@ -82,6 +82,9 @@ pub struct Media {
     pub size: Option<u64>,
     pub width: Option<u64>,
     pub height: Option<u64>,
+    /// Not sent as a file but as a text message of its link: what it is
+    /// isn't known until the server is asked (`files::probe`).
+    pub linked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +181,7 @@ fn media_of(m: &MessageType) -> Option<Media> {
             size: c.info.as_ref().and_then(|i| u(i.size)),
             width: c.info.as_ref().and_then(|i| u(i.width)),
             height: c.info.as_ref().and_then(|i| u(i.height)),
+            linked: false,
         },
         MessageType::Video(c) => Media {
             kind: MediaKind::Video,
@@ -188,6 +192,7 @@ fn media_of(m: &MessageType) -> Option<Media> {
             size: c.info.as_ref().and_then(|i| u(i.size)),
             width: None,
             height: None,
+            linked: false,
         },
         MessageType::Audio(c) => Media {
             kind: MediaKind::Audio,
@@ -198,6 +203,7 @@ fn media_of(m: &MessageType) -> Option<Media> {
             size: c.info.as_ref().and_then(|i| u(i.size)),
             width: None,
             height: None,
+            linked: false,
         },
         MessageType::File(c) => Media {
             kind: MediaKind::File,
@@ -208,9 +214,26 @@ fn media_of(m: &MessageType) -> Option<Media> {
             size: c.info.as_ref().and_then(|i| u(i.size)),
             width: None,
             height: None,
+            linked: false,
         },
         _ => return None,
     })
+}
+
+/// A file shown from a message that is only its link; a plain file until
+/// its server says what it is.
+pub fn linked_media(mxc: OwnedMxcUri) -> Media {
+    Media {
+        kind: MediaKind::File,
+        name: mxc.media_id().unwrap_or("file").to_owned(),
+        source: MediaSource::Plain(mxc),
+        thumbnail: None,
+        mime: None,
+        size: None,
+        width: None,
+        height: None,
+        linked: true,
+    }
 }
 
 /// Drops the "> <@user> quoted text" fallback older clients put at the top of replies.
@@ -248,7 +271,11 @@ pub fn parse(content: &RoomMessageEventContent) -> Parsed {
                 MessageType::Notice(t) => t.formatted.as_ref().map(|f| mention_names(&f.body)).unwrap_or_default(),
                 _ => Vec::new(),
             };
-            Parsed::New { body, is_text, reply_to, media: media_of(&content.msgtype), thread, pills }
+            let media = media_of(&content.msgtype).or_else(|| match (&content.msgtype, crate::files::parse_link(&body)) {
+                (MessageType::Text(_), Some(crate::files::FileLink::Media(mxc))) => Some(linked_media(mxc)),
+                _ => None,
+            });
+            Parsed::New { body, is_text, reply_to, media, thread, pills }
         }
     }
 }

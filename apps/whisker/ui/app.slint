@@ -401,6 +401,7 @@ component MessageRow inherits Rectangle {
                 if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
                 if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
                 if Prefs.menu-open-media && root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
+                if Prefs.menu-copy-file && root.item.media > 0: MenuItem { title: "Copy file link"; activated => { root.action("copy-file", root.item.id); } }
                 if root.item.media > 0 && root.item.media < 4: MenuSeparator {}
                 if Prefs.menu-react: Menu {
                     title: "React";

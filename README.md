@@ -314,6 +314,9 @@ cargo build --release            # Linux / Windows
 Use the release build for real use; debug builds are much slower (dependencies are
 optimised in debug too, but Whisker's own code isn't).
 
+Every push builds Linux, Windows and Android artifacts in Actions. A `v*` tag attaches
+them to a release.
+
 To have Whisker in the app menu and the FerroOS Share box, install its desktop entry (it
 expects `whisker` on your `PATH`, e.g. linked into `~/.local/bin`):
 

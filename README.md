@@ -1,5 +1,7 @@
 # Whisker
 
+[![Build](https://github.com/anti-ghostsec/whisker/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/anti-ghostsec/whisker/actions/workflows/build.yml)
+
 A Matrix client written in Rust and built for privacy, running on Linux, Windows and
 Android. It keeps every account on every server signed in at once, can hide alt accounts
 behind a second passphrase, and can run an AI as its own automated account with moderation

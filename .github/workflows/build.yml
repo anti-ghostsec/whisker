@@ -1,0 +1,172 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev nasm pkg-config \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libfontconfig1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-sync-dev libxcb-xinerama0-dev \
+            libxcb-icccm4-dev libxcb-keysyms1-dev libxcb-util-dev libxcb-cursor-dev \
+            libdbus-1-dev libssl-dev
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  linux:
+    name: Linux
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev nasm pkg-config \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libfontconfig1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-sync-dev libxcb-xinerama0-dev \
+            libxcb-icccm4-dev libxcb-keysyms1-dev libxcb-util-dev libxcb-cursor-dev \
+            libdbus-1-dev libssl-dev
+
+      - name: Build
+        run: cargo build --release --locked -p whisker -p whisker-agentd
+
+      - name: Package
+        run: |
+          mkdir -p dist/whisker-linux-x86_64
+          cp target/release/whisker target/release/whisker-agentd dist/whisker-linux-x86_64/
+          cp README.md apps/whisker/whisker.desktop dist/whisker-linux-x86_64/
+          tar -C dist -czf dist/whisker-linux-x86_64.tar.gz whisker-linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisker-linux-x86_64
+          path: dist/whisker-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows
+    needs: check
+    runs-on: windows-2022
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked -p whisker -p whisker-agentd
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/whisker-windows-x86_64 | Out-Null
+          Copy-Item target/release/whisker.exe, target/release/whisker-agentd.exe, README.md dist/whisker-windows-x86_64/
+          Compress-Archive -Path dist/whisker-windows-x86_64 -DestinationPath dist/whisker-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisker-windows-x86_64
+          path: dist/whisker-windows-x86_64.zip
+          if-no-files-found: error
+
+  android:
+    name: Android
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install xbuild
+        run: cargo install --git https://github.com/rust-mobile/xbuild.git --rev e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1 --locked xbuild
+
+      - name: Build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: x build -p whisker --platform android --arch arm64 --release --format apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisker-android-arm64
+          path: target/x/release/android/whisker.apk
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, android]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

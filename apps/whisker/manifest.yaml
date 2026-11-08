@@ -1,0 +1,21 @@
+# Android settings for xbuild (`x build --platform android`). xbuild reads
+# this file, not [package.metadata.android] in Cargo.toml.
+android:
+  manifest:
+    package: io.github.antighostsec.whisker
+    uses_permission:
+      - name: android.permission.INTERNET
+      # Bringing the open Whisker to the front when something is shared to it.
+      - name: android.permission.REORDER_TASKS
+    application:
+      label: Whisker
+      activities:
+        # Whisker shows up in other apps' Share menus, for any files or text.
+        - intent_filters:
+            - actions:
+                - android.intent.action.SEND
+                - android.intent.action.SEND_MULTIPLE
+              categories:
+                - android.intent.category.DEFAULT
+              data:
+                - mime_type: "*/*"

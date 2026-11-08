@@ -1023,6 +1023,13 @@ component UnlockScreen inherits Rectangle {
     }
 }
 
+// Room the phone's status and navigation bars take at the top and bottom
+// of the screen (zero on desktops), so nothing is drawn under them.
+global Safe {
+    in-out property <length> top;
+    in-out property <length> bottom;
+}
+
 component Overlay inherits Rectangle {
     in property <length> card-width: 380px;
     callback dismiss;
@@ -1030,6 +1037,8 @@ component Overlay inherits Rectangle {
     TouchArea { clicked => { root.dismiss(); } }
     VerticalLayout {
         alignment: center;
+        padding-top: Safe.top;
+        padding-bottom: Safe.bottom;
         HorizontalLayout {
             alignment: center;
             Rectangle {
@@ -1196,6 +1205,7 @@ export component AppWindow inherits Window {
     in-out property <string> draft;
     // The spell check looks again once typing pauses.
     changed draft => { root.spell-refresh(); }
+    changed safe-area-insets => { Safe.top = self.safe-area-insets.top; Safe.bottom = self.safe-area-insets.bottom; }
     in-out property <string> reply-to;
     in property <string> reply-label;
     in-out property <string> editing;
@@ -1429,7 +1439,7 @@ export component AppWindow inherits Window {
         Palette.color-scheme = root.theme == 0 ? ColorScheme.dark : root.theme == 1 ? ColorScheme.light : ColorScheme.unknown;
         Theme.dark = root.theme == 0 || (root.theme == 2 && Palette.color-scheme == ColorScheme.dark);
     }
-    init => { root.apply-theme(); }
+    init => { root.apply-theme(); Safe.top = self.safe-area-insets.top; Safe.bottom = self.safe-area-insets.bottom; }
     changed theme => { root.apply-theme(); }
 
     // Copies to the system clipboard through a hidden text field.
@@ -1451,6 +1461,8 @@ export component AppWindow inherits Window {
     }
 
     if root.screen == 0: UnlockScreen {
+        y: Safe.top;
+        height: root.height - Safe.top - Safe.bottom;
         first-run: root.first-run;
         error: root.error;
         busy: root.busy;
@@ -1459,6 +1471,8 @@ export component AppWindow inherits Window {
     }
 
     if root.screen == 1: HorizontalLayout {
+        y: Safe.top;
+        height: root.height - Safe.top - Safe.bottom;
         // Account rail
         Rectangle {
             width: 64px;
@@ -2497,6 +2511,8 @@ export component AppWindow inherits Window {
     }
 
     if root.screen == 2: SettingsPage {
+        y: Safe.top;
+        height: root.height - Safe.top - Safe.bottom;
         narrow: root.narrow;
         theme <=> root.theme;
         auto-lock <=> root.auto-lock;

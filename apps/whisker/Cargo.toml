@@ -46,19 +46,4 @@ jni = "0.21"
 [build-dependencies]
 slint-build = "1.18.1"
 
-[package.metadata.android]
-package = "io.github.antighostsec.whisker"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.INTERNET"
-
-# Bringing the open Whisker to the front when something is shared to it.
-[[package.metadata.android.uses_permission]]
-name = "android.permission.REORDER_TASKS"
-
-# Whisker shows up in other apps' Share menus, for any files or text.
-[[package.metadata.android.application.activity.intent_filter]]
-actions = ["android.intent.action.SEND", "android.intent.action.SEND_MULTIPLE"]
-categories = ["android.intent.category.DEFAULT"]
-[[package.metadata.android.application.activity.intent_filter.data]]
-mime_type = "*/*"
+# Android permissions, name and Share menu entry are in manifest.yaml.

@@ -56,6 +56,7 @@ pub enum VaultError {
 }
 
 /// An unlocked vault. Holds the derived key, never the passphrase.
+#[derive(Clone)]
 pub struct Vault {
     path: PathBuf,
     salt: [u8; 16],

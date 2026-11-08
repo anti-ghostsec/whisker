@@ -15,6 +15,9 @@ mod format;
 mod settings;
 pub mod share;
 mod spaces;
+mod spell;
+#[cfg(not(target_os = "android"))]
+mod spell_marks;
 mod ui;
 
 use anyhow::Result;
@@ -30,6 +33,7 @@ use tokio::task::JoinHandle;
 use ui::{MsgRow, PixelCache, Pixels, initial_hue, s};
 use whisker_agent::{Detected, Llm, agents_in, save_agents};
 use whisker_core::files::{self, FileLink};
+use whisker_core::stickers::{self, Sticker};
 use whisker_core::timeline::{self, HistoryItem, MediaKind};
 use whisker_core::{AccountId, AccountKind, AccountManager, AccountSummary, ClientEvent, LoginRequest, ModAction, VaultId};
 
@@ -111,6 +115,15 @@ struct State {
     /// page but not saved yet, with their PNG picture.
     pending_cards: HashMap<AccountId, Option<CardAndPicture>>,
     reply_to: Option<OwnedEventId>,
+    /// Files picked to send with the next message (its text is their
+    /// caption), in the open room.
+    pending_files: Vec<PathBuf>,
+    /// Your stickers, with the vault each is kept in.
+    stickers: Vec<(VaultId, Sticker)>,
+    /// The picture being saved as a sticker, while its name is asked.
+    sticker_from: Option<timeline::Media>,
+    /// Stickers' pictures, small (`None`: couldn't be loaded).
+    sticker_pics: HashMap<String, Option<Pixels>>,
     editing: Option<OwnedEventId>,
     /// What the servers said about files linked in messages (`None`: they
     /// couldn't say), by address.
@@ -132,6 +145,11 @@ struct State {
     /// Rooms marked read locally: the server's unread count at that moment.
     /// The badge stays hidden until the server reports a different count.
     cleared: HashMap<RoomKey, u64>,
+    /// Messages from others that arrived in rooms that weren't open, since
+    /// each was last read. The server's count only has the ones your push
+    /// rules alert for, so rooms set to mentions only never showed new
+    /// messages.
+    fresh: HashMap<RoomKey, HashSet<OwnedEventId>>,
     /// The verification on screen: (account, other user, flow id).
     verifying: Option<(AccountId, OwnedUserId, String)>,
     /// Public room directory: (server, query, next page token, results).
@@ -147,6 +165,9 @@ struct Ctl {
     settings: Arc<Mutex<AppSettings>>,
     /// Decoded avatar thumbnails (None: failed). Memory only.
     avatars: PixelCache,
+    /// Avatars whose download failed: how many times, for the wait before
+    /// the next try.
+    avatar_tries: Arc<Mutex<HashMap<OwnedMxcUri, u8>>>,
     loading: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -236,9 +257,15 @@ fn play_file(path: &std::path::Path, video: bool) {
 /// server makes, this many pixels across, or the file itself), and what it is.
 type Attempt = (MediaSource, Option<u32>, Preview);
 
-/// Times a preview is tried before it shows as failed, when the server
-/// doesn't answer.
+/// Times a preview is tried before it shows as failed.
 const PREVIEW_TRIES: u8 = 4;
+
+/// Previews downloading at once, across the whole app. Each batch used to
+/// get its own few, so a busy room sent dozens of requests at once and
+/// servers turned some down (rate limits), leaving blank previews.
+static PREVIEW_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(6);
+/// The same for avatars.
+static AVATAR_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(6);
 
 /// Biggest picture downloaded whole when no thumbnail can be had.
 const MAX_FULL_PICTURE_BYTES: u64 = 25 * 1024 * 1024;
@@ -282,6 +309,15 @@ fn preview_attempts(media: &timeline::Media) -> Vec<Attempt> {
         MediaKind::Audio | MediaKind::File => {}
     }
     out
+}
+
+/// The first line of a room description that has something on it.
+fn first_line(topic: &str) -> &str {
+    topic
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
 }
 
 /// A file's `mxc://` address, for messages.
@@ -433,33 +469,68 @@ impl Ctl {
         }
         let c = self.clone();
         self.spawn(async move {
-            let Some(client) = c.mgr.client(account).await else { return };
+            let Some(client) = c.mgr.client(account).await else {
+                return;
+            };
+            // Several at once: one slow server shouldn't hold up the rest.
+            let mut jobs = tokio::task::JoinSet::new();
             for m in wanted {
-                let px = match timeline::thumbnail(&client, &m, AVATAR_PX).await.ok().and_then(|b| decode(&b, AVATAR_PX, AVATAR_PX, true)) {
-                    Some(p) => Some(Some(p)),
-                    // No thumbnail (servers often can't make one for another
-                    // server's media) or one we can't read: the picture itself.
-                    None => match timeline::download(&client, &MediaSource::Plain(m.clone()), None).await {
-                        Ok(b) => Some(tokio::task::spawn_blocking(move || decode(&b, AVATAR_PX, AVATAR_PX, true)).await.ok().flatten()),
+                let (c, client) = (c.clone(), client.clone());
+                jobs.spawn(async move {
+                    let _slot = AVATAR_SLOTS.acquire().await;
+                    // The server's small copy first; when it gives one we can't
+                    // read (or none), the picture itself.
+                    let thumb = timeline::thumbnail(&client, &m, AVATAR_PX).await;
+                    let thumb_failed = thumb.is_err();
+                    let mut px = match thumb {
+                        Ok(b) => tokio::task::spawn_blocking(move || decode(&b, AVATAR_PX, AVATAR_PX, true)).await.ok().flatten(),
                         Err(_) => None,
-                    },
-                };
-                match px {
-                    Some(px) => {
-                        c.avatars.lock().unwrap().insert(m.clone(), px);
-                        c.loading.lock().unwrap().remove(m.as_str());
+                    };
+                    let mut unreachable = thumb_failed;
+                    if px.is_none() {
+                        match timeline::download(&client, &MediaSource::Plain(m.clone()), None).await {
+                            Ok(b) => px = tokio::task::spawn_blocking(move || decode(&b, AVATAR_PX, AVATAR_PX, true)).await.ok().flatten(),
+                            Err(_) => unreachable = true,
+                        }
                     }
-                    // The server didn't answer (busy, rate limit, offline):
-                    // try again in a minute instead of showing initials for good.
-                    None => {
-                        let loading = c.loading.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            loading.lock().unwrap().remove(m.as_str());
-                        });
+                    drop(_slot);
+                    match px {
+                        Some(p) => {
+                            c.avatars.lock().unwrap().insert(m.clone(), Some(p));
+                            c.avatar_tries.lock().unwrap().remove(&m);
+                            c.loading.lock().unwrap().remove(m.as_str());
+                        }
+                        // A download failed (busy server, rate limit, offline):
+                        // try again by itself, sooner at first. Only a picture
+                        // that came but can't be read is given up on.
+                        None if unreachable => {
+                            let tries = {
+                                let mut t = c.avatar_tries.lock().unwrap();
+                                let n = t.entry(m.clone()).or_insert(0);
+                                *n = n.saturating_add(1);
+                                *n
+                            };
+                            let wait = Duration::from_secs(match tries {
+                                1 => 5,
+                                2 => 20,
+                                3 => 60,
+                                _ => 300,
+                            });
+                            let c2 = c.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(wait).await;
+                                c2.loading.lock().unwrap().remove(m.as_str());
+                                c2.fetch_avatars(account, [m]);
+                            });
+                        }
+                        None => {
+                            c.avatars.lock().unwrap().insert(m.clone(), None);
+                            c.loading.lock().unwrap().remove(m.as_str());
+                        }
                     }
-                }
+                });
             }
+            while jobs.join_next().await.is_some() {}
             c.refresh_accounts_only().await;
             c.refresh_rooms().await;
             c.show_messages().await;
@@ -493,15 +564,16 @@ impl Ctl {
         }
         let (c, account, room) = (self.clone(), key.0, key.1.clone());
         self.spawn(async move {
-            let Some(client) = c.mgr.client(account).await else { return };
-            let slots = Arc::new(tokio::sync::Semaphore::new(4));
+            let Some(client) = c.mgr.client(account).await else {
+                return;
+            };
             for (id, attempts) in wanted {
-                let (c, client, room, slots) = (c.clone(), client.clone(), room.clone(), slots.clone());
+                let (c, client, room) = (c.clone(), client.clone(), room.clone());
                 tokio::spawn(async move {
-                    let _slot = slots.acquire().await;
+                    let _slot = PREVIEW_SLOTS.acquire().await;
                     // Each way in turn: another server may not make thumbnails,
                     // or send one we can't read.
-                    let (mut decoded, mut unreachable) = ((None, None), false);
+                    let (mut decoded, mut failed) = ((None, None), false);
                     for (src, thumb, what) in attempts {
                         if let (Preview::Remote, MediaSource::Plain(mxc)) = (what, &src) {
                             let poster = files::look_at_video(&client, mxc, true).await.and_then(|(_, p)| p);
@@ -530,14 +602,20 @@ impl Ctl {
                                 }
                             }
                             Err(e) => {
-                                unreachable = true;
-                                tracing::warn!("couldn't fetch a preview of {id} ({}): {e:#}", media_address(&src));
+                                failed = true;
+                                tracing::warn!(
+                                    "couldn't fetch a preview of {id} ({}): {e:#}",
+                                    media_address(&src)
+                                );
                             }
                         }
                     }
-                    // The server didn't answer (a busy one fetching it from
-                    // another server, or offline): try again a little later.
-                    if decoded.0.is_none() && unreachable {
+                    // A download failed: try again a little later, as a click
+                    // on "try again" would. Busy servers, rate limits and
+                    // files still on their way from another server all
+                    // clear up on their own; answers like "not found" can
+                    // too, while the account's server is still fetching it.
+                    if decoded.0.is_none() && failed {
                         let tries = {
                             let mut st = c.st.lock().unwrap();
                             let n = st.picture_tries.entry(id.clone()).or_default();
@@ -546,7 +624,10 @@ impl Ctl {
                         };
                         if tries < PREVIEW_TRIES {
                             drop(_slot);
-                            tokio::time::sleep(Duration::from_secs(15 << tries)).await;
+                            tokio::time::sleep(Duration::from_secs(
+                                5 * 3u64.pow(u32::from(tries) - 1),
+                            ))
+                            .await;
                             c.loading.lock().unwrap().remove(id.as_str());
                             let key = (account, room);
                             let item = c.st.lock().unwrap().messages.get(&key).and_then(|l| l.iter().find(|m| m.event_id == id).cloned());
@@ -681,6 +762,14 @@ impl Ctl {
     async fn after_unlock(&self, vaults: Vec<VaultId>) {
         let mut handles = Vec::new();
         for v in &vaults {
+            if let Some(words) = self.mgr.extra::<Vec<String>>(v, spell::VAULT_KEY).await {
+                spell::add_custom(words);
+            }
+            if let Some(list) = self.mgr.extra::<Vec<Sticker>>(v, stickers::VAULT_KEY).await {
+                let mut st = self.st.lock().unwrap();
+                st.stickers.retain(|(from, _)| from != v);
+                st.stickers.extend(list.into_iter().map(|x| (v.clone(), x)));
+            }
             handles.extend(whisker_agent::start_vault(&self.mgr, v).await);
         }
         {
@@ -739,6 +828,7 @@ impl Ctl {
             a.abort();
         }
         self.mgr.lock_all().await;
+        spell::clear_custom();
         let _ = std::fs::remove_dir_all(media_dir(self.mgr.data_dir()));
         *self.st.lock().unwrap() = State::default();
         self.avatars.lock().unwrap().clear();
@@ -752,6 +842,7 @@ impl Ctl {
             u.set_status(s(""));
             u.set_draft(s(""));
             u.set_reply_to(s(""));
+            u.set_pending_files(ModelRc::default());
             u.set_editing(s(""));
             u.set_pane(1);
             u.set_share_open(false);
@@ -866,8 +957,9 @@ impl Ctl {
             let mut st = self.st.lock().unwrap();
             // Forget a local "read" once the server's count moves on.
             st.cleared.retain(|(a, r), n| *a != account || rooms.iter().any(|x| &x.room_id == r && x.unread == *n));
-            st.cleared.clone()
+            (st.cleared.clone(), st.fresh.clone())
         };
+        let (cleared, fresh) = cleared;
         let closed = self.st.lock().unwrap().closed_spaces.clone();
         let rows: Vec<RoomRowData> = spaces::tree(&rooms, &closed, &search)
             .into_iter()
@@ -915,7 +1007,7 @@ impl Ctl {
                     avatar: r.avatar.clone(),
                     preview,
                     time: r.latest.as_ref().map(|l| fmt_when(l.ts)).unwrap_or_default(),
-                    unread: if read { 0 } else { r.unread },
+                    unread: if read { 0 } else { r.unread }.max(fresh.get(&(account, r.room_id.clone())).map_or(0, |f| f.len() as u64)),
                     encrypted: r.encrypted,
                 }
             })
@@ -956,7 +1048,8 @@ impl Ctl {
             u.set_current_room(s(room_id));
             u.set_current_invite(invite);
             u.set_current_room_name(s(room_name));
-            u.set_current_room_topic(s(topic.lines().next().unwrap_or_default()));
+            u.set_current_room_topic(s(first_line(&topic)));
+            u.set_current_room_topic_full(s(&topic));
         });
     }
 
@@ -1200,12 +1293,14 @@ impl Ctl {
             st.account = Some(id);
             st.room = None;
             st.reply_to = None;
+            st.pending_files.clear();
             st.editing = None;
             st.explore = Default::default();
         }
         self.ui(|u| {
             ui::with(|m| m.messages.set_vec(Vec::new()));
             u.set_reply_to(s(""));
+            u.set_pending_files(ModelRc::default());
             u.set_editing(s(""));
             u.set_public_rooms(ModelRc::default());
             u.set_exploring(false);
@@ -1252,6 +1347,7 @@ impl Ctl {
                 let mut st = self.st.lock().unwrap();
                 st.room = Some(room_id.clone());
                 st.reply_to = None;
+                st.pending_files.clear();
                 st.editing = None;
             }
             let from = match room.invite_details().await {
@@ -1280,6 +1376,7 @@ impl Ctl {
                 }
                 st.room = Some(room_id.clone());
                 st.reply_to = None;
+                st.pending_files.clear();
                 st.editing = None;
                 st.thread = None;
             }
@@ -1289,6 +1386,7 @@ impl Ctl {
                 u.set_thread_open(false);
                 u.set_loading_history(false);
                 u.set_reply_to(s(""));
+                u.set_pending_files(ModelRc::default());
                 u.set_editing(s(""));
                 u.set_space_status(s(""));
             });
@@ -1311,6 +1409,7 @@ impl Ctl {
             let mut st = self.st.lock().unwrap();
             st.room = Some(room_id.clone());
             st.reply_to = None;
+            st.pending_files.clear();
             st.editing = None;
             st.thread = None;
         }
@@ -1318,6 +1417,7 @@ impl Ctl {
             u.set_thread_open(false);
             u.set_loading_history(true);
             u.set_reply_to(s(""));
+            u.set_pending_files(ModelRc::default());
             u.set_editing(s(""));
             u.set_stick_bottom(true);
         });
@@ -1357,6 +1457,7 @@ impl Ctl {
         if let Some(n) = self.mgr.rooms(key.0).await.iter().find(|r| r.room_id == key.1).map(|r| r.unread) {
             self.st.lock().unwrap().cleared.insert(key.clone(), n);
         }
+        self.st.lock().unwrap().fresh.remove(key);
         self.refresh_rooms().await;
         if let Err(e) = self.mgr.mark_read(key.0, &key.1).await {
             tracing::debug!("read receipt failed: {e}");
@@ -1512,7 +1613,7 @@ impl Ctl {
                             id: s(r.room_id.as_str()),
                             name: s(&r.name),
                             alias: s(r.alias.clone().unwrap_or_default()),
-                            topic: s(r.topic.as_deref().unwrap_or_default().lines().next().unwrap_or_default()),
+                            topic: s(first_line(r.topic.as_deref().unwrap_or_default())),
                             members: s(format!("{} members", r.members)),
                             initial,
                             hue,
@@ -1621,6 +1722,7 @@ impl Ctl {
             let mut st = self.st.lock().unwrap();
             st.room = Some(p.room_id.clone());
             st.reply_to = None;
+            st.pending_files.clear();
             st.editing = None;
             st.thread = None;
             st.messages.insert(key.clone(), p.messages.clone());
@@ -1638,11 +1740,13 @@ impl Ctl {
             u.set_preview_busy(false);
             u.set_current_room(s(&id));
             u.set_current_room_name(s(name));
-            u.set_current_room_topic(s(topic.lines().next().unwrap_or_default()));
+            u.set_current_room_topic(s(first_line(&topic)));
+            u.set_current_room_topic_full(s(&topic));
             u.set_thread_open(false);
             u.set_loading_history(false);
             u.set_has_older(false);
             u.set_reply_to(s(""));
+            u.set_pending_files(ModelRc::default());
             u.set_editing(s(""));
             u.set_can_moderate(false);
             u.set_stick_bottom(true);
@@ -2154,10 +2258,44 @@ impl Ctl {
 
     async fn send(&self, text: String) {
         let text = emoji::replace_open_shortcodes(text.trim());
+        let Some((key, room)) = self.current_room().await else {
+            return;
+        };
+        // Files waiting to go: the text is their caption.
+        let files = {
+            let mut st = self.st.lock().unwrap();
+            if st.editing.is_none() {
+                std::mem::take(&mut st.pending_files)
+            } else {
+                Vec::new()
+            }
+        };
+        if !files.is_empty() {
+            let reply_to = self.st.lock().unwrap().reply_to.take();
+            self.ui(|u| {
+                u.set_reply_to(s(""));
+                u.set_pending_files(ModelRc::default());
+                u.set_stick_bottom(true);
+            });
+            if self.st.lock().unwrap().typing_sent.take().is_some() {
+                let r = room.clone();
+                tokio::spawn(async move { r.typing_notice(false).await });
+            }
+            self.send_files(room, files, text, reply_to).await;
+            return;
+        }
         if text.is_empty() {
             return;
         }
-        let Some((key, room)) = self.current_room().await else { return };
+        // Only `:name:` of one of your stickers: that sticker.
+        let sticker = {
+            let st = self.st.lock().unwrap();
+            if st.editing.is_none() { st.stickers.iter().map(|(_, x)| x).find(|x| stickers::find(std::slice::from_ref(x), &text).is_some()).cloned() } else { None }
+        };
+        if let Some(sticker) = sticker {
+            self.post_sticker(&room, sticker).await;
+            return;
+        }
         // The clear command opens its confirmation instead of being posted.
         let clear = self.settings.lock().unwrap().clear_command.trim().to_owned();
         if !clear.is_empty() && text.eq_ignore_ascii_case(&clear) && self.st.lock().unwrap().editing.is_none() {
@@ -2182,12 +2320,16 @@ impl Ctl {
         };
         self.ui(|u| {
             u.set_reply_to(s(""));
+            u.set_pending_files(ModelRc::default());
             u.set_editing(s(""));
             u.set_status(s(""));
         });
 
         if let Some(target) = editing {
-            if let Err(e) = timeline::edit_text(&room, &target, &text).await {
+            // A picture, video or file: its caption changes, the file stays.
+            let file = self.find(&key, target.as_str()).is_some_and(|m| m.media.as_ref().is_some_and(|x| !x.linked));
+            let done = if file { timeline::edit_caption(&room, &target, &text).await } else { timeline::edit_text(&room, &target, &text).await };
+            if let Err(e) = done {
                 self.status(format!("Not saved: {e:#}"));
             }
             return;
@@ -2371,24 +2513,314 @@ impl Ctl {
         });
     }
 
+    /// Picks files to send. They wait above the message box, so a caption
+    /// can be typed (and a reply picked) first; Enter sends them.
     async fn attach(&self) {
         #[cfg(not(target_os = "android"))]
         {
-            let Some((_, room)) = self.current_room().await else { return };
-            let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().set_title("Send files").pick_files()).await.ok().flatten();
-            for path in picked.unwrap_or_default() {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.status(format!("Uploading {name}…"));
-                let (me, label) = (self.clone(), name.clone());
-                let progress = move |pct: u8| me.status(format!("Uploading {label}… {pct}%"));
-                match timeline::send_file(&room, &path, progress).await {
-                    Ok(()) => self.status(""),
-                    Err(e) => self.status(format!("Couldn't send {name}: {e:#}")),
-                }
+            if self.current_room().await.is_none() {
+                return;
             }
+            let picked = tokio::task::spawn_blocking(|| {
+                rfd::FileDialog::new().set_title("Send files").pick_files()
+            })
+            .await
+            .ok()
+            .flatten();
+            let paths = picked.unwrap_or_default();
+            if paths.is_empty() {
+                return;
+            }
+            self.st.lock().unwrap().pending_files.extend(paths);
+            self.show_pending_files();
+            self.ui(|u| u.set_focus_request(u.get_focus_request() + 1));
         }
         #[cfg(target_os = "android")]
         self.status("Uploading isn't available on Android yet.");
+    }
+
+    /// Opens the room's whole description in a window of its own, with
+    /// its formatting (big rooms keep pages of rules there).
+    async fn open_topic(&self) {
+        let shown = self.ui.upgrade().map(|u| (u.get_current_room_name().to_string(), u.get_current_room_topic_full().to_string()));
+        let (name, mut text) = shown.unwrap_or_default();
+        if let Some((_, room)) = self.current_room().await {
+            let full = whisker_core::rooms::topic(&room).await;
+            if !full.trim().is_empty() {
+                text = full;
+            }
+        }
+        self.ui(move |u| {
+            let text = if text.trim().is_empty() { "This room has no description.".to_owned() } else { text };
+            u.set_topic_title(s(name));
+            u.set_topic_blocks(ui::blocks(&text, &[]));
+            u.set_topic_text(s(text));
+            u.set_topic_open(true);
+        });
+    }
+
+    /// Saves the picture whose menu was used as a sticker called `name`.
+    async fn save_sticker(&self, name: String) {
+        let Some(media) = self.st.lock().unwrap().sticker_from.clone() else { return };
+        let sticker = match Sticker::from_media(&name, &media) {
+            Ok(x) => x,
+            Err(e) => {
+                let m = format!("{e:#}");
+                return self.ui(move |u| u.set_sticker_error(s(m)));
+            }
+        };
+        let Some(vault) = self.spell_vault().await else {
+            return self.ui(|u| u.set_sticker_error(s("Unlock an account first.")));
+        };
+        let mut list: Vec<Sticker> = self.mgr.extra(&vault, stickers::VAULT_KEY).await.unwrap_or_default();
+        list.retain(|x| x.name != sticker.name);
+        list.push(sticker.clone());
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Err(e) = self.mgr.set_extra(&vault, stickers::VAULT_KEY, &list).await {
+            let m = format!("Couldn't save it: {e:#}");
+            return self.ui(move |u| u.set_sticker_error(s(m)));
+        }
+        {
+            let mut st = self.st.lock().unwrap();
+            st.stickers.retain(|(_, x)| x.name != sticker.name);
+            st.sticker_pics.remove(&sticker.name);
+            st.stickers.push((vault, sticker.clone()));
+            st.stickers.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+            st.sticker_from = None;
+        }
+        self.ui(|u| u.set_sticker_save_open(false));
+        self.status(format!("Saved as :{}: (type it to send it)", sticker.name));
+        self.show_stickers();
+    }
+
+    async fn remove_sticker(&self, name: String) {
+        let vault = self.st.lock().unwrap().stickers.iter().find(|(_, x)| x.name == name).map(|(v, _)| v.clone());
+        if let Some(vault) = vault {
+            let mut list: Vec<Sticker> = self.mgr.extra(&vault, stickers::VAULT_KEY).await.unwrap_or_default();
+            list.retain(|x| x.name != name);
+            if let Err(e) = self.mgr.set_extra(&vault, stickers::VAULT_KEY, &list).await {
+                return self.status(format!("Couldn't remove it: {e:#}"));
+            }
+        }
+        self.st.lock().unwrap().stickers.retain(|(_, x)| x.name != name);
+        self.show_stickers();
+    }
+
+    async fn open_stickers(&self) {
+        self.show_stickers();
+        self.ui(|u| u.set_stickers_open(true));
+    }
+
+    /// Sends a sticker from the picker.
+    async fn send_sticker(&self, name: String) {
+        let Some((_, room)) = self.current_room().await else { return };
+        let sticker = self.st.lock().unwrap().stickers.iter().find(|(_, x)| x.name == name).map(|(_, x)| x.clone());
+        self.ui(|u| u.set_stickers_open(false));
+        if let Some(sticker) = sticker {
+            self.post_sticker(&room, sticker).await;
+        }
+    }
+
+    /// Posts a sticker, as a reply when one is being written.
+    async fn post_sticker(&self, room: &matrix_sdk::Room, sticker: Sticker) {
+        let reply_to = self.st.lock().unwrap().reply_to.take();
+        self.ui(|u| {
+            u.set_reply_to(s(""));
+            u.set_stick_bottom(true);
+        });
+        let sent = match sticker.message() {
+            Ok(m) => whisker_core::upload::post_reply(room, m, reply_to.as_deref()).await.map(drop),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = sent {
+            self.status(format!("Couldn't send the sticker: {e:#}"));
+        }
+    }
+
+    /// The picker's rows, loading pictures not seen yet.
+    fn show_stickers(&self) {
+        let (rows, missing): (Vec<(String, Option<Pixels>)>, bool) = {
+            let st = self.st.lock().unwrap();
+            let rows: Vec<(String, Option<Pixels>)> = st.stickers.iter().map(|(_, x)| (x.name.clone(), st.sticker_pics.get(&x.name).cloned().flatten())).collect();
+            let missing = st.stickers.iter().any(|(_, x)| !st.sticker_pics.contains_key(&x.name));
+            (rows, missing)
+        };
+        if missing {
+            self.load_sticker_pics();
+        }
+        self.ui(move |u| {
+            let items: Vec<StickerItem> = rows.iter().map(|(n, p)| StickerItem { name: s(n), picture: p.clone().map(Image::from_rgba8).unwrap_or_default() }).collect();
+            u.set_stickers(ModelRc::new(VecModel::from(items)));
+        });
+    }
+
+    /// Downloads the pictures of stickers not shown yet, then shows them.
+    fn load_sticker_pics(&self) {
+        let want: Vec<Sticker> = {
+            let st = self.st.lock().unwrap();
+            st.stickers.iter().map(|(_, x)| x).filter(|x| !st.sticker_pics.contains_key(&x.name)).cloned().collect()
+        };
+        let Some(account) = self.st.lock().unwrap().account else { return };
+        if want.is_empty() {
+            return;
+        }
+        // Marked as loading (no picture yet) so they're asked for once.
+        for x in &want {
+            self.st.lock().unwrap().sticker_pics.insert(x.name.clone(), None);
+        }
+        let c = self.clone();
+        self.spawn(async move {
+            let Some(client) = c.mgr.client(account).await else { return };
+            for x in want {
+                let Ok(src) = x.source() else { continue };
+                let px = match timeline::download(&client, &src, None).await {
+                    Ok(b) => tokio::task::spawn_blocking(move || decode(&b, 96, 96, false)).await.ok().flatten(),
+                    Err(_) => None,
+                };
+                c.st.lock().unwrap().sticker_pics.insert(x.name.clone(), px);
+            }
+            c.show_stickers();
+        });
+    }
+
+    /// The vault to keep your own additions in: the open account's, else
+    /// the last one unlocked.
+    async fn spell_vault(&self) -> Option<VaultId> {
+        let v = match self.current() {
+            Some(key) => self.vault_of(key.0).await,
+            None => None,
+        };
+        v.or_else(|| self.st.lock().unwrap().active_vault.clone())
+    }
+
+    async fn cancel_reply(&self) {
+        self.st.lock().unwrap().reply_to = None;
+    }
+
+    /// Takes a waiting file off the list.
+    fn remove_pending_file(&self, index: i32) {
+        {
+            let mut st = self.st.lock().unwrap();
+            if let Ok(i) = usize::try_from(index)
+                && i < st.pending_files.len()
+            {
+                st.pending_files.remove(i);
+            }
+        }
+        self.show_pending_files();
+    }
+
+    fn show_pending_files(&self) {
+        let names: Vec<SharedString> = self
+            .st
+            .lock()
+            .unwrap()
+            .pending_files
+            .iter()
+            .map(|p| {
+                s(p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default())
+            })
+            .collect();
+        self.ui(move |u| u.set_pending_files(ModelRc::new(VecModel::from(names))));
+    }
+
+    /// Uploads `paths` (a few at once) and posts them in order: the first as
+    /// a reply to `reply_to`, the last with `caption` under it.
+    async fn send_files(
+        &self,
+        room: matrix_sdk::Room,
+        paths: Vec<PathBuf>,
+        caption: String,
+        reply_to: Option<OwnedEventId>,
+    ) {
+        let opts = self.settings.lock().unwrap().upload.clone();
+        let slots = Arc::new(tokio::sync::Semaphore::new(UPLOADS_AT_ONCE));
+        let shown = Arc::new(Mutex::new(Uploads {
+            total: paths.len(),
+            ..Default::default()
+        }));
+        let count = paths.len();
+        let mut jobs = Vec::new();
+        for (i, path) in paths.into_iter().enumerate() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (me, room, opts, slots, shown) = (
+                self.clone(),
+                room.clone(),
+                opts.clone(),
+                slots.clone(),
+                shown.clone(),
+            );
+            jobs.push((
+                name.clone(),
+                tokio::spawn(async move {
+                    let _slot = slots.acquire_owned().await;
+                    let progress = {
+                        let (me, shown) = (me.clone(), shown.clone());
+                        move |pct: u8| {
+                            let line = {
+                                let mut u = shown.lock().unwrap();
+                                u.active.insert(i, (name.clone(), pct));
+                                u.line()
+                            };
+                            me.status(line);
+                        }
+                    };
+                    progress(0);
+                    let r = timeline::upload_file(&room, &path, &opts, progress).await;
+                    shown.lock().unwrap().active.remove(&i);
+                    r
+                }),
+            ));
+        }
+        let mut failed = Vec::new();
+        for (i, (name, job)) in jobs.into_iter().enumerate() {
+            let reply = if i == 0 { reply_to.as_deref() } else { None };
+            let r = match job.await {
+                Ok(Ok(message)) => {
+                    let message = if i + 1 == count {
+                        whisker_core::upload::with_caption(message, &caption)
+                    } else {
+                        message
+                    };
+                    whisker_core::upload::post_reply(&room, message, reply)
+                        .await
+                        .map(drop)
+                }
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::anyhow!("{e}")),
+            };
+            let line = {
+                let mut u = shown.lock().unwrap();
+                u.done += 1;
+                u.line()
+            };
+            match r {
+                Ok(()) => self.status(line),
+                Err(e) => failed.push(format!("{name}: {e:#}")),
+            }
+        }
+        match failed.as_slice() {
+            [] => self.status(""),
+            [one] => self.status(format!("Couldn't send {one}")),
+            many => self.status(format!(
+                "Couldn't send {} files. {}",
+                many.len(),
+                many.join("; ")
+            )),
+        }
+        // The caption isn't lost when the file carrying it failed.
+        if !failed.is_empty() && !caption.is_empty() {
+            self.ui(move |u| {
+                if u.get_draft().is_empty() {
+                    u.set_draft(s(caption));
+                }
+            });
+        }
     }
 
     fn find(&self, key: &RoomKey, id: &str) -> Option<HistoryItem> {
@@ -2440,7 +2872,8 @@ impl Ctl {
             }
             "edit" => {
                 self.st.lock().unwrap().editing = Some(m.event_id.clone());
-                let body = m.body.clone();
+                // A file's text is its caption, or a stand-in when it has none.
+                let body = if m.media.is_some() && !timeline::is_caption(&m.body) { String::new() } else { m.body.clone() };
                 self.ui(move |u| {
                     u.set_reply_to(s(""));
                     u.set_editing(s(&id));
@@ -2473,6 +2906,17 @@ impl Ctl {
             }
             "profile" => self.open_profile(&key, m.sender.clone()).await,
             "save" => self.save_media(&key, m).await,
+            "save-sticker" => {
+                let Some(media) = m.media.clone() else { return };
+                let stem = media.name.rsplit_once('.').map_or(media.name.as_str(), |(a, _)| a).to_owned();
+                let suggested = stickers::clean_name(&stem).unwrap_or_default();
+                self.st.lock().unwrap().sticker_from = Some(media);
+                self.ui(move |u| {
+                    u.set_sticker_name(s(suggested));
+                    u.set_sticker_error(s(""));
+                    u.set_sticker_save_open(true);
+                });
+            }
             "play" => self.play_media(&key, m).await,
             "view" => self.view_image(&key, m).await,
             "forward" => self.open_forward(key, m.event_id).await,
@@ -2629,8 +3073,12 @@ impl Ctl {
                         SpaceRoomItem {
                             id: s(r.room_id.as_str()),
                             name: s(&r.name),
-                            topic: s(r.topic.as_deref().unwrap_or_default().lines().next().unwrap_or_default()),
-                            members: s(if r.members == 1 { "1 member".into() } else { format!("{} members", r.members) }),
+                            topic: s(first_line(r.topic.as_deref().unwrap_or_default())),
+                            members: s(if r.members == 1 {
+                                "1 member".into()
+                            } else {
+                                format!("{} members", r.members)
+                            }),
                             initial,
                             hue,
                             avatar: m.avatar(&r.avatar, &px),
@@ -2823,8 +3271,16 @@ impl Ctl {
                 self.ui(move |u| u.set_share_status(s(m)));
             }
             let sent = match item {
-                share::Shared::File { name, data } => timeline::send_bytes(&room, &name, data).await.map_err(|e| (name, e)),
-                share::Shared::Text(t) => timeline::send_text(&room, &t, None, &[]).await.map(drop).map_err(|e| ("the text".into(), e)),
+                share::Shared::File { name, data } => {
+                    let opts = self.settings.lock().unwrap().upload.clone();
+                    timeline::send_bytes(&room, &name, data, &opts)
+                        .await
+                        .map_err(|e| (name, e))
+                }
+                share::Shared::Text(t) => timeline::send_text(&room, &t, None, &[])
+                    .await
+                    .map(drop)
+                    .map_err(|e| ("the text".into(), e)),
                 share::Shared::TooBig(name) => {
                     too_big.push(name);
                     Ok(())
@@ -3006,23 +3462,44 @@ impl Ctl {
         });
 
         // Role and permissions in this room.
-        let (role, can_kick, can_ban) = match (room.power_levels().await, &me) {
-            (Ok(pl), Some(me)) => {
-                let level: i64 = match pl.for_user(&user) {
-                    matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Int(i) => i.into(),
-                    _ => i64::MAX,
-                };
-                let role = match level {
-                    i64::MAX => "Creator".to_owned(),
-                    100.. => "Admin".to_owned(),
-                    50..=99 => "Moderator".to_owned(),
-                    1..=49 => format!("Power {level}"),
-                    _ => String::new(),
-                };
-                (role, pl.user_can_kick_user(me, &user), pl.user_can_ban_user(me, &user))
-            }
-            _ => (String::new(), false, false),
-        };
+        let (role, can_kick, can_ban, (level_now, can_set_level, max_level)) =
+            match (room.power_levels().await, &me) {
+                (Ok(pl), Some(me)) => {
+                    use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
+                    let level: i64 = match pl.for_user(&user) {
+                        UserPowerLevel::Int(i) => i.into(),
+                        _ => i64::MAX,
+                    };
+                    // A creator (who outranks everyone) gives up to the usual admin level.
+                    let mine: i64 = match pl.for_user(me) {
+                        UserPowerLevel::Int(i) => i.into(),
+                        _ => 100,
+                    };
+                    let levels = (
+                        if level == i64::MAX {
+                            -1
+                        } else {
+                            level.clamp(-1_000_000, 1_000_000) as i32
+                        },
+                        pl.user_can_change_user_power_level(me, &user),
+                        mine.clamp(-1_000_000, 1_000_000) as i32,
+                    );
+                    let role = match level {
+                        i64::MAX => "Creator".to_owned(),
+                        100.. => "Admin".to_owned(),
+                        50..=99 => "Moderator".to_owned(),
+                        1..=49 => format!("Power {level}"),
+                        _ => String::new(),
+                    };
+                    (
+                        role,
+                        pl.user_can_kick_user(me, &user),
+                        pl.user_can_ban_user(me, &user),
+                        levels,
+                    )
+                }
+                _ => (String::new(), false, false, (0, false, 0)),
+            };
         // Server profile may be newer than this room's member info.
         let (name, avatar_mxc) = match client.account().fetch_user_profile_of(&user).await {
             Ok(p) => (
@@ -3032,7 +3509,24 @@ impl Ctl {
             Err(_) => (name0.unwrap_or(name), avatar0),
         };
         let px = match &avatar_mxc {
-            Some(m) => timeline::thumbnail(&client, m, 256).await.ok().and_then(|b| decode(&b, 256, 256, true)),
+            Some(m) => match timeline::thumbnail(&client, m, 256).await {
+                Ok(b) => {
+                    let (big, small) = tokio::task::spawn_blocking(move || (decode(&b, 256, 256, true), decode(&b, AVATAR_PX, AVATAR_PX, true))).await.unwrap_or((None, None));
+                    // The same picture next to their messages, if it hadn't loaded there.
+                    if let Some(small) = small {
+                        let mut cache = self.avatars.lock().unwrap();
+                        if !matches!(cache.get(m), Some(Some(_))) {
+                            cache.insert(m.clone(), Some(small));
+                            drop(cache);
+                            self.loading.lock().unwrap().remove(m.as_str());
+                            let c = self.clone();
+                            self.spawn(async move { c.show_messages().await });
+                        }
+                    }
+                    big
+                }
+                Err(_) => None,
+            },
             None => None,
         };
         let has_dm = client.get_dm_room(&user).is_some();
@@ -3074,6 +3568,9 @@ impl Ctl {
                 is_me,
                 can_kick,
                 can_ban,
+                level: level_now,
+                can_set_level,
+                max_level,
                 has_dm,
                 verified,
                 sessions: ModelRc::new(VecModel::from(
@@ -3117,6 +3614,23 @@ impl Ctl {
                     let d = u.get_draft();
                     u.set_draft(s(format!("{d}{pill}")));
                 });
+            }
+            a if a.starts_with("level:") => {
+                let Ok(level) = a["level:".len()..].parse::<i64>() else {
+                    return;
+                };
+                let act = ModAction::SetPowerLevel {
+                    user: user.clone(),
+                    level,
+                };
+                match act.apply(&room).await {
+                    Ok(()) => {
+                        self.status(format!("Done: {act}"));
+                        // Show the new role (and what may still be changed).
+                        self.open_profile(&key, user).await;
+                    }
+                    Err(e) => self.status(format!("Couldn't change the role: {e}")),
+                }
             }
             "kick" | "ban" => {
                 close(self);
@@ -3200,12 +3714,90 @@ impl Ctl {
         }
     }
 
+    /// One upload setting changed (`key` as the Settings page names it).
+    fn set_upload(&self, key: &str, v: i32) {
+        use whisker_core::upload::{Convert, ThumbFormat};
+        let mut st = self.settings.lock().unwrap();
+        let u = &mut st.upload;
+        let on = v != 0;
+        match key {
+            "strip" => u.strip_metadata = on,
+            "hash" => u.hash_names = on,
+            "convert" => {
+                u.convert = [Convert::Keep, Convert::Jpeg, Convert::Png]
+                    .get(v as usize)
+                    .copied()
+                    .unwrap_or_default()
+            }
+            "quality" => u.quality = v.clamp(1, 100) as u8,
+            "thumbs" => u.thumbnails = on,
+            "thumb-format" => {
+                u.thumb_format = if v == 1 {
+                    ThumbFormat::Png
+                } else {
+                    ThumbFormat::Jpeg
+                }
+            }
+            "thumb-quality" => u.thumb_quality = v.clamp(1, 100) as u8,
+            "encrypt" => u.always_encrypt = on,
+            _ => return,
+        }
+        let _ = st.save(self.mgr.data_dir());
+        let u = st.upload.clone();
+        drop(st);
+        self.ui(move |ui| show_upload_prefs(&ui.global::<Prefs>(), &u));
+    }
+
+    fn set_ask_file_servers(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.ask_file_servers = on;
+        let _ = st.save(self.mgr.data_dir());
+        whisker_core::media_fetch::set_ask_file_servers(on);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_ask_file_servers(on);
+        }
+    }
+
     fn set_link_posters(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.link_posters = on;
         let _ = st.save(self.mgr.data_dir());
         if let Some(u) = self.ui.upgrade() {
             u.global::<Prefs>().set_link_posters(on);
+        }
+    }
+
+    fn set_spell_check(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.spell_check = on;
+        let _ = st.save(self.mgr.data_dir());
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_spell_check(on);
+            #[cfg(not(target_os = "android"))]
+            spell_marks::set_on(&u, on);
+        }
+    }
+
+    /// Keeps a word added to the dictionary, in the open account's vault.
+    async fn save_spell_word(&self, word: String) {
+        let vault = match self.current() {
+            Some(key) => self.vault_of(key.0).await,
+            None => None,
+        }
+        .or_else(|| self.st.lock().unwrap().active_vault.clone());
+        let Some(vault) = vault else { return };
+        let mut words: Vec<String> = self
+            .mgr
+            .extra(&vault, spell::VAULT_KEY)
+            .await
+            .unwrap_or_default();
+        let word = word.to_lowercase();
+        if !words.contains(&word) {
+            words.push(word);
+            words.sort();
+            if let Err(e) = self.mgr.set_extra(&vault, spell::VAULT_KEY, &words).await {
+                self.status(format!("Couldn't save the word: {e:#}"));
+            }
         }
     }
 
@@ -3346,7 +3938,12 @@ impl Ctl {
     async fn draft_edited(&self, text: String) {
         // A finished `:name:` becomes its emoji straight away.
         let word = last_word(&text);
-        if let Some(e) = word.strip_prefix(':').and_then(|w| w.strip_suffix(':')).filter(|n| !n.is_empty()).and_then(emoji::shortcode) {
+        if let Some(e) = word
+            .strip_prefix(':')
+            .and_then(|w| w.strip_suffix(':'))
+            .filter(|n| !n.is_empty() && !self.st.lock().unwrap().stickers.iter().any(|(_, x)| x.name == *n))
+            .and_then(emoji::shortcode)
+        {
             let new = format!("{}{e}", &text[..text.len() - word.len()]);
             self.st.lock().unwrap().draft = new.clone();
             self.ui(move |u| {
@@ -3360,6 +3957,7 @@ impl Ctl {
         self.st.lock().unwrap().draft = text.clone();
         // (label, detail, insert, kind); built into Slint rows on the UI thread.
         let mut out: Vec<(String, String, String, i32)> = Vec::new();
+        let mut pics: HashMap<String, Pixels> = HashMap::new();
         if let Some(q) = word.strip_prefix('@').filter(|q| !q.is_empty()) {
             if let Some((key, room)) = self.current_room().await {
                 for (user, name) in best_members(&self.members(&key, &room).await, q).into_iter().take(6) {
@@ -3367,6 +3965,24 @@ impl Ctl {
                 }
             }
         } else if let Some(q) = word.strip_prefix(':').filter(|q| !q.is_empty() && !q.contains(':')) {
+            let found: Vec<Sticker> = {
+                let st = self.st.lock().unwrap();
+                let list: Vec<Sticker> = st.stickers.iter().map(|(_, x)| x.clone()).collect();
+                let found: Vec<Sticker> = stickers::suggest(&list, q).into_iter().take(4).cloned().collect();
+                for x in &found {
+                    if let Some(Some(p)) = st.sticker_pics.get(&x.name) {
+                        pics.insert(x.name.clone(), p.clone());
+                    }
+                }
+                found
+            };
+            if found.iter().any(|x| !pics.contains_key(&x.name)) {
+                self.load_sticker_pics();
+            }
+            for x in &found {
+                let tag = format!(":{}:", x.name);
+                out.push((x.name.clone(), format!("{tag} · sticker"), tag, 2));
+            }
             for e in emoji::suggest(q).into_iter().take(8) {
                 out.push((e.to_owned(), format!(":{}:", emoji::name_of(e)), e.to_owned(), 1));
             }
@@ -3375,7 +3991,11 @@ impl Ctl {
             let rows: Vec<Suggestion> = out
                 .iter()
                 .map(|(label, detail, insert, kind)| Suggestion {
-                    picture: if *kind == 1 { ui::emoji_image(label) } else { Image::default() },
+                    picture: match kind {
+                        1 => ui::emoji_image(label),
+                        2 => pics.get(label).map(|p| Image::from_rgba8(p.clone())).unwrap_or_default(),
+                        _ => Image::default(),
+                    },
                     label: s(label),
                     detail: s(detail),
                     insert: s(insert),
@@ -4204,12 +4824,19 @@ impl Ctl {
                         self.spawn(async move { c.maybe_notify(account, room_id, sender, name, body, origin_server_ts).await });
                     }
                     let key = (account, room_id);
+                    // New since the last sync, from someone else, in a room that
+                    // isn't open: counts towards the room's badge.
+                    let live = self.st.lock().unwrap().synced.contains(&account);
+                    if live && self.current().as_ref() != Some(&key) && !self.mgr.accounts().await.iter().any(|a| a.user_id == sender.as_str()) {
+                        self.st.lock().unwrap().fresh.entry(key.clone()).or_default().insert(event_id.clone());
+                    }
                     let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone(), pills, shield };
                     // Kept for every room, so opening one shows something at once
                     // (its history still loads on first open).
                     self.merge(&key, vec![item]);
                     {
                         if self.current().as_ref() == Some(&key) {
+                            self.st.lock().unwrap().fresh.remove(&key);
                             // A thread reply updates its thread, not the timeline's end.
                             match &thread {
                                 Some(root) => self.update_message(&key, root),
@@ -4429,6 +5056,59 @@ fn to_png(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
+/// Puts the upload settings on the Settings page.
+fn show_upload_prefs(p: &Prefs, u: &whisker_core::upload::UploadOptions) {
+    use whisker_core::upload::{Convert, ThumbFormat};
+    p.set_up_strip(u.strip_metadata);
+    p.set_up_hash(u.hash_names);
+    p.set_up_convert(match u.convert {
+        Convert::Keep => 0,
+        Convert::Jpeg => 1,
+        Convert::Png => 2,
+    });
+    p.set_up_quality(i32::from(u.quality));
+    p.set_up_thumbs(u.thumbnails);
+    p.set_up_thumb_format(i32::from(u.thumb_format == ThumbFormat::Png));
+    p.set_up_thumb_quality(i32::from(u.thumb_quality));
+    p.set_up_encrypt(u.always_encrypt);
+}
+
+/// Files uploading at the same time.
+const UPLOADS_AT_ONCE: usize = 3;
+
+/// Picked files on their way, for the status line.
+#[derive(Default)]
+struct Uploads {
+    total: usize,
+    done: usize,
+    /// Uploading now: (name, percent sent), by place in the list.
+    active: std::collections::BTreeMap<usize, (String, u8)>,
+}
+
+impl Uploads {
+    fn line(&self) -> String {
+        let now: Vec<String> = self
+            .active
+            .values()
+            .map(|(n, p)| format!("{n} {p}%"))
+            .collect();
+        match (self.total, now.is_empty()) {
+            (1, false) => format!("Uploading {}…", now[0]),
+            (_, false) => format!(
+                "Uploading {} of {} files… {}",
+                (self.done + 1).min(self.total),
+                self.total,
+                now.join(", ")
+            ),
+            _ => format!(
+                "Sending {} of {} files…",
+                (self.done + 1).min(self.total),
+                self.total
+            ),
+        }
+    }
+}
+
 /// A name usable as a file name everywhere.
 fn safe_file_name(name: &str) -> String {
     let n: String = name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
@@ -4490,8 +5170,16 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
+    ui.global::<Prefs>().set_spell_check(prefs.spell_check);
+    #[cfg(not(target_os = "android"))]
+    spell_marks::set_on(&ui, prefs.spell_check);
     ui.global::<Prefs>().set_link_posters(prefs.link_posters);
-    ui.global::<Prefs>().set_clear_command(s(&prefs.clear_command));
+    ui.global::<Prefs>()
+        .set_ask_file_servers(prefs.ask_file_servers);
+    show_upload_prefs(&ui.global::<Prefs>(), &prefs.upload);
+    whisker_core::media_fetch::set_ask_file_servers(prefs.ask_file_servers);
+    ui.global::<Prefs>()
+        .set_clear_command(s(&prefs.clear_command));
     autocorrect::warm();
     ui.global::<ModelInfo>().on_sees(|model, _| {
         let model = model.trim();
@@ -4520,6 +5208,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         st: Arc::default(),
         settings: Arc::new(Mutex::new(prefs)),
         avatars: Arc::default(),
+        avatar_tries: Arc::default(),
         loading: Arc::default(),
     };
 
@@ -4617,7 +5306,19 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.on_emoji_search(move |q| c.emoji_search(q.to_string()));
     }
     ui.set_emoji_rows(emoji_rows(&emoji::search("")));
-    ui.set_quick_reactions(ModelRc::new(VecModel::from(emoji::QUICK.iter().map(s).collect::<Vec<_>>())));
+    let quick: Vec<QuickReaction> = emoji::QUICK
+        .iter()
+        .zip(emoji::QUICK_LABELS)
+        .map(|(e, label)| QuickReaction {
+            emoji: s(*e),
+            label: s(label),
+            icon: emoji::picture(e)
+                .and_then(|png| decode(png, 32, 32, false))
+                .map(Image::from_rgba8)
+                .unwrap_or_default(),
+        })
+        .collect();
+    ui.set_quick_reactions(ModelRc::new(VecModel::from(quick)));
     on!(on_create_room, |n, t, public, alias, enc, inv| create_room);
     on!(on_login, |hs, u, p, t, px, ag, reg, tok| login);
     {
@@ -4662,6 +5363,16 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_filter_image_models, |q| filter_image_models);
     on!(on_change_passphrase, |o, n| change_passphrase);
     on!(on_attach, attach);
+    on!(on_cancel_reply, cancel_reply);
+    on!(on_save_sticker, |n| save_sticker);
+    on!(on_remove_sticker, |n| remove_sticker);
+    on!(on_send_sticker, |n| send_sticker);
+    on!(on_open_stickers, open_stickers);
+    on!(on_open_topic, open_topic);
+    {
+        let c = ctl.clone();
+        ui.on_remove_pending_file(move |i| c.remove_pending_file(i));
+    }
     on!(on_load_older, load_older);
     on!(on_remove_agent, remove_agent);
     on!(on_lock, lock);
@@ -4721,7 +5432,39 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         let c = ctl.clone();
         ui.on_set_autocorrect(move |b| c.set_autocorrect(b));
         let c = ctl.clone();
+        ui.on_set_spell_check(move |b| c.set_spell_check(b));
+        #[cfg(not(target_os = "android"))]
+        {
+            let weak = ui.as_weak();
+            ui.on_spell_refresh(move || {
+                if let Some(u) = weak.upgrade() {
+                    spell_marks::soon(&u);
+                }
+            });
+            let weak = ui.as_weak();
+            ui.on_spell_replace(move |w| {
+                if let Some(u) = weak.upgrade() {
+                    spell_marks::replace(&u, &w);
+                }
+            });
+            let (c, weak) = (ctl.clone(), ui.as_weak());
+            ui.on_spell_add(move || {
+                let (Some(u), Some(word)) = (weak.upgrade(), spell_marks::take_clicked_word())
+                else {
+                    return;
+                };
+                spell::add_custom([word.clone()]);
+                spell_marks::recheck(&u);
+                let c2 = c.clone();
+                c.spawn(async move { c2.save_spell_word(word).await });
+            });
+        }
+        let c = ctl.clone();
         ui.on_set_link_posters(move |b| c.set_link_posters(b));
+        let c = ctl.clone();
+        ui.on_set_ask_file_servers(move |b| c.set_ask_file_servers(b));
+        let c = ctl.clone();
+        ui.on_set_upload(move |k, v| c.set_upload(k.as_str(), v));
         let c = ctl.clone();
         ui.on_set_clear_command(move |t| c.set_clear_command(t.to_string()));
         let c = ctl.clone();
@@ -4754,11 +5497,41 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
 
     rt.spawn(ctl.clone().pump());
     rt.spawn(ctl.clone().auto_lock_loop());
-    ui.run()?;
+    #[cfg(all(unix, not(target_os = "android")))]
+    rt.spawn(quit_on_signal());
+    // Lock (saving the stores into the vaults) however the window loop ends,
+    // even when it ends with an error (the display went away at logout).
+    let ran = ui.run();
     rt.block_on(ctl.mgr.lock_all());
     let _ = std::fs::remove_dir_all(media_dir(ctl.mgr.data_dir()));
     share::stop_listening(ctl.mgr.data_dir());
-    Ok(())
+    Ok(ran?)
+}
+
+/// Ends the window loop when the system asks Whisker to stop (shutdown,
+/// logout, `kill`, Ctrl+C in a terminal), so it locks and saves like a
+/// normal close. Without this the newest encryption keys, which live in a
+/// RAM folder until saved into the vault, would be lost.
+#[cfg(all(unix, not(target_os = "android")))]
+async fn quit_on_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut hup), Ok(mut int)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        tracing::warn!("can't watch for shutdown signals");
+        return;
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = hup.recv() => {}
+        _ = int.recv() => {}
+    }
+    tracing::info!("asked to stop: locking and saving");
+    let _ = slint::invoke_from_event_loop(|| {
+        let _ = slint::quit_event_loop();
+    });
 }
 
 #[cfg(target_os = "android")]

@@ -13,6 +13,8 @@ pub mod profile;
 pub mod rooms;
 pub mod stores;
 pub mod timeline;
+pub mod stickers;
+pub mod upload;
 pub mod vault;
 pub mod verify;
 

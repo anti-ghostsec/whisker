@@ -353,6 +353,8 @@ impl Models {
             reply_name: s(reply_name),
             reply_text: s(reply_text),
             media,
+            caption: r.item.media.as_ref().is_some_and(|m| !m.linked)
+                && whisker_core::timeline::is_caption(&r.item.body),
             media_name: s(media_name),
             media_info: s(media_info),
             picture: r.picture.as_ref().map(|p| Image::from_rgba8(p.clone())).unwrap_or_default(),

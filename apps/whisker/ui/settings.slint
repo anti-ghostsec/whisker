@@ -153,6 +153,37 @@ component Number inherits HorizontalLayout {
     SpinBox { width: 130px; value <=> root.value; minimum: root.minimum; maximum: root.maximum; }
 }
 
+component UpSwitch inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> hint;
+    in property <bool> checked;
+    callback toggled(bool);
+    spacing: 8px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: center;
+        Text { text: root.text; wrap: word-wrap; color: Theme.text; }
+        if root.hint != "": Text { text: root.hint; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+    }
+    Switch { checked: root.checked; toggled => { root.toggled(self.checked); } }
+}
+
+component UpNumber inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> hint;
+    in property <int> minimum: 0;
+    in property <int> value;
+    callback edited(int);
+    spacing: 8px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: center;
+        Text { text: root.text; wrap: word-wrap; color: Theme.text; }
+        if root.hint != "": Text { text: root.hint; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+    }
+    SpinBox { width: 130px; value: root.value; minimum: root.minimum; maximum: 100; edited(v) => { root.edited(v); } }
+}
+
 component NavRow inherits Rectangle {
     in property <NavItem> item;
     in property <bool> selected;
@@ -194,7 +225,11 @@ component GeneralPage inherits VerticalLayout {
     callback set-notify-level(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
+    callback set-spell-check(bool);
     callback set-link-posters(bool);
+    callback set-ask-file-servers(bool);
+    // An upload setting changed: (key, value; switches are 0 or 1).
+    callback set-upload(string, int);
     callback set-clear-command(string);
     callback set-menu-entry(string, bool);
     in-out property <int> auto-lock;
@@ -304,6 +339,22 @@ component GeneralPage inherits VerticalLayout {
             VerticalLayout {
                 horizontal-stretch: 1;
                 alignment: center;
+                Text { text: "Underline spelling mistakes"; color: Theme.text; }
+                Text {
+                    text: "A red line goes under words that aren't in the dictionary once you stop typing. Right-click one for suggestions, or to add it to your dictionary (kept in your vault).";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.spell-check;
+                toggled => { root.set-spell-check(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
                 Text { text: "Preview frames for video links"; color: Theme.text; }
                 Text {
                     text: "Sending a video's link (mxc://…) uploads one small still from it, so other apps show a picture instead of a blank box. The video itself is never uploaded again.";
@@ -314,6 +365,80 @@ component GeneralPage inherits VerticalLayout {
                 checked: Prefs.link-posters;
                 toggled => { root.set-link-posters(self.checked); }
             }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Ask a file's own server"; color: Theme.text; }
+                Text {
+                    text: "When your server can't get an image or file from another server, ask that server for it directly. Fixes some pictures that won't load, but that server then sees your IP address (unless the account uses a proxy) and which file you opened. Your login is never sent to it.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.ask-file-servers;
+                toggled => { root.set-ask-file-servers(self.checked); }
+            }
+        }
+    }
+    Card {
+        title: "Uploads";
+        subtitle: "Applied to every file you send, so nothing asks each time.";
+        UpSwitch {
+            text: "Remove photo metadata (EXIF etc.)";
+            hint: "Photos often carry where they were taken, the phone or camera, and when. This removes it from pictures (JPEG, PNG, WebP, GIF), and from videos and sound files when ffmpeg is installed. Nothing is re-encoded, so quality stays the same.";
+            checked: Prefs.up-strip;
+            toggled(b) => { root.set-upload("strip", b ? 1 : 0); }
+        }
+        UpSwitch {
+            text: "Name files after their contents";
+            hint: "Sends a code made from the file (like 3fa94c….jpg) instead of its own name, which can give away dates, names or folders.";
+            checked: Prefs.up-hash;
+            toggled(b) => { root.set-upload("hash", b ? 1 : 0); }
+        }
+        Field {
+            label: "Convert pictures";
+            hint: "Animations and see-through pictures (for JPEG) are always kept as they are.";
+            ComboBox {
+                model: ["Keep their format", "JPEG", "PNG"];
+                current-index: Prefs.up-convert;
+                selected => { root.set-upload("convert", self.current-index); }
+            }
+        }
+        if Prefs.up-convert == 1 || Prefs.up-strip: UpNumber {
+            text: "JPEG quality (1-100)";
+            hint: "Used when a picture is converted, or turned upright.";
+            minimum: 1;
+            value: Prefs.up-quality;
+            edited(v) => { root.set-upload("quality", v); }
+        }
+        UpSwitch {
+            text: "Make previews of big pictures";
+            hint: "A small copy, so others see the picture without downloading all of it.";
+            checked: Prefs.up-thumbs;
+            toggled(b) => { root.set-upload("thumbs", b ? 1 : 0); }
+        }
+        if Prefs.up-thumbs: Field {
+            label: "Preview format";
+            ComboBox {
+                model: ["JPEG", "PNG"];
+                current-index: Prefs.up-thumb-format;
+                selected => { root.set-upload("thumb-format", self.current-index); }
+            }
+        }
+        if Prefs.up-thumbs && Prefs.up-thumb-format == 0: UpNumber {
+            text: "Preview quality (1-100)";
+            minimum: 1;
+            value: Prefs.up-thumb-quality;
+            edited(v) => { root.set-upload("thumb-quality", v); }
+        }
+        UpSwitch {
+            text: "Always encrypt files, even in rooms without encryption";
+            hint: "The server's file store then only holds scrambled data. Everyone in the room can still open them (the key is in the message), and a few older apps may not show them.";
+            checked: Prefs.up-encrypt;
+            toggled(b) => { root.set-upload("encrypt", b ? 1 : 0); }
         }
     }
     Card {
@@ -985,7 +1110,11 @@ export component SettingsPage inherits Rectangle {
     callback set-send-typing(bool);
     callback set-clear-command(string);
     callback set-autocorrect(bool);
+    callback set-spell-check(bool);
     callback set-link-posters(bool);
+    callback set-ask-file-servers(bool);
+    // An upload setting changed: (key, value; switches are 0 or 1).
+    callback set-upload(string, int);
     callback set-menu-entry(string, bool);
     callback save-account(AccountForm);
     callback profile-edit(string, string, string);
@@ -1077,7 +1206,10 @@ export component SettingsPage inherits Rectangle {
                             set-send-typing(b) => { root.set-send-typing(b); }
                             set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }
+                            set-spell-check(b) => { root.set-spell-check(b); }
                             set-link-posters(b) => { root.set-link-posters(b); }
+                            set-ask-file-servers(b) => { root.set-ask-file-servers(b); }
+                            set-upload(k, v) => { root.set-upload(k, v); }
                             set-menu-entry(k, b) => { root.set-menu-entry(k, b); }
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }
                             unlock-hidden(p) => { root.unlock-hidden(p); }

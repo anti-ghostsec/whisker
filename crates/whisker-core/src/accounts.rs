@@ -33,6 +33,10 @@ struct OpenVault {
     /// Packed stores of this vault's accounts (see [`stores`]), keyed
     /// `store/<account id>`.
     attachments: Attachments,
+    /// Goes up with every change to `profile` or `attachments`.
+    version: u64,
+    /// The version in the file (see [`AccountManager::save_vault`]).
+    written: Arc<std::sync::Mutex<u64>>,
 }
 
 fn store_key(id: AccountId) -> String {
@@ -41,6 +45,16 @@ fn store_key(id: AccountId) -> String {
 
 /// How often running stores are packed into their vault.
 const SNAPSHOT_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How often the encryption-key database is checked for changes. New keys
+/// (a message sent with a new room key, keys received) reach the vault this
+/// soon, instead of waiting for [`SNAPSHOT_EVERY`]: the running store is in
+/// RAM, so keys not yet in the vault are lost if the computer shuts down.
+const KEYS_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+/// Shortest time between two saves for new keys: each save rewrites the
+/// whole vault (tens of megabytes), and in busy encrypted rooms the key
+/// database changes nearly all the time. Locking, logging out and shutting
+/// down still save straight away.
+const KEYS_SAVE_GAP: std::time::Duration = std::time::Duration::from_secs(120);
 
 struct LiveAccount {
     record: AccountRecord,
@@ -231,9 +245,10 @@ impl AccountManager {
             ov.attachments.retain(|k, _| keep.contains(k));
             changed |= ov.attachments.len() != before;
             if changed {
-                ov.vault.save_with(&ov.profile, &ov.attachments)?;
+                ov.version += 1;
             }
         }
+        self.save_vault(vault).await?;
         for id in ids {
             let legacy = self.legacy_store_dir(id);
             if legacy.exists() && self.inner.read().await.vaults.get(vault).is_some_and(|ov| ov.attachments.contains_key(&store_key(id))) {
@@ -245,6 +260,28 @@ impl AccountManager {
         Ok(())
     }
 
+    /// How the encryption-key databases of `vault`'s accounts look on disk
+    /// (time changed and size, with their write-ahead logs), to notice changes
+    /// without reading them.
+    async fn keys_state(&self, vault: &str) -> Vec<Option<(std::time::SystemTime, u64)>> {
+        let ids: Vec<AccountId> = {
+            let inner = self.inner.read().await;
+            inner
+                .vaults
+                .get(vault)
+                .map(|ov| ov.profile.accounts.iter().map(|a| a.id).collect())
+                .unwrap_or_default()
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            for name in [stores::KEYS_DB, &format!("{}-wal", stores::KEYS_DB)] {
+                let meta = std::fs::metadata(self.store_dir(id).join(name)).ok();
+                out.push(meta.and_then(|m| Some((m.modified().ok()?, m.len()))));
+            }
+        }
+        out
+    }
+
     /// Starts the periodic store snapshot task (once).
     fn ensure_snapshotter(&self) {
         if self.snapshotter.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -252,13 +289,34 @@ impl AccountManager {
         }
         let mgr = self.clone();
         tokio::spawn(async move {
+            // Per vault: when it was last saved, and how its key databases looked.
+            let mut seen: HashMap<
+                VaultId,
+                (
+                    std::time::Instant,
+                    Vec<Option<(std::time::SystemTime, u64)>>,
+                ),
+            > = HashMap::new();
             loop {
-                tokio::time::sleep(SNAPSHOT_EVERY).await;
+                tokio::time::sleep(KEYS_CHECK_EVERY).await;
                 for v in mgr.open_vaults().await {
-                    if let Err(e) = mgr.persist(&v).await {
-                        tracing::warn!("could not save stores: {e:#}");
+                    let now = mgr.keys_state(&v).await;
+                    let due = match seen.get(&v) {
+                        Some((at, before)) => (*before != now && at.elapsed() >= KEYS_SAVE_GAP) || at.elapsed() >= SNAPSHOT_EVERY,
+                        None => true,
+                    };
+                    if !due {
+                        continue;
+                    }
+                    match mgr.persist(&v).await {
+                        Ok(()) => {
+                            seen.insert(v, (std::time::Instant::now(), now));
+                        }
+                        Err(e) => tracing::warn!("could not save stores: {e:#}"),
                     }
                 }
+                let open = mgr.open_vaults().await;
+                seen.retain(|v, _| open.contains(v));
             }
         });
     }
@@ -309,7 +367,7 @@ impl AccountManager {
             Ok(v)
         })
         .await??;
-        self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile, attachments: Attachments::new() });
+        self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile, attachments: Attachments::new(), version: 0, written: Default::default() });
         self.ensure_snapshotter();
         Ok(id)
     }
@@ -386,7 +444,7 @@ impl AccountManager {
                     Err(e) => tracing::warn!("could not prepare store of {}: {e:#}", rec.user_id),
                 }
             }
-            self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile, attachments });
+            self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile, attachments, version: 0, written: Default::default() });
             // All at once: one slow account shouldn't hold up the rest.
             futures_util::future::join_all(records.into_iter().map(|rec| {
                 let id = &id;
@@ -467,7 +525,11 @@ impl AccountManager {
             b = b.proxy(p);
         }
         let client = b.build().await?;
-        client.set_media_fetcher(std::sync::Arc::new(crate::media_fetch::WithFallback)).await;
+        client
+            .set_media_fetcher(std::sync::Arc::new(
+                crate::media_fetch::WithFallback::default(),
+            ))
+            .await;
         Ok(client)
     }
 
@@ -522,6 +584,17 @@ impl AccountManager {
                         let m = Msg { body, is_text, is_notice, reply_to, media, thread, pills, shield: timeline::shield(info.as_ref()) };
                         publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
                     }
+                }
+            }
+        });
+        // Stickers: shown like pictures.
+        let (tx, latest) = (self.events.clone(), self.latest.clone());
+        client.add_event_handler(move |ev: matrix_sdk::ruma::events::sticker::OriginalSyncStickerEvent, room: Room, info: Option<matrix_sdk::deserialized_responses::EncryptionInfo>| {
+            let (tx, latest) = (tx.clone(), latest.clone());
+            async move {
+                if let timeline::Parsed::New { body, is_text, reply_to, media, thread, pills } = timeline::parse_sticker(&ev.content) {
+                    let m = Msg { body, is_text, is_notice: false, reply_to, media, thread, pills, shield: timeline::shield(info.as_ref()) };
+                    publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
                 }
             }
         });
@@ -843,10 +916,18 @@ impl AccountManager {
                 p.accounts.retain(|a| a.id != id);
             })
             .await?;
-            if let Some(ov) = self.inner.write().await.vaults.get_mut(&vault)
-                && ov.attachments.remove(&store_key(id)).is_some()
-            {
-                ov.vault.save_with(&ov.profile, &ov.attachments)?;
+            let removed = match self.inner.write().await.vaults.get_mut(&vault) {
+                Some(ov) => {
+                    let gone = ov.attachments.remove(&store_key(id)).is_some();
+                    if gone {
+                        ov.version += 1;
+                    }
+                    gone
+                }
+                None => false,
+            };
+            if removed {
+                self.save_vault(&vault).await?;
             }
         }
         let _ = self.events.send(ClientEvent::AccountsChanged);
@@ -863,11 +944,42 @@ impl AccountManager {
     }
 
     async fn mutate_profile(&self, vault: &str, f: impl FnOnce(&mut Profile)) -> Result<()> {
-        let mut inner = self.inner.write().await;
-        let ov = inner.vaults.get_mut(vault).ok_or_else(|| anyhow!("vault is locked"))?;
-        f(&mut ov.profile);
-        ov.vault.save_with(&ov.profile, &ov.attachments)?;
-        Ok(())
+        {
+            let mut inner = self.inner.write().await;
+            let ov = inner.vaults.get_mut(vault).ok_or_else(|| anyhow!("vault is locked"))?;
+            f(&mut ov.profile);
+            ov.version += 1;
+        }
+        self.save_vault(vault).await
+    }
+
+    /// Writes `vault` to its file if it changed since the last write. The
+    /// encrypting and writing (tens of megabytes with the stores in it) is
+    /// done on a blocking thread from a copy, without holding the manager's
+    /// lock: holding it there froze everything that asks the manager
+    /// anything (opening settings, loading pictures) for as long as each
+    /// save took, which with the 15-second key saving was most of the time.
+    /// Saves go one at a time, and one that finds a newer version already
+    /// written skips itself, so an older copy never overwrites a newer one.
+    async fn save_vault(&self, vault: &str) -> Result<()> {
+        let (v, profile, attachments, version, written) = {
+            let inner = self.inner.read().await;
+            let Some(ov) = inner.vaults.get(vault) else { return Ok(()) };
+            if *ov.written.lock().unwrap() >= ov.version {
+                return Ok(());
+            }
+            (ov.vault.clone(), ov.profile.clone(), ov.attachments.clone(), ov.version, ov.written.clone())
+        };
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut on_disk = written.lock().unwrap();
+            if *on_disk >= version {
+                return Ok(());
+            }
+            v.save_with(&profile, &attachments)?;
+            *on_disk = version;
+            Ok(())
+        })
+        .await?
     }
 
     async fn mutate_account(&self, id: AccountId, f: impl Fn(&mut AccountRecord)) -> Result<()> {

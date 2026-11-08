@@ -225,8 +225,11 @@ pub async fn details(room: &Room) -> RoomDetails {
     }
     RoomDetails {
         name: timeline::room_name(room).await,
-        topic: room.topic().unwrap_or_default(),
-        alias: room.canonical_alias().map(|a| a.to_string()).unwrap_or_default(),
+        topic: topic(room).await,
+        alias: room
+            .canonical_alias()
+            .map(|a| a.to_string())
+            .unwrap_or_default(),
         avatar: room.avatar_url(),
         encrypted: room.encryption_state().is_encrypted(),
         join_rule: join_rule.into(),
@@ -237,6 +240,122 @@ pub async fn details(room: &Room) -> RoomDetails {
         can_invite,
         pinned,
     }
+}
+
+/// The room's description. When the usual reading has none (a description
+/// the SDK couldn't read, or one not synced yet), reads the description
+/// event itself: from the store, then from the server.
+pub async fn topic(room: &Room) -> String {
+    use matrix_sdk::ruma::events::StateEventType;
+    if let Some(t) = room.topic().filter(|t| !t.trim().is_empty()) {
+        return t;
+    }
+    if let Ok(Some(raw)) = room.get_state_event(StateEventType::RoomTopic, "").await {
+        let json = match &raw {
+            matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState::Sync(r) => {
+                r.json().get().to_owned()
+            }
+            matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState::Stripped(r) => {
+                r.json().get().to_owned()
+            }
+        };
+        if let Some(t) = serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|v| topic_text(&v))
+        {
+            return t;
+        }
+    }
+    let req = matrix_sdk::ruma::api::client::state::get_state_event_for_key::v3::Request::new(
+        room.room_id().to_owned(),
+        StateEventType::RoomTopic,
+        String::new(),
+    );
+    match tokio::time::timeout(std::time::Duration::from_secs(10), room.client().send(req)).await {
+        Ok(Ok(resp)) => serde_json::from_str::<serde_json::Value>(resp.event_or_content.get())
+            .ok()
+            .and_then(|v| topic_text(&v))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// The text of a description event, or of its content: the plain `topic`,
+/// else the plain (or first) text of the richer `m.topic`, in either the
+/// current shape or the older list one.
+fn topic_text(v: &serde_json::Value) -> Option<String> {
+    let content = v.get("content").filter(|c| c.is_object()).unwrap_or(v);
+    if let Some(t) = content
+        .get("topic")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.trim().is_empty())
+    {
+        return Some(t.to_owned());
+    }
+    let block = content.get("m.topic")?;
+    let texts = block.get("m.text").unwrap_or(block).as_array()?;
+    let pick = texts
+        .iter()
+        .find(|t| {
+            t.get("mimetype")
+                .and_then(|m| m.as_str())
+                .is_none_or(|m| m == "text/plain")
+        })
+        .or(texts.first())?;
+    let body = pick.get("body")?.as_str()?;
+    let plain = if pick.get("mimetype").and_then(|m| m.as_str()) == Some("text/html") {
+        html_to_text(body)
+    } else {
+        body.to_owned()
+    };
+    Some(plain).filter(|t| !t.trim().is_empty())
+}
+
+/// Rough plain text of a bit of HTML: tags dropped, line breaks kept.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let Some(j) = rest[i..].find('>') else {
+            rest = "";
+            break;
+        };
+        let tag = rest[i + 1..i + j]
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(
+            tag.as_str(),
+            "br" | "p"
+                | "div"
+                | "li"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "tr"
+                | "blockquote"
+        ) && !out.ends_with('\n')
+            && !out.is_empty()
+        {
+            out.push('\n');
+        }
+        rest = &rest[i + j + 1..];
+    }
+    out.push_str(rest);
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .trim()
+        .to_owned()
 }
 
 #[derive(Debug, Clone)]
@@ -410,6 +529,17 @@ mod tests {
         assert_eq!(normalize_server("#room:envs.net"), Some("envs.net".into()));
         assert_eq!(normalize_server("  "), None);
         assert_eq!(normalize_server("127.0.0.1:8008"), Some("127.0.0.1:8008".into()));
+    }
+
+    #[test]
+    fn reads_descriptions_in_every_shape() {
+        let plain = serde_json::json!({"content": {"topic": "Be nice"}});
+        assert_eq!(topic_text(&plain).as_deref(), Some("Be nice"));
+        let current = serde_json::json!({"topic": "", "m.topic": {"m.text": [{"body": "<p>Rule 1</p><p>Rule &amp; 2</p>", "mimetype": "text/html"}]}});
+        assert_eq!(topic_text(&current).as_deref(), Some("Rule 1\nRule & 2"));
+        let older = serde_json::json!({"m.topic": [{"body": "<b>x</b>", "mimetype": "text/html"}, {"body": "Plain rules"}]});
+        assert_eq!(topic_text(&older).as_deref(), Some("Plain rules"));
+        assert_eq!(topic_text(&serde_json::json!({"topic": " "})), None);
     }
 
     #[test]

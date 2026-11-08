@@ -33,6 +33,9 @@ pub fn only_emoji(text: &str, max: usize) -> Option<Vec<&'static str>> {
 /// Shown first when reacting from a message's menu.
 pub const QUICK: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🎉"];
 
+/// What each of [`QUICK`] says, next to its picture in menus.
+pub const QUICK_LABELS: [&str; 6] = ["Like", "Love", "Funny", "Wow", "Sad", "Party"];
+
 /// (emoji, search words), in picker order.
 pub const ALL: &[(&str, &str)] = &[
     // Smileys

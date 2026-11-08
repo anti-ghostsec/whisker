@@ -1,7 +1,11 @@
 """Makes "Whisker Emoji" from Noto Color Emoji: the same colour glyphs, but
-without ordinary text characters (space, digits, # * © ® ™ and the rest of
+without ordinary text characters (digits, # * © ® ™ and the rest of
 Latin-1), so it can come first in a font list without taking over text, and
 with the line-height metrics of a reference text font.
+
+The space stays, with the reference font's width: text boxes measure a line
+by the first font's space, and without one Up and Down didn't move the
+cursor.
 
 Usage: trim_emoji_font.py NotoColorEmoji.ttf DejaVuSans.ttf out.ttf
 Standard library only (no fontTools)."""
@@ -81,6 +85,18 @@ def build_name(family):
         strings += enc
     return struct.pack(">HHH", 0, len(recs), 6 + 12 * len(recs)) + b"".join(recs) + strings
 
+def advance(tables, gid):
+    n = struct.unpack(">H", tables["hhea"][34:36])[0]
+    i = min(gid, n - 1)
+    return struct.unpack(">H", tables["hmtx"][4 * i: 4 * i + 2])[0]
+
+def set_advance(tables, gid, adv):
+    n = struct.unpack(">H", tables["hhea"][34:36])[0]
+    assert gid < n, "glyph shares the last advance"
+    hmtx = bytearray(tables["hmtx"])
+    hmtx[4 * gid: 4 * gid + 2] = struct.pack(">H", adv)
+    return bytes(hmtx)
+
 def metrics(tables):
     upem = struct.unpack(">H", tables["head"][18:20])[0]
     asc, desc, gap = struct.unpack(">hhh", tables["hhea"][4:10])
@@ -96,8 +112,12 @@ def main(src, ref, dst):
     # Also left to the text font: symbols Whisker draws as UI icons
     # (⚙ settings, ▶ ◀ play, ↩ ↪ forward/back).
     text_symbols = (0x2122, 0x2139, 0x2194, 0x2195, 0x2699, 0x25B6, 0x25C0, 0x21A9, 0x21AA)
-    keep = lambda cp: cp >= 0x2000 and cp not in text_symbols or cp in (0x200D, 0xFE0F, 0x20E3)
+    keep = lambda cp: cp >= 0x2000 and cp not in text_symbols or cp in (0x20, 0x200D, 0xFE0F, 0x20E3)
     mapping = {cp: g for cp, g in mapping.items() if keep(cp)}
+    # The space as wide as the text font's, so text spacing doesn't change.
+    rmap = cmap_mappings(rt["cmap"])
+    space_adv = round(advance(rt, rmap[0x20]) * metrics(t)[0] / metrics(rt)[0])
+    t["hmtx"] = set_advance(t, mapping[0x20], space_adv)
     t["cmap"] = build_cmap(mapping)
     t["name"] = build_name("Whisker Emoji")
     # Line height like the text font: same ascent/descent/gap per em.

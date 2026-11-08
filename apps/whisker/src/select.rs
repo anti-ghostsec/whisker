@@ -122,9 +122,31 @@ fn on_event(ui: &AppWindow, window: &slint::Window, event: &WindowEvent) -> Even
             }
             EventResult::Propagate
         }
-        WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+        // The message box's menu offers spellings for the word under the mouse.
+        WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            button: MouseButton::Right,
+            ..
+        } => {
+            if WindowInner::from_pub(window).active_popups().is_empty() {
+                crate::spell_marks::right_click(ui, ST.with(|s| s.borrow().mouse));
+            }
+            EventResult::Propagate
+        }
+        WindowEvent::MouseInput {
+            state,
+            button: MouseButton::Left,
+            ..
+        } => {
             match state {
                 ElementState::Pressed => {
+                    // A menu is open (Slint draws it inside this window): the
+                    // press is on it, e.g. its Copy, or closes it. Keep the
+                    // selection for Copy, and don't start a drag from there.
+                    if !WindowInner::from_pub(window).active_popups().is_empty() {
+                        ST.with(|s| s.borrow_mut().pressed = None);
+                        return EventResult::Propagate;
+                    }
                     let active = ST.with(|s| {
                         let mut s = s.borrow_mut();
                         s.pressed = Some(s.mouse);

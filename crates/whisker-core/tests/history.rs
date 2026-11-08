@@ -189,3 +189,66 @@ fn mentions_round_trip() {
     let html = r#"hi <a href="https://matrix.to/#/%40bob%3Ax">Bob &amp; co</a>, <a href="https://example.com">site</a> <a href='matrix:u/amy:x'>Amy</a>"#;
     assert_eq!(timeline::mention_names(html), [("Bob & co".to_owned(), "@bob:x".to_owned()), ("Amy".to_owned(), "@amy:x".to_owned())]);
 }
+
+/// One of your own messages, as the server hands it back.
+fn mine(client: &matrix_sdk::Client, id: &str, content: serde_json::Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "type": "m.room.message", "event_id": id, "sender": client.user_id().unwrap(), "origin_server_ts": 5,
+        "room_id": "!ed:localhost", "content": content
+    }))
+}
+
+/// The edit that went out, once the SDK sends it.
+async fn sent_edit(server: &MatrixMockServer) -> std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let keep = seen.clone();
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/send/m.room.message/.*"))
+        .respond_with(move |req: &wiremock::Request| {
+            *keep.lock().unwrap() = serde_json::from_slice(&req.body).ok();
+            ResponseTemplate::new(200).set_body_json(json!({"event_id": "$edit"}))
+        })
+        .expect(1)
+        .mount(server.server())
+        .await;
+    seen
+}
+
+#[tokio::test]
+async fn edits_a_reply() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room = server.sync_joined_room(&client, room_id!("!ed:localhost")).await;
+    plain_room(&server).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/event/.*"))
+        .respond_with(mine(&client, "$reply", json!({"msgtype": "m.text", "body": "helo", "m.relates_to": {"m.in_reply_to": {"event_id": "$earlier"}}})))
+        .mount(server.server())
+        .await;
+    let seen = sent_edit(&server).await;
+    timeline::edit_text(&room, event_id!("$reply"), "hello").await.unwrap();
+    let body = seen.lock().unwrap().clone().expect("no edit sent");
+    assert_eq!(body["m.new_content"]["body"], "hello", "{body}");
+    assert_eq!(body["m.relates_to"]["rel_type"], "m.replace", "{body}");
+}
+
+#[tokio::test]
+async fn edits_a_caption() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room = server.sync_joined_room(&client, room_id!("!ed:localhost")).await;
+    plain_room(&server).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/event/.*"))
+        .respond_with(mine(&client, "$pic", json!({"msgtype": "m.image", "body": "my cat", "filename": "cat.png", "url": "mxc://localhost/cat"})))
+        .mount(server.server())
+        .await;
+    let seen = sent_edit(&server).await;
+    timeline::edit_caption(&room, event_id!("$pic"), "my **best** cat").await.unwrap();
+    let body = seen.lock().unwrap().clone().expect("no edit sent");
+    let new = &body["m.new_content"];
+    assert_eq!(new["msgtype"], "m.image", "{body}");
+    assert_eq!(new["url"], "mxc://localhost/cat", "{body}");
+    assert_eq!(new["body"], "my **best** cat", "{body}");
+    assert_eq!(new["filename"], "cat.png", "{body}");
+}

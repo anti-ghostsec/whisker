@@ -11,7 +11,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// The databases worth keeping: room state and encryption keys.
-const KEPT: [&str; 2] = ["matrix-sdk-state.sqlite3", "matrix-sdk-crypto.sqlite3"];
+const KEPT: [&str; 2] = ["matrix-sdk-state.sqlite3", KEYS_DB];
+
+/// The database with the account's encryption keys.
+pub const KEYS_DB: &str = "matrix-sdk-crypto.sqlite3";
 
 /// Root for running stores. On Linux a tmpfs (`$XDG_RUNTIME_DIR`, else
 /// `/dev/shm`), so nothing reaches the disk. Elsewhere a folder in the data

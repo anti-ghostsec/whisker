@@ -8,6 +8,14 @@ import "../assets/fonts/WhiskerEmoji.ttf";
 export { AccountForm, AgentForm, NavItem, Prefs, TextTools, ModelInfo }
 
 // `initial`/`hue`/`avatar` are worked out in Rust so a name looks the same everywhere.
+// A reaction offered in a message's menu. Menus don't use the window's
+// colour emoji font, so the emoji shows as its picture next to a word.
+export struct QuickReaction {
+    emoji: string,
+    label: string,
+    icon: image,
+}
+
 export struct AccountItem {
     id: string,
     name: string,
@@ -115,6 +123,12 @@ export struct Suggestion {
     picture: image,
 }
 
+// One of your stickers, in the sticker picker.
+export struct StickerItem {
+    name: string,
+    picture: image,
+}
+
 // An emoji in the picker, with its colour picture.
 export struct EmojiCell {
     symbol: string,
@@ -163,6 +177,8 @@ export struct MessageItem {
     frame-ms: int,
     // A message of only emoji: their pictures, drawn big instead of the text.
     big-emoji: [image],
+    // A file message whose body is a caption, shown under the file.
+    caption: bool,
     picture-width: length,
     picture-height: length,
     links: [string],
@@ -175,6 +191,14 @@ export struct MessageItem {
     // A thread's first message: how many replies, and the newest ("Bob: hi").
     thread-replies: int,
     thread-last: string,
+}
+
+// A red wavy line under a misspelled word, in the composer's coordinates.
+export struct SpellMark {
+    x: length,
+    y: length,
+    w: length,
+    path: string,
 }
 
 export struct MemberItem {
@@ -226,6 +250,11 @@ export struct Profile {
     is-me: bool,
     can-kick: bool,
     can-ban: bool,
+    // Their power level in the room (-1: a creator, which can't change),
+    // whether you may change it, and the highest you may give.
+    level: int,
+    can-set-level: bool,
+    max-level: int,
     has-dm: bool,
     // 0 = no encryption keys to verify, 1 = not verified, 2 = verified,
     // 3 = verified before but their identity changed, -1 = checking
@@ -473,7 +502,7 @@ component MessageRow inherits Rectangle {
     in property <string> list: "m";
     in property <bool> can-moderate;
     in property <string> room-id;
-    in property <[string]> quick-reactions;
+    in property <[QuickReaction]> quick-reactions;
     callback action(string, string);
     callback copy(string);
     callback link(string);
@@ -493,6 +522,7 @@ component MessageRow inherits Rectangle {
                 if root.selection != "" || TextTools.spanning: MenuItem { title: "Copy"; activated => { TextTools.copy-selection(root.selection); } }
                 if root.selection != "" || TextTools.spanning: MenuSeparator {}
                 if root.item.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.item.id); } }
+                if root.item.media == 1: MenuItem { title: "Save as sticker…"; activated => { root.action("save-sticker", root.item.id); } }
                 if Prefs.menu-open-media && (root.item.media == 2 || root.item.media == 3): MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
                 if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
                 if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
@@ -501,7 +531,7 @@ component MessageRow inherits Rectangle {
                 if root.item.media > 0 && root.item.media < 4: MenuSeparator {}
                 if Prefs.menu-react: Menu {
                     title: "React";
-                    for e in root.quick-reactions: MenuItem { title: e; activated => { root.action("react:" + e, root.item.id); } }
+                    for r in root.quick-reactions: MenuItem { title: r.label; icon: r.icon; activated => { root.action("react:" + r.emoji, root.item.id); } }
                     MenuItem { title: "More emoji…"; activated => { root.pick-reaction(); } }
                 }
                 if Prefs.menu-reply: MenuItem { title: "Reply"; activated => { root.action("reply", root.item.id); } }
@@ -516,7 +546,7 @@ component MessageRow inherits Rectangle {
                     for l in root.item.links: MenuItem { title: l; activated => { root.link(l); } }
                 }
                 if Prefs.menu-copy-link: MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); } }
-                if root.item.mine && root.item.media == 0: MenuItem { title: "Edit"; activated => { root.action("edit", root.item.id); } }
+                if root.item.mine: MenuItem { title: root.item.media == 0 ? "Edit" : root.item.caption ? "Edit caption" : "Add a caption"; activated => { root.action("edit", root.item.id); } }
                 MenuSeparator {}
                 if root.item.mine || root.can-moderate: MenuItem { title: "Delete"; activated => { root.action("delete", root.item.id); } }
                 if !root.item.mine && root.can-moderate: Menu {
@@ -683,7 +713,7 @@ component MessageRow inherits Rectangle {
                             spacing: 4px;
                             for pic in root.item.big-emoji: Image { source: pic; width: 40px; height: 40px; }
                         }
-                        if root.item.media == 0 && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } selected(t) => { root.selection = t; } }
+                        if (root.item.media == 0 || root.item.caption) && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } selected(t) => { root.selection = t; } }
                         if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
                         // Who really sent it: the warning always, the reason on hover.
                         if root.item.shield > 0: Text {
@@ -1123,6 +1153,23 @@ export component AppWindow inherits Window {
     in-out property <string> current-room;
     in property <string> current-room-name;
     in property <string> current-room-topic;
+    // The whole description, and the window showing it with its formatting.
+    in property <string> current-room-topic-full;
+    in-out property <bool> topic-open;
+    in property <string> topic-title;
+    in property <string> topic-text;
+    in property <[Block]> topic-blocks;
+    callback open-topic();
+    // Stickers: saving a picture as one (asking its name), and the picker.
+    in-out property <bool> sticker-save-open;
+    in-out property <string> sticker-name;
+    in property <string> sticker-error;
+    callback save-sticker(string);
+    in-out property <bool> stickers-open;
+    in property <[StickerItem]> stickers;
+    callback open-stickers();
+    callback send-sticker(string);
+    callback remove-sticker(string);
     in property <string> current-account-name;
     in property <string> current-account-user;
     in property <bool> loading-rooms;
@@ -1147,6 +1194,8 @@ export component AppWindow inherits Window {
 
     // Composer
     in-out property <string> draft;
+    // The spell check looks again once typing pauses.
+    changed draft => { root.spell-refresh(); }
     in-out property <string> reply-to;
     in property <string> reply-label;
     in-out property <string> editing;
@@ -1232,7 +1281,7 @@ export component AppWindow inherits Window {
     in-out property <bool> emoji-open;
     in-out property <string> emoji-for;
     in property <[EmojiRow]> emoji-rows;
-    in property <[string]> quick-reactions;
+    in property <[QuickReaction]> quick-reactions;
     callback emoji-search(string);
     // Account being dragged in the rail (-1: none) and how far.
     property <int> rail-drag-from: -1;
@@ -1306,6 +1355,11 @@ export component AppWindow inherits Window {
     callback search-rooms(string);
     callback send(string);
     callback attach();
+    // Files picked to go with the next message (names), and taking one off.
+    in property <[string]> pending-files;
+    callback remove-pending-file(int);
+    // The reply bar was closed: the next message isn't a reply.
+    callback cancel-reply();
     callback load-older();
     callback message-action(string, string);
     callback open-link(string);
@@ -1353,7 +1407,18 @@ export component AppWindow inherits Window {
     callback set-notify-level(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
+    callback set-spell-check(bool);
+    // Spell check: red lines under misspelled words in the composer, and
+    // for the word right-clicked, suggestions (set just before the menu opens).
+    in property <[SpellMark]> spell-marks;
+    in property <string> spell-word;
+    in property <[string]> spell-suggestions;
+    callback spell-refresh();
+    callback spell-replace(string);
+    callback spell-add();
     callback set-link-posters(bool);
+    callback set-ask-file-servers(bool);
+    callback set-upload(string, int);
     callback set-clear-command(string);
     // "Clear messages" dialog: open, and delete the newest `n` (0 = all).
     in-out property <bool> clear-open;
@@ -1377,7 +1442,7 @@ export component AppWindow inherits Window {
     }
 
     function do-send() {
-        if root.draft != "" {
+        if root.draft != "" || (root.pending-files.length > 0 && root.editing == "") {
             root.activity();
             root.send(root.draft);
             root.draft = "";
@@ -1643,7 +1708,12 @@ export component AppWindow inherits Window {
                             alignment: center;
                             horizontal-stretch: 1;
                             Text { text: root.current-room-name; font-size: 16px; font-weight: 800; color: Theme.text; overflow: elide; }
-                            if root.current-room-topic != "": Text { text: root.current-room-topic; font-size: 12px; color: Theme.muted; overflow: elide; }
+                            // A glimpse of the description; click it for all of it.
+                            if root.current-room-topic != "": Text {
+                                text: root.current-room-topic;
+                                font-size: 12px; color: topic-ta.has-hover ? Theme.text : Theme.muted; overflow: elide;
+                                topic-ta := TouchArea { mouse-cursor: pointer; clicked => { root.activity(); root.open-topic(); } }
+                            }
                             TouchArea { mouse-cursor: pointer; clicked => { if root.current-room != "" && !root.current-preview { root.open-room-info(); } } }
                         }
                         if root.current-room != "" && !root.current-preview: VerticalLayout {
@@ -1762,15 +1832,20 @@ export component AppWindow inherits Window {
                     msgs := ScrollView {
                         content-width: self.visible-width;
                         content-height: col.preferred-height;
-                        // Keep the newest message in view unless the user scrolled up.
+                        // Where you are, as the distance from the end of the
+                        // conversation. Kept when things load: older messages
+                        // added above and pictures growing as they arrive don't
+                        // move what you're reading. At the end, it stays at the end.
+                        property <length> from-bottom: 0px;
                         changed content-height => {
-                            if root.stick-bottom { self.content-y = min(0px, self.visible-height - self.content-height); }
+                            self.content-y = min(0px, self.visible-height - self.content-height + (root.stick-bottom ? 0px : self.from-bottom));
                         }
                         changed visible-height => {
-                            if root.stick-bottom { self.content-y = min(0px, self.visible-height - self.content-height); }
+                            self.content-y = min(0px, self.visible-height - self.content-height + (root.stick-bottom ? 0px : self.from-bottom));
                         }
                         scrolled => {
                             root.stick-bottom = self.content-y <= self.visible-height - self.content-height + 40px;
+                            self.from-bottom = max(0px, self.content-height + self.content-y - self.visible-height);
                         }
                         col := VerticalLayout {
                             width: msgs.visible-width;
@@ -1804,7 +1879,7 @@ export component AppWindow inherits Window {
                         drop-shadow-blur: 8px;
                         drop-shadow-color: #00000060;
                         older := Text { text: "Load older messages"; font-size: 12px; color: Theme.text; }
-                        TouchArea { mouse-cursor: pointer; clicked => { root.stick-bottom = false; root.load-older(); } }
+                        TouchArea { mouse-cursor: pointer; clicked => { msgs.from-bottom = max(0px, msgs.content-height + msgs.content-y - msgs.visible-height); root.stick-bottom = false; root.load-older(); } }
                     }
                     if !root.stick-bottom: Rectangle {
                         x: parent.width - 52px;
@@ -1874,7 +1949,36 @@ export component AppWindow inherits Window {
                         text: root.editing != "" ? "Editing your message" : "Replying to " + root.reply-label;
                         color: Theme.muted; font-size: 12px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center;
                     }
-                    IconBtn { icon: "✕"; size: 24px; clicked => { root.reply-to = ""; if root.editing != "" { root.editing = ""; root.draft = ""; } } }
+                    IconBtn { icon: "✕"; size: 24px; clicked => { if root.reply-to != "" { root.cancel-reply(); } root.reply-to = ""; if root.editing != "" { root.editing = ""; root.draft = ""; } } }
+                }
+
+                // Files waiting to go with the next message.
+                if root.pending-files.length > 0 && !root.current-preview: Flickable {
+                    height: 40px;
+                    content-width: max(self.width, pend-row.preferred-width);
+                    pend-row := HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 12px;
+                        padding-top: 8px;
+                        spacing: 6px;
+                        alignment: start;
+                        for f[i] in root.pending-files: Rectangle {
+                            height: 30px;
+                            border-radius: 8px;
+                            background: Theme.raised;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 2px;
+                                spacing: 4px;
+                                Text { text: "📎 " + f; color: Theme.text; font-size: 12px; vertical-alignment: center; overflow: elide; max-width: 220px; }
+                                IconBtn { icon: "✕"; size: 26px; clicked => { root.remove-pending-file(i); } }
+                            }
+                        }
+                        Text {
+                            text: root.pending-files.length == 1 ? "Type a caption, or press Enter to send" : "Type a caption, or press Enter to send them";
+                            color: Theme.muted; font-size: 11px; vertical-alignment: center;
+                        }
+                    }
                 }
 
                 // Looking at a room before joining it: Join instead of the composer.
@@ -1922,6 +2026,10 @@ export component AppWindow inherits Window {
                             padding-bottom: 10px;
                             ContextMenuArea {
                                 Menu {
+                                    for w in root.spell-suggestions: MenuItem { title: w; activated => { root.spell-replace(w); } }
+                                    if root.spell-word != "" && root.spell-suggestions.length == 0: MenuItem { title: "No suggestions"; enabled: false; }
+                                    if root.spell-word != "": MenuItem { title: "Add \"" + root.spell-word + "\" to dictionary"; activated => { root.spell-add(); } }
+                                    if root.spell-word != "": MenuSeparator {}
                                     MenuItem { title: "Cut"; activated => { compose.cut(); root.draft-edited(compose.text); } }
                                     MenuItem { title: "Copy"; activated => { compose.copy(); } }
                                     MenuItem { title: "Paste"; activated => { compose.paste(); root.draft-edited(compose.text); } }
@@ -1929,6 +2037,9 @@ export component AppWindow inherits Window {
                                     MenuItem { title: "Select all"; activated => { compose.focus(); compose.select-all(); } }
                                 }
                                 compose := TextInput {
+                                    // Found by the spell check (see spell_marks.rs).
+                                    accessible-description: "composer";
+                                    changed width => { root.spell-refresh(); }
                                     text <=> root.draft;
                                     single-line: false;
                                     wrap: word-wrap;
@@ -1962,6 +2073,7 @@ export component AppWindow inherits Window {
                                             return accept;
                                         }
                                         if e.text == Key.Escape {
+                                            if root.reply-to != "" { root.cancel-reply(); }
                                             root.reply-to = "";
                                             if root.editing != "" { root.editing = ""; root.draft = ""; }
                                             return accept;
@@ -1970,6 +2082,16 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                        }
+                        // Red lines under misspelled words; places are in the
+                        // text box's coordinates, which start at the padding.
+                        for m in root.spell-marks: Rectangle {
+                            x: 14px + m.x;
+                            y: 10px + m.y;
+                            width: m.w;
+                            height: 2px;
+                            border-radius: 1px;
+                            background: #e5484d;
                         }
                         if root.draft == "": Text {
                             x: 14px;
@@ -1984,6 +2106,15 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         alignment: end;
                         IconBtn {
+                            icon: "🖼";
+                            size: 40px;
+                            active: root.stickers-open;
+                            clicked => { root.activity(); root.open-stickers(); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        IconBtn {
                             icon: "☺";
                             size: 40px;
                             active: root.emoji-open && root.emoji-for == "";
@@ -1992,7 +2123,7 @@ export component AppWindow inherits Window {
                     }
                     VerticalLayout {
                         alignment: end;
-                        Btn { text: root.editing != "" ? "Save" : "Send"; primary: true; height: 40px; enabled: root.current-room != "" && root.draft != ""; clicked => { root.do-send(); } }
+                        Btn { text: root.editing != "" ? "Save" : "Send"; primary: true; height: 40px; enabled: root.current-room != "" && (root.draft != "" || root.pending-files.length > 0); clicked => { root.do-send(); } }
                     }
                 }
                 if root.status != "": HorizontalLayout {
@@ -2129,6 +2260,57 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                            if root.profile.can-set-level: VerticalLayout {
+                                alignment: start;
+                                spacing: 6px;
+                                Text { text: "ROLE IN THIS ROOM"; font-size: 10px; font-weight: 800; color: Theme.muted; }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    for r in [{ name: "Member", level: 0 }, { name: "Moderator", level: 50 }, { name: "Admin", level: 100 }]: Btn {
+                                        // Giving your own level (or lowering your own) can't be undone by you.
+                                        property <bool> final: r.level != root.profile.level && (r.level >= root.profile.max-level || root.profile.is-me);
+                                        property <string> key: "level:" + r.level;
+                                        enabled: r.level <= root.profile.max-level;
+                                        text: root.confirm-mod == self.key ? "Really?" : r.name;
+                                        primary: r.level == root.profile.level;
+                                        danger: root.confirm-mod == self.key;
+                                        horizontal-stretch: 1;
+                                        clicked => {
+                                            if r.level == root.profile.level { return; }
+                                            if !self.final || root.confirm-mod == self.key {
+                                                root.confirm-mod = "";
+                                                root.profile-action(self.key, root.profile.user-id);
+                                            } else {
+                                                root.confirm-mod = self.key;
+                                            }
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    plevel := Input { placeholder: "Custom level (now " + root.profile.level + ")"; }
+                                    Btn {
+                                        property <string> key: "level:" + plevel.text.to-float().round();
+                                        property <bool> final: plevel.text.to-float() >= root.profile.max-level || root.profile.is-me;
+                                        text: root.confirm-mod == self.key ? "Really?" : "Set";
+                                        danger: root.confirm-mod == self.key;
+                                        enabled: plevel.text.is-float() && plevel.text.to-float() <= root.profile.max-level;
+                                        clicked => {
+                                            if !self.final || root.confirm-mod == self.key {
+                                                root.confirm-mod = "";
+                                                root.profile-action(self.key, root.profile.user-id);
+                                                plevel.text = "";
+                                            } else {
+                                                root.confirm-mod = self.key;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.confirm-mod != "" && root.confirm-mod != "kick" && root.confirm-mod != "ban": Text {
+                                    text: root.profile.is-me ? "You're lowering your own level. You won't be able to raise it again yourself." : "They'll have as much power as you, and you won't be able to lower it again. Click again to confirm.";
+                                    font-size: 11px; color: Theme.danger; wrap: word-wrap;
+                                }
+                            }
                             if !root.profile.is-me: Text {
                                 text: "Ignore this user";
                                 font-size: 11px; color: Theme.muted; horizontal-alignment: center;
@@ -2216,16 +2398,26 @@ export component AppWindow inherits Window {
                             if !root.info-editing: VerticalLayout {
                                 spacing: 4px;
                                 Text { text: "DESCRIPTION"; font-size: 10px; font-weight: 800; color: Theme.muted; }
-                                ContextMenuArea {
-                                    Menu {
-                                        MenuItem { title: "Copy"; activated => { rtopic.copy(); } }
-                                        MenuItem { title: "Select all"; activated => { rtopic.focus(); rtopic.select-all(); } }
-                                    }
-                                    rtopic := TextInput {
+                                // Descriptions can be pages long (big rooms keep
+                                // their rules there): the first few lines here,
+                                // all of it, formatted, in a window of its own.
+                                // The fixed width keeps long lines from pushing
+                                // the panel off the screen.
+                                Rectangle {
+                                    height: min(topic-peek.preferred-height, 90px);
+                                    clip: true;
+                                    topic-peek := Text {
+                                        x: 0; y: 0;
+                                        width: parent.width;
                                         text: root.room-details.topic == "" ? "No description." : root.room-details.topic;
-                                        read-only: true; single-line: false; wrap: word-wrap; color: Theme.text;
-                                        selection-background-color: Theme.accent.transparentize(0.55);
+                                        wrap: char-wrap; color: root.room-details.topic == "" ? Theme.muted : Theme.text;
                                     }
+                                }
+                                if root.room-details.topic != "": HorizontalLayout {
+                                    alignment: start;
+                                    spacing: 8px;
+                                    Btn { text: "Read the full description"; clicked => { root.open-topic(); } }
+                                    Btn { text: "Copy"; clicked => { root.copy-text(root.room-details.topic); } }
                                 }
                             }
                             if root.room-details.history != "" && !root.info-editing: Text { text: root.room-details.history; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
@@ -2329,7 +2521,10 @@ export component AppWindow inherits Window {
         set-notify-level(i) => { root.set-notify-level(i); }
         set-send-typing(b) => { root.set-send-typing(b); }
         set-autocorrect(b) => { root.set-autocorrect(b); }
+        set-spell-check(b) => { root.set-spell-check(b); }
         set-link-posters(b) => { root.set-link-posters(b); }
+        set-ask-file-servers(b) => { root.set-ask-file-servers(b); }
+        set-upload(k, v) => { root.set-upload(k, v); }
         set-clear-command(t) => { root.set-clear-command(t); }
         set-menu-entry(k, b) => { root.set-menu-entry(k, b); }
         save-account(f) => { root.activity(); root.save-account(f); }
@@ -2369,6 +2564,92 @@ export component AppWindow inherits Window {
             alignment: end;
             Btn { text: "Copy all"; clicked => { root.copy-text(root.select-text); } }
             Btn { text: "Close"; primary: true; clicked => { root.select-text = ""; root.select-title = "Select text"; } }
+        }
+    }
+
+    if root.sticker-save-open: Overlay {
+        dismiss => { root.sticker-save-open = false; }
+        Text { text: "Save as sticker"; font-size: 18px; font-weight: 800; color: Theme.text; }
+        Text {
+            text: "Give it a short name. Typing :name: then sends it, in any room. Your stickers are kept in your vault, not on the server.";
+            color: Theme.muted; font-size: 12px; wrap: word-wrap;
+        }
+        sname := Input {
+            text <=> root.sticker-name;
+            placeholder: "name (letters, numbers, - or _)";
+            accepted(t) => { root.save-sticker(t); }
+        }
+        if root.sticker-error != "": Text { text: root.sticker-error; color: Theme.danger; font-size: 12px; wrap: word-wrap; }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Btn { text: "Cancel"; clicked => { root.sticker-save-open = false; } }
+            Btn { text: "Save"; primary: true; enabled: root.sticker-name != ""; clicked => { root.save-sticker(root.sticker-name); } }
+        }
+    }
+
+    if root.stickers-open: Overlay {
+        card-width: 460px;
+        dismiss => { root.stickers-open = false; }
+        Text { text: "Stickers"; font-size: 18px; font-weight: 800; color: Theme.text; }
+        if root.stickers.length == 0: Text {
+            text: "No stickers yet. Right-click a picture in a chat and pick \"Save as sticker…\".";
+            color: Theme.muted; font-size: 12px; wrap: word-wrap;
+        }
+        if root.stickers.length > 0: Text {
+            text: root.reply-to != "" ? "Click one to send it as your reply." : "Click one to send it, or type :name: in a message.";
+            color: Theme.muted; font-size: 12px; wrap: word-wrap;
+        }
+        Flickable {
+            height: min(root.stickers.length * 72px, root.height - 240px);
+            VerticalLayout {
+                for x in root.stickers: Rectangle {
+                    height: 72px;
+                    border-radius: 8px;
+                    background: xta.has-hover ? Theme.hover : transparent;
+                    xta := TouchArea { mouse-cursor: pointer; clicked => { root.send-sticker(x.name); } }
+                    HorizontalLayout {
+                        padding: 6px;
+                        spacing: 12px;
+                        Rectangle {
+                            width: 60px;
+                            height: 60px;
+                            if x.picture.width > 0: Image { source: x.picture; width: 60px; height: 60px; image-fit: contain; }
+                            if x.picture.width == 0: Text { text: "…"; color: Theme.muted; }
+                        }
+                        Text { text: ":" + x.name + ":"; color: Theme.text; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                        VerticalLayout { alignment: center; IconBtn { icon: "✕"; size: 28px; clicked => { root.remove-sticker(x.name); } } }
+                    }
+                }
+            }
+        }
+        HorizontalLayout { alignment: end; Btn { text: "Close"; primary: true; clicked => { root.stickers-open = false; } } }
+    }
+
+    if root.topic-open: Overlay {
+        card-width: 720px;
+        dismiss => { root.topic-open = false; }
+        Text { text: root.topic-title == "" ? "Description" : root.topic-title; font-size: 16px; font-weight: 800; color: Theme.text; overflow: elide; }
+        topic-sv := ScrollView {
+            height: min(topic-col.preferred-height + 8px, root.height - 200px);
+            content-width: self.visible-width;
+            content-height: topic-col.preferred-height;
+            topic-col := VerticalLayout {
+                width: topic-sv.visible-width;
+                padding-right: 8px;
+                Blocks {
+                    key: "topic";
+                    avail: topic-sv.visible-width - 8px;
+                    blocks: root.topic-blocks;
+                    link(l) => { root.open-link(l); }
+                }
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Btn { text: "Copy"; clicked => { root.copy-text(root.topic-text); } }
+            Btn { text: "Close"; primary: true; clicked => { root.topic-open = false; } }
         }
     }
 

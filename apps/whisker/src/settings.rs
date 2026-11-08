@@ -56,6 +56,10 @@ pub struct AppSettings {
     /// Fix common typos in the composer as you type.
     #[serde(default = "yes")]
     pub autocorrect: bool,
+    /// Red lines under misspelled words in the composer, with suggestions
+    /// on right-click.
+    #[serde(default = "yes")]
+    pub spell_check: bool,
     /// Message menu entries turned off (see `Prefs.menu-*` in the UI).
     #[serde(default)]
     pub menu_hidden: std::collections::BTreeSet<String>,
@@ -67,6 +71,13 @@ pub struct AppSettings {
     /// so other apps show a picture (the video itself isn't uploaded).
     #[serde(default = "yes")]
     pub link_posters: bool,
+    /// When your server can't get a file from another server, ask that
+    /// server directly. Off: it would see your IP (unless you use a proxy).
+    #[serde(default)]
+    pub ask_file_servers: bool,
+    /// How files are prepared before upload.
+    #[serde(default)]
+    pub upload: whisker_core::upload::UploadOptions,
 }
 
 fn clear_command() -> String {
@@ -115,7 +126,7 @@ On this device
 • Encrypted: the vault (logins, access tokens, tags, nicknames, proxies, AI settings and API keys), \
 using Argon2id and XChaCha20-Poly1305. Each account's message store and encryption keys are also \
 encrypted, with a random key kept in the vault.
-• Not encrypted: settings.json (theme and auto-lock only). The data folder also shows how many vault \
+• Not encrypted: settings.json (theme, auto-lock and other display and privacy choices). The data folder also shows how many vault \
 files and account folders exist, so a hidden vault hides who your alts are, not that you have some.
 • While unlocked, messages are in memory in readable form.
 
@@ -125,6 +136,8 @@ Between you and the server
 Rooms without it (most public rooms) can be read by every server in them.
 • Servers always see metadata: which rooms you're in, who you talk to and when, display names \
 and avatars.
+• Files come through your own server. Only if you turn on “Ask a file's own server” does Whisker \
+contact other servers directly, and then they see your IP address unless you use a proxy.
 • Whisker doesn't send public read receipts, and sends typing notifications only if you turn them on.
 • Devices aren't verified yet, so other people see your Whisker login as an unverified device.
 

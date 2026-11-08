@@ -48,7 +48,20 @@ export global Prefs {
     in-out property <int> notify-level: 2;
     in-out property <bool> send-typing: false;
     in-out property <bool> autocorrect: true;
+    in-out property <bool> spell-check: true;
     in-out property <bool> link-posters: true;
+    in-out property <bool> ask-file-servers: false;
+    // Uploads (see whisker_core::upload::UploadOptions).
+    in-out property <bool> up-strip: true;
+    in-out property <bool> up-hash: true;
+    // 0 keep the format, 1 JPEG, 2 PNG.
+    in-out property <int> up-convert: 0;
+    in-out property <int> up-quality: 90;
+    in-out property <bool> up-thumbs: true;
+    // 0 JPEG, 1 PNG.
+    in-out property <int> up-thumb-format: 0;
+    in-out property <int> up-thumb-quality: 70;
+    in-out property <bool> up-encrypt: false;
     // Which entries the message right-click menu shows.
     in-out property <bool> menu-react: true;
     in-out property <bool> menu-reply: true;

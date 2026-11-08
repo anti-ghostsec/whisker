@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 static WORD_LIST: &str = include_str!("../assets/words.txt");
 
-fn words() -> &'static HashSet<&'static str> {
+pub(crate) fn words() -> &'static HashSet<&'static str> {
     static WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
     WORDS.get_or_init(|| WORD_LIST.lines().collect())
 }
@@ -98,7 +98,7 @@ fn nearest(typed: &str) -> Option<String> {
 }
 
 /// Keys next to `c` on a QWERTY keyboard.
-fn neighbours(c: u8) -> &'static [u8] {
+pub(crate) fn neighbours(c: u8) -> &'static [u8] {
     match c {
         b'q' => b"wa",
         b'w' => b"qeas",
@@ -128,6 +128,22 @@ fn neighbours(c: u8) -> &'static [u8] {
         b'm' => b"njk",
         _ => b"",
     }
+}
+
+/// The fix listed for a common misspelling (lowercase).
+pub(crate) fn listed_fix(word: &str) -> Option<&'static str> {
+    FIXES
+        .binary_search_by(|(w, _)| w.cmp(&word))
+        .ok()
+        .map(|i| FIXES[i].1)
+}
+
+/// Whether a word is the right spelling of a listed misspelling (the list
+/// has contractions the word list lacks, like "doesn't").
+pub(crate) fn is_fix_target(word: &str) -> bool {
+    FIXES
+        .iter()
+        .any(|(_, right)| right.eq_ignore_ascii_case(word))
 }
 
 /// Characters that end a word (and trigger a fix).

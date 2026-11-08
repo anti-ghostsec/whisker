@@ -1,7 +1,6 @@
 //! Room lists, message history, media and sending, in plain types the UI can show.
 
 use anyhow::{Context, Result, anyhow, bail};
-use matrix_sdk::attachment::AttachmentConfig;
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::room::edit::EditedContent;
@@ -154,19 +153,66 @@ pub enum Parsed {
     Edit { target: OwnedEventId, body: String },
 }
 
+/// Whether a file message's text is a caption, not the stand-in
+/// [`message_body`] gives files without one.
+pub fn is_caption(body: &str) -> bool {
+    !matches!(body, "Sent an image" | "Sent a video" | "Sent audio" | "Sent a sticker" | "")
+        && !body.starts_with("Sent a file: ")
+        && !is_undecryptable(body)
+}
+
 /// Readable text for a message, and whether it is real text (not a label).
 pub fn message_body(m: &MessageType) -> (String, bool) {
     match m {
         MessageType::Text(t) => (t.body.clone(), true),
         MessageType::Notice(t) => (t.body.clone(), true),
         MessageType::Emote(t) => (format!("* {}", t.body), true),
-        MessageType::Image(_) => ("Sent an image".into(), false),
-        MessageType::Video(_) => ("Sent a video".into(), false),
-        MessageType::Audio(_) => ("Sent audio".into(), false),
-        MessageType::File(f) => (format!("Sent a file: {}", f.body), false),
+        // A caption, when the file has one, shows under it.
+        MessageType::Image(c) => (
+            c.caption()
+                .map_or_else(|| "Sent an image".into(), str::to_owned),
+            false,
+        ),
+        MessageType::Video(c) => (
+            c.caption()
+                .map_or_else(|| "Sent a video".into(), str::to_owned),
+            false,
+        ),
+        MessageType::Audio(c) => (
+            c.caption()
+                .map_or_else(|| "Sent audio".into(), str::to_owned),
+            false,
+        ),
+        MessageType::File(f) => (
+            f.caption()
+                .map_or_else(|| format!("Sent a file: {}", f.body), str::to_owned),
+            false,
+        ),
         MessageType::Location(_) => ("Shared a location".into(), false),
         other => (other.body().to_owned(), true),
     }
+}
+
+/// A sticker someone sent (`m.sticker`): shown as its picture.
+pub fn parse_sticker(c: &matrix_sdk::ruma::events::sticker::StickerEventContent) -> Parsed {
+    let u = |v: Option<UInt>| v.map(u64::from);
+    let (reply_to, thread) = match &c.relates_to {
+        Some(Relation::Reply(r)) => (Some(r.in_reply_to.event_id.clone()), None),
+        Some(Relation::Thread(t)) => (t.in_reply_to.as_ref().filter(|_| !t.is_falling_back).map(|r| r.event_id.clone()), Some(t.event_id.clone())),
+        _ => (None, None),
+    };
+    let media = Media {
+        kind: MediaKind::Image,
+        source: c.source.clone().into(),
+        thumbnail: c.info.thumbnail_source.clone(),
+        name: c.body.clone(),
+        mime: c.info.mimetype.clone(),
+        size: u(c.info.size),
+        width: u(c.info.width),
+        height: u(c.info.height),
+        linked: false,
+    };
+    Parsed::New { body: "Sent a sticker".into(), is_text: false, reply_to, media: Some(media), thread, pills: Vec::new() }
 }
 
 fn media_of(m: &MessageType) -> Option<Media> {
@@ -657,6 +703,7 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)) => {
                 (m.event_id, m.sender, m.origin_server_ts, parse(&m.content))
             }
+            AnySyncMessageLikeEvent::Sticker(SyncMessageLikeEvent::Original(m)) => (m.event_id, m.sender, m.origin_server_ts, parse_sticker(&m.content)),
             AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(m)) => {
                 let why = match &ev.kind {
                     matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt { utd_info, .. } => undecryptable_reason(&utd_info.reason),
@@ -893,6 +940,21 @@ pub async fn edit_text(room: &Room, target: &EventId, text: &str) -> Result<()> 
     Ok(())
 }
 
+/// Changes the caption of a picture, video or file you sent (an empty
+/// caption removes it). The file stays as it is.
+pub async fn edit_caption(room: &Room, target: &EventId, caption: &str) -> Result<()> {
+    use matrix_sdk::ruma::events::room::message::FormattedBody;
+    let caption = caption.trim();
+    let edit = EditedContent::MediaCaption {
+        caption: (!caption.is_empty()).then(|| caption.to_owned()),
+        formatted_caption: FormattedBody::markdown(caption),
+        mentions: None,
+    };
+    let content = room.make_edit_event(target, edit).await.map_err(|e| anyhow!("couldn't edit: {e}"))?;
+    room.send(content).await?;
+    Ok(())
+}
+
 /// Reacts to a message with `key` (an emoji). Returns the reaction's id.
 pub async fn react(room: &Room, target: &EventId, key: &str) -> Result<OwnedEventId> {
     use matrix_sdk::ruma::events::reaction::ReactionEventContent;
@@ -992,40 +1054,68 @@ fn too_big(limit: u64) -> anyhow::Error {
     anyhow::anyhow!("that file is over {} MB, the most this server takes", limit / 1_048_576)
 }
 
-/// Uploads a file from disk and posts it (as an image when it is one),
-/// calling `progress` with the percentage sent as it goes.
-pub async fn send_file(room: &Room, path: &Path, progress: impl Fn(u8) + Send + 'static) -> Result<()> {
-    let meta = tokio::fs::metadata(path).await.context("can't read that file")?;
+/// Uploads a file from disk (prepared as `opts` say: see [`crate::upload`])
+/// and returns the message to post with [`crate::upload::post`]; calls
+/// `progress` with the percentage sent as it goes.
+pub async fn upload_file(
+    room: &Room,
+    path: &Path,
+    opts: &crate::upload::UploadOptions,
+    progress: impl Fn(u8) + Send + 'static,
+) -> Result<MessageType> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .context("can't read that file")?;
     let limit = upload_limit(room).await;
     if meta.len() > limit {
         return Err(too_big(limit));
     }
     let data = tokio::fs::read(path).await?;
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
-    let mut config = AttachmentConfig::new();
-    // A poster frame, so the video shows as a picture rather than a file.
-    if mime_guess::from_path(path).first().is_some_and(|m| m.type_() == mime_guess::mime::VIDEO) {
-        let owned = path.to_owned();
-        if let Ok(Some(p)) = tokio::task::spawn_blocking(move || video_poster(&owned)).await {
-            let size = UInt::try_from(p.jpeg.len() as u64).unwrap_or_default();
-            config = config
-                .info(matrix_sdk::attachment::AttachmentInfo::Video(matrix_sdk::attachment::BaseVideoInfo {
-                    duration: p.duration,
-                    width: Some(UInt::from(p.video_size.0)),
-                    height: Some(UInt::from(p.video_size.1)),
-                    size: UInt::try_from(meta.len()).ok(),
-                    blurhash: None,
-                }))
-                .thumbnail(Some(matrix_sdk::attachment::Thumbnail {
-                    data: p.jpeg,
-                    content_type: mime_guess::mime::IMAGE_JPEG,
-                    width: UInt::from(p.size.0),
-                    height: UInt::from(p.size.1),
-                    size,
-                }));
-        }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    upload_bytes(room, &name, data, Some(path.to_owned()), opts, progress).await
+}
+
+/// Uploads a file from disk and posts it (as an image when it is one).
+pub async fn send_file(
+    room: &Room,
+    path: &Path,
+    opts: &crate::upload::UploadOptions,
+    progress: impl Fn(u8) + Send + 'static,
+) -> Result<()> {
+    let message = upload_file(room, path, opts, progress).await?;
+    crate::upload::post(room, message).await.map(drop)
+}
+
+/// `path`: where the file is on disk, for a video's preview frame.
+async fn upload_bytes(
+    room: &Room,
+    name: &str,
+    data: Vec<u8>,
+    path: Option<std::path::PathBuf>,
+    opts: &crate::upload::UploadOptions,
+    progress: impl Fn(u8) + Send + 'static,
+) -> Result<MessageType> {
+    let (name, opts2) = (name.to_owned(), opts.clone());
+    let prepared = tokio::task::spawn_blocking(move || {
+        // A poster frame, so a video shows as a picture rather than a file.
+        let poster = path
+            .filter(|p| {
+                mime_guess::from_path(p)
+                    .first()
+                    .is_some_and(|m| m.type_() == mime_guess::mime::VIDEO)
+            })
+            .and_then(|p| video_poster(&p));
+        crate::upload::prepare(&name, data, &opts2, poster)
+    })
+    .await?;
+    let limit = upload_limit(room).await;
+    if prepared.data.len() as u64 > limit {
+        return Err(too_big(limit));
     }
-    send_bytes_with(room, &name, data, config, progress).await
+    crate::upload::upload(room, prepared, opts.always_encrypt, progress).await
 }
 
 /// A still from a video, made by ffmpeg (when it's installed).
@@ -1124,35 +1214,20 @@ pub fn video_poster(path: impl AsRef<std::ffi::OsStr>) -> Option<Poster> {
     None
 }
 
-/// Uploads `data` as a file called `name` (its extension sets the type).
-pub async fn send_bytes(room: &Room, name: &str, data: Vec<u8>) -> Result<()> {
-    send_bytes_with(room, name, data, AttachmentConfig::new(), |_| ()).await
-}
-
-async fn send_bytes_with(room: &Room, name: &str, data: Vec<u8>, config: AttachmentConfig, progress: impl Fn(u8) + Send + 'static) -> Result<()> {
+/// Uploads `data` as a file called `name` (its extension sets the type)
+/// and posts it.
+pub async fn send_bytes(
+    room: &Room,
+    name: &str,
+    data: Vec<u8>,
+    opts: &crate::upload::UploadOptions,
+) -> Result<()> {
     let limit = upload_limit(room).await;
     if data.len() as u64 > limit {
         return Err(too_big(limit));
     }
-    let mime = mime_guess::from_path(name).first_or_octet_stream();
-    let sent = eyeball::SharedObservable::new(matrix_sdk::TransmissionProgress::default());
-    let mut watch = sent.subscribe();
-    // Ends when the upload drops `sent`.
-    tokio::spawn(async move {
-        let mut last = None;
-        while let Some(p) = watch.next().await {
-            if p.total == 0 {
-                continue;
-            }
-            let pct = (p.current.min(p.total) as u64 * 100 / p.total as u64) as u8;
-            if last != Some(pct) {
-                last = Some(pct);
-                progress(pct);
-            }
-        }
-    });
-    room.send_attachment(name, &mime, data, config).with_send_progress_observable(sent).await?;
-    Ok(())
+    let message = upload_bytes(room, name, data, None, opts, |_| ()).await?;
+    crate::upload::post(room, message).await.map(drop)
 }
 
 #[cfg(test)]

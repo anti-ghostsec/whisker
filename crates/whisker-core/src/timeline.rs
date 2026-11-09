@@ -675,11 +675,12 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     let mut out = Vec::new();
     let mut edits: HashMap<OwnedEventId, String> = HashMap::new();
     let mut profiles: HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)> = HashMap::new();
-    // Only a missing `end` token means the server has nothing older: either
-    // the start of the room or the start of what we're allowed to see. A
-    // short page with a token isn't the end; the server may still be
-    // fetching older messages from other servers in the room.
-    let mut at_start = msgs.end.is_none();
+    // No `end` token, or a page with nothing on it, means the server has
+    // nothing older: either the start of the room or the start of what we're
+    // allowed to see (some servers hand out a token even then). A short page
+    // with a token isn't the end: the server may still be fetching older
+    // messages from the room's other servers.
+    let mut at_start = msgs.end.is_none() || msgs.chunk.is_empty();
     let mut created = false;
     let mut reactions = Vec::new();
     // Newest first: an edit is seen before the message it changes.

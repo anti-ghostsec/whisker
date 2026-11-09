@@ -22,12 +22,19 @@ async fn plain_room(server: &MatrixMockServer) {
 }
 
 #[tokio::test]
-async fn short_page_means_nothing_older() {
+async fn empty_page_means_nothing_older() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
     let room = server.sync_joined_room(&client, room_id!("!new:localhost")).await;
-    // A new room: fewer events than asked for, yet the server still hands
-    // back an `end` token. That used to leave "Load older messages" up.
+    // A new room: fewer events than asked for, then an empty page, yet the
+    // server still hands back `end` tokens. That used to leave "Load older
+    // messages" up.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"))
+        .and(wiremock::matchers::query_param("from", "t1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"start": "t1", "end": "t2", "chunk": []})))
+        .mount(server.server())
+        .await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -49,6 +56,36 @@ async fn short_page_means_nothing_older() {
     assert_eq!(page.reactions.len(), 1);
     assert_eq!(page.reactions[0].key, "👍");
     assert_eq!(page.reactions[0].target, "$m2");
+}
+
+/// A short page with a token isn't the start: the server may still be
+/// fetching older messages, so the next page is asked for too.
+#[tokio::test]
+async fn short_page_keeps_going() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room = server.sync_joined_room(&client, room_id!("!old:localhost")).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"))
+        .and(wiremock::matchers::query_param("from", "t1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"start": "t1", "end": "t2", "chunk": [text("$m1", "older", 1)]})))
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"))
+        .and(wiremock::matchers::query_param("from", "t2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"start": "t2", "chunk": []})))
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"start": "t0", "end": "t1", "chunk": [text("$m2", "newer", 2)]})))
+        .mount(server.server())
+        .await;
+    let page = timeline::history(&room, None, 50).await.unwrap();
+    let bodies: Vec<_> = page.items.iter().filter(|i| !i.notice).map(|i| i.body.as_str()).collect();
+    assert_eq!(bodies, ["older", "newer"]);
+    assert_eq!(page.older, None);
 }
 
 #[tokio::test]

@@ -10,6 +10,16 @@
 //!    the file's server still gives it out the old way. Off by default: that
 //!    server then sees your IP address (unless the account uses a proxy) and
 //!    which file you opened.
+//! 4. only when turned on ([`set_ask_room_servers`]): a few other servers in
+//!    the room the file was posted in, the older address, without the login,
+//!    asking only for copies they already keep (`allow_remote=false`). When
+//!    a server shuts down its files are gone from it, but a server whose
+//!    users opened them keeps a copy, and some still give those out. Tried:
+//!    the two with the most members in the room (likeliest to have opened
+//!    it), then two others at random; never the account's server or the
+//!    file's own. Off by default: each one asked sees your IP address
+//!    (unless the account uses a proxy) and which file you wanted. The room
+//!    comes from [`in_room`].
 //!
 //! The SDK's own fetcher retries a failing server for up to 15 minutes, with
 //! no time limit on a stalled download, so a few slow previews held up all
@@ -18,13 +28,13 @@
 
 use matrix_sdk::media::{MediaFetcher, MediaFormat, MediaRequestParameters};
 use matrix_sdk::ruma::events::room::MediaSource;
-use matrix_sdk::ruma::{MxcUri, OwnedServerName};
+use matrix_sdk::ruma::{MxcUri, OwnedMxcUri, OwnedRoomId, OwnedServerName, ServerName};
 use matrix_sdk::{BoxFuture, Client};
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Longest wait for a server to start answering.
 const ANSWER: Duration = Duration::from_secs(30);
@@ -34,6 +44,29 @@ const STALL: Duration = Duration::from_secs(30);
 const MAX_BYTES: usize = 512 * 1024 * 1024;
 
 static ASK_FILE_SERVERS: AtomicBool = AtomicBool::new(false);
+static ASK_ROOM_SERVERS: AtomicBool = AtomicBool::new(false);
+
+/// How many of the room's other servers are asked for a copy.
+const ROOM_TRIES: usize = 4;
+/// After the room's servers had no copy of a file, how long before they're
+/// asked again (previews retry on their own).
+const ROOM_AGAIN: Duration = Duration::from_secs(600);
+
+tokio::task_local! {
+    static ROOM: OwnedRoomId;
+}
+
+/// Runs `f` with `room` as the room whose files it fetches, so a file whose
+/// server is gone can be asked of the room's other servers.
+pub async fn in_room<F: std::future::Future>(room: OwnedRoomId, f: F) -> F::Output {
+    ROOM.scope(room, f).await
+}
+
+/// Whether files nobody else can give are asked of other servers in their
+/// room (see the module docs).
+pub fn set_ask_room_servers(on: bool) {
+    ASK_ROOM_SERVERS.store(on, Ordering::Relaxed);
+}
 
 /// Whether files the account's server can't get are asked of their own
 /// server directly (see the module docs).
@@ -45,6 +78,12 @@ pub fn set_ask_file_servers(on: bool) {
 pub struct WithFallback {
     /// For tests: overrides [`set_ask_file_servers`].
     ask_file_servers: Option<bool>,
+    /// For tests: overrides [`set_ask_room_servers`].
+    ask_room_servers: Option<bool>,
+    /// For tests: the room's other servers, instead of reading its members.
+    room_servers: Option<Vec<OwnedServerName>>,
+    /// Files the room's servers had no copy of, and when they were asked.
+    no_copy: Mutex<HashMap<(OwnedMxcUri, bool), Instant>>,
     /// Where each file server answers client requests (from its
     /// `.well-known/matrix/client`); `None`: it can't be reached that way.
     origins: Mutex<HashMap<OwnedServerName, Option<reqwest::Url>>>,
@@ -85,6 +124,9 @@ enum Failed {
     Refused(String),
     /// No usable answer (offline, too slow, broken connection).
     Unreachable(String),
+    /// The server answered, but with an error of its own (5xx); a server
+    /// says this when it couldn't reach the file's server, too.
+    ServerError(String),
     /// Rate limited: try again after this long. Never leaves [`get`].
     Busy(String, Duration),
 }
@@ -92,7 +134,7 @@ enum Failed {
 impl std::fmt::Display for Failed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Failed::Refused(s) | Failed::Unreachable(s) | Failed::Busy(s, _) => f.write_str(s),
+            Failed::Refused(s) | Failed::Unreachable(s) | Failed::ServerError(s) | Failed::Busy(s, _) => f.write_str(s),
         }
     }
 }
@@ -105,6 +147,11 @@ impl WithFallback {
             .lock()
             .unwrap()
             .insert(server.try_into().unwrap(), Some(base));
+    }
+
+    fn asks_room_servers(&self) -> bool {
+        self.ask_room_servers
+            .unwrap_or_else(|| ASK_ROOM_SERVERS.load(Ordering::Relaxed))
     }
 
     fn asks_file_servers(&self) -> bool {
@@ -158,38 +205,73 @@ impl WithFallback {
             }
         }
         let first = first.expect("set above");
-        // The file's own server, if allowed and not the one we just asked.
-        if !self.asks_file_servers() || home.host_str() == Some(server.as_str()) {
-            return Err(first);
-        }
-        let Some(base) = self.origin(client, server).await else {
-            return Err(first);
-        };
-        if base.origin() == home.origin() {
-            return Err(first);
-        }
         let sep = if tail.contains('?') { '&' } else { '?' };
-        match get(
-            client,
-            at(
-                &base,
-                format!("_matrix/media/v3/{tail}{sep}allow_remote=false"),
-            )?,
-            None,
-        )
-        .await
+        let cached = format!("_matrix/media/v3/{tail}{sep}allow_remote=false");
+        // The file's own server, if allowed and not the one we just asked.
+        if self.asks_file_servers() && home.host_str() != Some(server.as_str())
+            && let Some(base) = self.origin(client, server).await
+            && base.origin() != home.origin()
         {
-            Ok(d) => {
-                tracing::debug!(
-                    "{uri}: fetched from its own server, as the account's server couldn't ({first})"
-                );
-                Ok(d)
-            }
-            Err(again) => {
-                tracing::debug!("{uri}: its own server didn't give it either: {again}");
-                Err(first)
+            match get(client, at(&base, cached.clone())?, None).await {
+                Ok(d) => {
+                    tracing::debug!("{uri}: fetched from its own server, as the account's server couldn't ({first})");
+                    return Ok(d);
+                }
+                Err(again) => tracing::debug!("{uri}: its own server didn't give it either: {again}"),
             }
         }
+        if !self.asks_room_servers() {
+            return Err(first);
+        }
+        let key = (uri.to_owned(), matches!(format, MediaFormat::File));
+        if self.no_copy.lock().unwrap().get(&key).is_some_and(|t| t.elapsed() < ROOM_AGAIN) {
+            return Err(first);
+        }
+        for other in self.room_servers(client, server).await {
+            let Some(base) = self.origin(client, &other).await else { continue };
+            if base.origin() == home.origin() {
+                continue;
+            }
+            // One try each: a server without a copy says so at once, and a
+            // dead one shouldn't hold up the rest.
+            match get_once(client, &at(&base, cached.clone())?, None).await {
+                Ok(d) => {
+                    tracing::debug!("{uri}: fetched a copy from {other}, as the account's server couldn't ({first})");
+                    return Ok(d);
+                }
+                Err(e) => tracing::debug!("{uri}: {other} had no copy: {e}"),
+            }
+        }
+        let mut no_copy = self.no_copy.lock().unwrap();
+        if no_copy.len() > 2000 {
+            no_copy.retain(|_, t| t.elapsed() < ROOM_AGAIN);
+        }
+        no_copy.insert(key, Instant::now());
+        Err(first)
+    }
+
+    /// Other servers in the room the file is being fetched for (see
+    /// [`in_room`]), to ask for a copy: the two with the most members there,
+    /// then others at random. Never the account's server or `file_server`.
+    async fn room_servers(&self, client: &Client, file_server: &ServerName) -> Vec<OwnedServerName> {
+        if let Some(s) = &self.room_servers {
+            return s.clone();
+        }
+        let Some(room) = ROOM.try_with(Clone::clone).ok().and_then(|r| client.get_room(&r)) else {
+            return Vec::new();
+        };
+        let Ok(members) = room.members_no_sync(matrix_sdk::RoomMemberships::JOIN).await else {
+            return Vec::new();
+        };
+        let own = client.user_id().map(|u| u.server_name().to_owned());
+        let mut counts: HashMap<OwnedServerName, usize> = HashMap::new();
+        for m in &members {
+            let s = m.user_id().server_name();
+            if s != file_server && own.as_deref() != Some(s) {
+                *counts.entry(s.to_owned()).or_default() += 1;
+            }
+        }
+        pick_servers(counts.into_iter().collect())
     }
 
     /// Where `server` answers client requests, asked once.
@@ -237,6 +319,20 @@ impl WithFallback {
     }
 }
 
+/// From servers and how many room members each has: the two biggest, then
+/// [`ROOM_TRIES`] in all, the rest picked at random.
+fn pick_servers(mut counts: Vec<(OwnedServerName, usize)>) -> Vec<OwnedServerName> {
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut rest = counts.split_off(counts.len().min(2));
+    let mut out: Vec<_> = counts.into_iter().map(|(s, _)| s).collect();
+    while out.len() < ROOM_TRIES && !rest.is_empty() {
+        let mut b = [0u8; 4];
+        let i = if getrandom::fill(&mut b).is_ok() { u32::from_le_bytes(b) as usize % rest.len() } else { 0 };
+        out.push(rest.swap_remove(i).0);
+    }
+    out
+}
+
 /// Longest wait a rate-limited request does before trying again.
 const MAX_WAIT: Duration = Duration::from_secs(20);
 
@@ -248,7 +344,7 @@ async fn get(client: &Client, url: reqwest::Url, token: Option<&str>) -> Result<
     loop {
         tries += 1;
         match get_once(client, &url, token).await {
-            Err(Failed::Unreachable(e)) if tries < 2 => {
+            Err(Failed::Unreachable(e) | Failed::ServerError(e)) if tries < 2 => {
                 tracing::debug!("{}: {e}; trying again", url.path());
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -323,7 +419,7 @@ async fn get_once(
         // Busy: worth one more try. Anything else is a no.
         return Err(
             if status.is_server_error() && !body.contains("M_UNRECOGNIZED") {
-                Failed::Unreachable(what)
+                Failed::ServerError(what)
             } else {
                 Failed::Refused(what)
             },
@@ -467,6 +563,86 @@ mod tests {
                 .is_err()
         );
         origin.verify().await;
+    }
+
+    /// When the file's server is gone, a copy comes from another server in
+    /// the room: one without a copy is skipped, and none get the login.
+    #[tokio::test]
+    async fn asks_the_rooms_other_servers() {
+        let mock = matrix_sdk::test_utils::mocks::MatrixMockServer::new().await;
+        Mock::given(path_regex("^/_matrix/"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(serde_json::json!({"errcode": "M_UNKNOWN", "error": "Failed to fetch remote media"})))
+            .mount(mock.server())
+            .await;
+        let empty = wiremock::MockServer::start().await;
+        Mock::given(path_regex("^/"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "Not found"})))
+            .expect(1)
+            .mount(&empty)
+            .await;
+        let keeper = wiremock::MockServer::start().await;
+        Mock::given(path("/_matrix/media/v3/download/other.org/owl"))
+            .and(wiremock::matchers::query_param("allow_remote", "false"))
+            .and(|r: &wiremock::Request| !r.headers.contains_key("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(b"hoot".to_vec(), "image/png"))
+            .mount(&keeper)
+            .await;
+        let client = mock.client_builder().build().await;
+        let fetcher = WithFallback {
+            ask_room_servers: Some(true),
+            room_servers: Some(vec!["empty.org".try_into().unwrap(), "keeper.org".try_into().unwrap()]),
+            ..Default::default()
+        };
+        fetcher.set_origin("empty.org", reqwest::Url::parse(&format!("{}/", empty.uri())).unwrap());
+        fetcher.set_origin("keeper.org", reqwest::Url::parse(&format!("{}/", keeper.uri())).unwrap());
+        client.set_media_fetcher(std::sync::Arc::new(fetcher)).await;
+        assert_eq!(client.media().get_media_content(&file("owl"), false).await.unwrap(), b"hoot");
+        empty.verify().await;
+    }
+
+    /// With the setting off, the room's other servers are never contacted.
+    #[tokio::test]
+    async fn leaves_the_rooms_servers_alone_when_off() {
+        let mock = matrix_sdk::test_utils::mocks::MatrixMockServer::new().await;
+        Mock::given(path_regex("^/_matrix/"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "Remote media not found"})))
+            .mount(mock.server())
+            .await;
+        let keeper = wiremock::MockServer::start().await;
+        Mock::given(path_regex("^/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(b"hoot".to_vec(), "image/png"))
+            .expect(0)
+            .mount(&keeper)
+            .await;
+        let client = mock.client_builder().build().await;
+        let fetcher = WithFallback {
+            ask_room_servers: Some(false),
+            room_servers: Some(vec!["keeper.org".try_into().unwrap()]),
+            ..Default::default()
+        };
+        fetcher.set_origin("keeper.org", reqwest::Url::parse(&format!("{}/", keeper.uri())).unwrap());
+        client.set_media_fetcher(std::sync::Arc::new(fetcher)).await;
+        assert!(client.media().get_media_content(&file("owl"), false).await.is_err());
+        keeper.verify().await;
+    }
+
+    /// The two biggest servers first, then others up to the limit, each once.
+    #[test]
+    fn picks_the_biggest_then_random() {
+        let counts: Vec<(OwnedServerName, usize)> = [("a.org", 1), ("big.org", 50), ("b.org", 2), ("mid.org", 9), ("c.org", 1), ("d.org", 3)]
+            .iter()
+            .map(|(s, n)| ((*s).try_into().unwrap(), *n))
+            .collect();
+        let picked = pick_servers(counts);
+        assert_eq!(picked.len(), ROOM_TRIES);
+        assert_eq!(picked[0].as_str(), "big.org");
+        assert_eq!(picked[1].as_str(), "mid.org");
+        let mut unique = picked.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), picked.len());
+        assert_eq!(pick_servers(vec![("only.org".try_into().unwrap(), 1)]).len(), 1);
+        assert!(pick_servers(Vec::new()).is_empty());
     }
 
     /// A server that keeps failing gives up quickly instead of being retried

@@ -228,6 +228,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-spell-check(bool);
     callback set-link-posters(bool);
     callback set-ask-file-servers(bool);
+    callback set-ask-room-servers(bool);
     // An upload setting changed: (key, value; switches are 0 or 1).
     callback set-upload(string, int);
     callback set-clear-command(string);
@@ -380,6 +381,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.ask-file-servers;
                 toggled => { root.set-ask-file-servers(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Ask other servers in the room for copies"; color: Theme.text; }
+                Text {
+                    text: "When nobody can give an image or file (often because its server shut down), ask up to 4 other servers in the room for the copy they keep. Brings back some lost pictures, but each server asked sees your IP address (unless the account uses a proxy) and which file you wanted. Your login is never sent to them.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.ask-room-servers;
+                toggled => { root.set-ask-room-servers(self.checked); }
             }
         }
     }
@@ -1113,6 +1130,7 @@ export component SettingsPage inherits Rectangle {
     callback set-spell-check(bool);
     callback set-link-posters(bool);
     callback set-ask-file-servers(bool);
+    callback set-ask-room-servers(bool);
     // An upload setting changed: (key, value; switches are 0 or 1).
     callback set-upload(string, int);
     callback set-menu-entry(string, bool);
@@ -1209,6 +1227,7 @@ export component SettingsPage inherits Rectangle {
                             set-spell-check(b) => { root.set-spell-check(b); }
                             set-link-posters(b) => { root.set-link-posters(b); }
                             set-ask-file-servers(b) => { root.set-ask-file-servers(b); }
+                            set-ask-room-servers(b) => { root.set-ask-room-servers(b); }
                             set-upload(k, v) => { root.set-upload(k, v); }
                             set-menu-entry(k, b) => { root.set-menu-entry(k, b); }
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }

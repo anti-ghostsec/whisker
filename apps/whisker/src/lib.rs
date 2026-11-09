@@ -588,7 +588,7 @@ impl Ctl {
                             }
                             continue;
                         }
-                        match timeline::download(&client, &src, thumb).await {
+                        match timeline::download_in(&client, &room, &src, thumb).await {
                             Ok(b) => {
                                 decoded = tokio::task::spawn_blocking(move || match what {
                                     Preview::Video => (poster_of(&b).and_then(|jpeg| decode(&jpeg, 720, 600, false)), None),
@@ -1782,7 +1782,7 @@ impl Ctl {
         let Some((p, _)) = self.st.lock().unwrap().preview.clone() else { return };
         self.ui(|u| u.set_preview_busy(true));
         let target: &matrix_sdk::ruma::RoomOrAliasId = (&*p.room_id).into();
-        match client.join_room_by_id_or_alias(target, &p.via).await {
+        match timeline::join_patiently(&client, target, &p.via).await {
             Ok(room) => {
                 timeline::check_room_type(&room).await;
                 self.end_preview();
@@ -1790,7 +1790,7 @@ impl Ctl {
                 self.select_room(p.room_id.to_string()).await;
             }
             Err(e) => {
-                let m = format!("Couldn't join: {e}");
+                let m = format!("Couldn't join: {e:#}");
                 self.ui(move |u| {
                     u.set_preview_busy(false);
                     u.set_preview_note(s(m));
@@ -3343,7 +3343,7 @@ impl Ctl {
             let Some(client) = self.mgr.client(key.0).await else { return };
             self.status("Downloading…");
             let r = async {
-                let bytes = timeline::download(&client, &media.source, None).await?;
+                let bytes = timeline::download_in(&client, &key.1, &media.source, None).await?;
                 tokio::fs::write(&path, bytes).await?;
                 anyhow::Ok(())
             }
@@ -3380,7 +3380,7 @@ impl Ctl {
         let ext = std::path::Path::new(&media.name).extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 5 && e.chars().all(char::is_alphanumeric)).unwrap_or("bin").to_owned();
         let path = dir.join(format!("{}.{ext}", &whisker_core::vault::random_secret()[..16]));
         let r = async {
-            let bytes = timeline::download(&client, &media.source, None).await?;
+            let bytes = timeline::download_in(&client, &key.1, &media.source, None).await?;
             whisker_core::stores::make_private_dir(&dir)?;
             tokio::fs::write(&path, bytes).await?;
             whisker_core::vault::owner_only(&path, false);
@@ -3420,7 +3420,7 @@ impl Ctl {
             u.set_viewer_open(true);
         });
         let Some(client) = self.mgr.client(key.0).await else { return };
-        let decoded = match timeline::download(&client, &media.source, None).await {
+        let decoded = match timeline::download_in(&client, &key.1, &media.source, None).await {
             Ok(b) => tokio::task::spawn_blocking(move || (decode(&b, 2560, 2560, false), ui::decode_frames(&b, 1600, 1200))).await.unwrap_or((None, None)),
             Err(_) => (None, None),
         };
@@ -3746,6 +3746,16 @@ impl Ctl {
         let u = st.upload.clone();
         drop(st);
         self.ui(move |ui| show_upload_prefs(&ui.global::<Prefs>(), &u));
+    }
+
+    fn set_ask_room_servers(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.ask_room_servers = on;
+        let _ = st.save(self.mgr.data_dir());
+        whisker_core::media_fetch::set_ask_room_servers(on);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_ask_room_servers(on);
+        }
     }
 
     fn set_ask_file_servers(&self, on: bool) {
@@ -5178,6 +5188,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         .set_ask_file_servers(prefs.ask_file_servers);
     show_upload_prefs(&ui.global::<Prefs>(), &prefs.upload);
     whisker_core::media_fetch::set_ask_file_servers(prefs.ask_file_servers);
+    ui.global::<Prefs>().set_ask_room_servers(prefs.ask_room_servers);
+    whisker_core::media_fetch::set_ask_room_servers(prefs.ask_room_servers);
     ui.global::<Prefs>()
         .set_clear_command(s(&prefs.clear_command));
     autocorrect::warm();
@@ -5463,6 +5475,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.on_set_link_posters(move |b| c.set_link_posters(b));
         let c = ctl.clone();
         ui.on_set_ask_file_servers(move |b| c.set_ask_file_servers(b));
+        let c = ctl.clone();
+        ui.on_set_ask_room_servers(move |b| c.set_ask_room_servers(b));
         let c = ctl.clone();
         ui.on_set_upload(move |k, v| c.set_upload(k.as_str(), v));
         let c = ctl.clone();

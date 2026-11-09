@@ -75,6 +75,10 @@ pub struct AppSettings {
     /// server directly. Off: it would see your IP (unless you use a proxy).
     #[serde(default)]
     pub ask_file_servers: bool,
+    /// When nobody else can give a file (its server shut down), ask a few
+    /// other servers in its room for their copy. Off: they'd see your IP.
+    #[serde(default)]
+    pub ask_room_servers: bool,
     /// How files are prepared before upload.
     #[serde(default)]
     pub upload: whisker_core::upload::UploadOptions,

@@ -12,7 +12,7 @@ use matrix_sdk::ruma::events::room::message::{
 use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent, SyncStateEvent};
 use matrix_sdk::ruma::{
-    EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, UInt, UserId,
+    EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
 };
 use matrix_sdk::{Client, Room};
 use std::collections::HashMap;
@@ -457,7 +457,7 @@ pub async fn join_listed(client: &Client, room: &SpaceRoom) -> Result<Room> {
     }
     via.dedup();
     let target: &matrix_sdk::ruma::RoomOrAliasId = (&*room.room_id).into();
-    let joined = client.join_room_by_id_or_alias(target, &via).await?;
+    let joined = join_patiently(client, target, &via).await?;
     check_room_type(&joined).await;
     Ok(joined)
 }
@@ -625,8 +625,8 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
             HistoryVisibility::Invited => Some(hidden_history("were invited")),
             // History is open to members, but the server gave nothing older.
             _ => Some(
-                "No older messages came from your server. The room lets members see its history, so \
-                 your server doesn't have it: it may not have fetched it from the server the room started on."
+                "No older messages came from your server. The room lets members see its history, but your \
+                 server couldn't get it from the room's other servers (they may be offline or slow)."
                     .to_owned(),
             ),
         };
@@ -675,9 +675,11 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     let mut out = Vec::new();
     let mut edits: HashMap<OwnedEventId, String> = HashMap::new();
     let mut profiles: HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)> = HashMap::new();
-    // A short page means the server had nothing more to give: either the
-    // start of the room or the start of what we're allowed to see.
-    let mut at_start = msgs.chunk.len() < limit as usize || msgs.end.is_none();
+    // Only a missing `end` token means the server has nothing older: either
+    // the start of the room or the start of what we're allowed to see. A
+    // short page with a token isn't the end; the server may still be
+    // fetching older messages from other servers in the room.
+    let mut at_start = msgs.end.is_none();
     let mut created = false;
     let mut reactions = Vec::new();
     // Newest first: an edit is seen before the message it changes.
@@ -825,6 +827,13 @@ pub async fn download(client: &Client, source: &MediaSource, thumb: Option<u32>)
     };
     let req = MediaRequestParameters { source: source.clone(), format };
     Ok(client.media().get_media_content(&req, true).await?)
+}
+
+/// [`download`] of media posted in `room`: if nobody else can give it, it
+/// can come from another server in that room (when that's turned on; see
+/// [`crate::media_fetch`]).
+pub async fn download_in(client: &Client, room: &RoomId, source: &MediaSource, thumb: Option<u32>) -> Result<Vec<u8>> {
+    crate::media_fetch::in_room(room.to_owned(), download(client, source, thumb)).await
 }
 
 /// A small square thumbnail of an avatar, as encoded image bytes.
@@ -1316,7 +1325,35 @@ pub async fn join(client: &Client, id_or_alias: &str) -> Result<Room> {
     let target: OwnedRoomOrAliasId = id_or_alias.trim().try_into().map_err(|_| anyhow!("that isn't a room address like #room:server"))?;
     // Ask the room's own server to help us in, as well as ours.
     let via: Vec<OwnedServerName> = target.server_name().map(ToOwned::to_owned).into_iter().collect();
-    let room = client.join_room_by_id_or_alias(&target, &via).await?;
+    let room = join_patiently(client, &target, &via).await?;
     check_room_type(&room).await;
     Ok(room)
+}
+
+/// How long a join that timed out is waited for.
+const JOIN_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Joins as the SDK does, but waits past the request's time limit. Joining a
+/// room on another server can take minutes while ours fetches the room from
+/// it, and the join still goes through after the request gave up: then the
+/// room turns up as joined in a later sync.
+pub async fn join_patiently(client: &Client, target: &matrix_sdk::ruma::RoomOrAliasId, via: &[matrix_sdk::ruma::OwnedServerName]) -> Result<Room> {
+    let err = match client.join_room_by_id_or_alias(target, via).await {
+        Ok(room) => return Ok(room),
+        Err(e) if e.to_string().contains("timed out") => e,
+        Err(e) => return Err(e.into()),
+    };
+    let id = match <&RoomId>::try_from(target) {
+        Ok(id) => id.to_owned(),
+        Err(alias) => client.resolve_room_alias(alias).await?.room_id,
+    };
+    tracing::debug!("joining {id} timed out; waiting for the server to finish");
+    let started = std::time::Instant::now();
+    while started.elapsed() < JOIN_WAIT {
+        if let Some(room) = client.get_room(&id).filter(|r| r.state() == matrix_sdk::RoomState::Joined) {
+            return Ok(room);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    Err(anyhow!("{err} (your server may still finish joining; the room shows up if it does)"))
 }

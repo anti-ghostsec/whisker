@@ -1428,6 +1428,7 @@ export component AppWindow inherits Window {
     callback spell-add();
     callback set-link-posters(bool);
     callback set-ask-file-servers(bool);
+    callback set-ask-room-servers(bool);
     callback set-upload(string, int);
     callback set-clear-command(string);
     // "Clear messages" dialog: open, and delete the newest `n` (0 = all).
@@ -2540,6 +2541,7 @@ export component AppWindow inherits Window {
         set-spell-check(b) => { root.set-spell-check(b); }
         set-link-posters(b) => { root.set-link-posters(b); }
         set-ask-file-servers(b) => { root.set-ask-file-servers(b); }
+        set-ask-room-servers(b) => { root.set-ask-room-servers(b); }
         set-upload(k, v) => { root.set-upload(k, v); }
         set-clear-command(t) => { root.set-clear-command(t); }
         set-menu-entry(k, b) => { root.set-menu-entry(k, b); }

@@ -41,6 +41,10 @@ slint::include_modules!();
 
 const KEEP_PER_ROOM: usize = 1000;
 const PAGE: u32 = 50;
+/// Opening a room draws this many of its newest messages at once, then the
+/// rest a few at a time, so a long room doesn't hold up the window.
+const ROWS_FIRST: usize = 20;
+const ROWS_STEP: usize = 15;
 const AVATAR_PX: u32 = 96;
 /// Animated pictures bigger than this show still (playing them means
 /// downloading and decoding every frame).
@@ -68,6 +72,8 @@ struct State {
     messages: HashMap<RoomKey, Vec<HistoryItem>>,
     /// Pagination token for older history, per room (None: reached the start).
     older: HashMap<RoomKey, Option<String>>,
+    /// While a room is opening: how many of its newest rows are drawn so far.
+    row_limit: Option<usize>,
     /// Emoji reactions seen in each opened room.
     reactions: HashMap<RoomKey, Vec<timeline::Reaction>>,
     /// The message the "Forward to…" dialog is for.
@@ -547,8 +553,10 @@ impl Ctl {
         let wanted: Vec<(OwnedEventId, Vec<Attempt>)> = {
             let st = self.st.lock().unwrap();
             let mut loading = self.loading.lock().unwrap();
+            // Newest first: those are the ones in view when a room opens.
             items
                 .iter()
+                .rev()
                 .filter_map(|m| {
                     let media = m.media.as_ref()?;
                     if st.pictures.contains_key(&m.event_id) {
@@ -1155,13 +1163,53 @@ impl Ctl {
 
     /// Redraws the whole open room (on switching rooms or loading history).
     async fn show_messages(&self) {
+        self.show_messages_counted().await;
+    }
+
+    /// Shows the rest of the open room's rows a few at a time, older ones
+    /// going in above the ones already there.
+    async fn grow_messages(&self, key: &RoomKey) {
+        loop {
+            if self.current().as_ref() != Some(key) {
+                return;
+            }
+            let total = self.show_messages_counted().await;
+            let more = {
+                let mut st = self.st.lock().unwrap();
+                match st.row_limit {
+                    Some(n) if n < total => {
+                        st.row_limit = Some(n + ROWS_STEP);
+                        true
+                    }
+                    _ => {
+                        st.row_limit = None;
+                        false
+                    }
+                }
+            };
+            if !more {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+
+    /// Draws the open room; says how many rows it has in all (more than are
+    /// drawn while it's still opening).
+    async fn show_messages_counted(&self) -> usize {
         let Some(key) = self.current() else {
             self.ui(|_| {
                 ui::with(|m| m.messages.set_vec(Vec::new()));
             });
-            return;
+            return 0;
         };
-        let rows = self.rows(&key).await;
+        let mut rows = self.rows(&key).await;
+        let total = rows.len();
+        if let Some(n) = self.st.lock().unwrap().row_limit
+            && total > n
+        {
+            rows.drain(..total - n);
+        }
         self.fetch_trust(key.0, rows.iter().filter(|r| !r.mine && !r.item.notice).map(|r| r.item.sender.clone()));
         self.fetch_avatars(key.0, rows.iter().filter_map(|r| r.item.sender_avatar.clone()).chain(rows.iter().flat_map(|r| r.readers.iter().filter_map(|x| x.2.clone()))));
         let items: Vec<HistoryItem> = rows.iter().map(|r| r.item.clone()).collect();
@@ -1174,6 +1222,7 @@ impl Ctl {
             });
             u.set_has_older(older);
         });
+        total
     }
 
     /// Appends the newest message of the open room without redrawing the rest.
@@ -1334,6 +1383,7 @@ impl Ctl {
     async fn select_room(&self, id: String) {
         let Ok(room_id) = OwnedRoomId::try_from(id) else { return };
         self.end_preview();
+        self.st.lock().unwrap().row_limit = None;
         // A video playing in the room being left stops.
         #[cfg(target_os = "linux")]
         player::stop(&self.ui);
@@ -1412,6 +1462,7 @@ impl Ctl {
             st.pending_files.clear();
             st.editing = None;
             st.thread = None;
+            st.row_limit = Some(ROWS_FIRST);
         }
         self.ui(move |u| {
             u.set_thread_open(false);
@@ -1449,6 +1500,7 @@ impl Ctl {
             }
         }
         self.ui(|u| u.set_loading_history(false));
+        self.grow_messages(&key).await;
         self.mark_read(&key).await;
     }
 

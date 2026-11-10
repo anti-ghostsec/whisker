@@ -128,15 +128,29 @@ impl Models {
 
 /// Replaces a list's rows, touching only rows that changed when the shape
 /// is the same (so the list doesn't reset its scroll position).
-pub fn sync_rows<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>, same_key: impl Fn(&T, &T) -> bool) {
-    if model.row_count() == rows.len() && rows.iter().enumerate().all(|(i, r)| model.row_data(i).is_some_and(|o| same_key(&o, r))) {
-        for (i, r) in rows.into_iter().enumerate() {
-            if model.row_data(i).as_ref() != Some(&r) {
-                model.set_row_data(i, r);
-            }
+pub fn sync_rows<T: Clone + PartialEq + 'static>(model: &VecModel<T>, mut rows: Vec<T>, same_key: impl Fn(&T, &T) -> bool) {
+    let had = model.row_count();
+    // Where the rows already shown sit in the new list: at its end (older
+    // ones were added in front), at its start (newer ones after), or not in
+    // one piece. Rows that stay are kept, so only new ones get built.
+    let kept_at = |start: usize| (0..had).all(|i| model.row_data(i).is_some_and(|o| same_key(&o, &rows[start + i])));
+    let start = match rows.len().checked_sub(had) {
+        Some(extra) if had > 0 && kept_at(extra) => extra,
+        Some(_) if had > 0 && kept_at(0) => 0,
+        _ => return model.set_vec(rows),
+    };
+    let after = rows.split_off(start + had);
+    let kept = rows.split_off(start);
+    for (i, r) in kept.into_iter().enumerate() {
+        if model.row_data(i).as_ref() != Some(&r) {
+            model.set_row_data(i, r);
         }
-    } else {
-        model.set_vec(rows);
+    }
+    for (i, r) in rows.into_iter().enumerate() {
+        model.insert(i, r);
+    }
+    for r in after {
+        model.push(r);
     }
 }
 
@@ -409,5 +423,27 @@ mod tests {
         assert_eq!(human_size(2048), "2 KB");
         assert_eq!(picture_size(Some(1920), Some(1080), None), (360.0, 202.5));
         assert_eq!(picture_size(Some(100), Some(50), None), (100.0, 50.0));
+    }
+
+    /// Rows added in front or after keep the ones already there; anything
+    /// else replaces the list. Either way it ends up as asked.
+    #[test]
+    fn sync_rows_adds_around_what_is_there() {
+        let model = VecModel::<(i32, i32)>::default();
+        let same = |a: &(i32, i32), b: &(i32, i32)| a.0 == b.0;
+        let all = |m: &VecModel<(i32, i32)>| (0..m.row_count()).filter_map(|i| m.row_data(i)).collect::<Vec<_>>();
+        sync_rows(&model, vec![(3, 0), (4, 0)], same);
+        assert_eq!(all(&model), [(3, 0), (4, 0)]);
+        // Older in front, one kept row changed.
+        sync_rows(&model, vec![(1, 0), (2, 0), (3, 9), (4, 0)], same);
+        assert_eq!(all(&model), [(1, 0), (2, 0), (3, 9), (4, 0)]);
+        // Newer after.
+        sync_rows(&model, vec![(1, 0), (2, 0), (3, 9), (4, 0), (5, 0)], same);
+        assert_eq!(all(&model), [(1, 0), (2, 0), (3, 9), (4, 0), (5, 0)]);
+        // Something else entirely, then nothing.
+        sync_rows(&model, vec![(7, 0), (1, 0)], same);
+        assert_eq!(all(&model), [(7, 0), (1, 0)]);
+        sync_rows(&model, Vec::new(), same);
+        assert!(all(&model).is_empty());
     }
 }

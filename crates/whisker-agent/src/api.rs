@@ -105,7 +105,7 @@ fn marked(v: &Value, trait_name: &str) -> Option<String> {
 }
 
 fn http() -> reqwest::Client {
-    reqwest::Client::builder().timeout(Duration::from_secs(15)).build().expect("http client")
+    whisker_core::tls::http_builder().timeout(Duration::from_secs(15)).build().expect("http client")
 }
 
 /// Adds a scheme if missing (http for local addresses, https otherwise) and

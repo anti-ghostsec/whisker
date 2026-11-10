@@ -519,6 +519,11 @@ impl AccountManager {
     /// account on unlock left it hanging whenever a server was slow.
     async fn build_client(&self, id: AccountId, homeserver: &str, known: bool, store_pass: &str, proxy: Option<&str>) -> Result<Client> {
         let mut b = Client::builder();
+        // See `crate::tls`: the system's check doesn't work on Android.
+        #[cfg(target_os = "android")]
+        {
+            b = b.disable_built_in_root_certificates().add_root_certificates(crate::tls::roots());
+        }
         b = if known { b.homeserver_url(homeserver) } else { b.server_name_or_homeserver_url(homeserver) };
         let mut b = b.sqlite_store_with_cache_path(self.store_dir(id), self.cache_dir(id), Some(store_pass));
         if let Some(p) = proxy {
@@ -1278,7 +1283,7 @@ impl AccountManager {
 /// `/.well-known/matrix/client`), or `None` if it doesn't say in time.
 async fn discover(record: &AccountRecord) -> Option<String> {
     let server = record.user_id.split_once(':')?.1;
-    let mut http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(6));
+    let mut http = crate::tls::http_builder().timeout(std::time::Duration::from_secs(6));
     if let Some(p) = &record.proxy {
         http = http.proxy(reqwest::Proxy::all(p).ok()?);
     }

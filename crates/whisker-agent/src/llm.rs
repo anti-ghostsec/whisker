@@ -54,7 +54,7 @@ pub struct Llm {
 
 impl Llm {
     pub fn new(api: ApiConfig, max_tokens: u32, extra: Map<String, Value>) -> Result<Self> {
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(300)).build()?;
+        let http = whisker_core::tls::http_builder().timeout(Duration::from_secs(300)).build()?;
         Ok(Self { api, max_tokens, extra, http, resolved: OnceCell::new(), venice: Venice::default() })
     }
 

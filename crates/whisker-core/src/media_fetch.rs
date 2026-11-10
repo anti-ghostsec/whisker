@@ -40,6 +40,8 @@ use std::time::{Duration, Instant};
 const ANSWER: Duration = Duration::from_secs(30);
 /// Longest wait between two pieces of a file.
 const STALL: Duration = Duration::from_secs(30);
+/// Longest a whole download may take.
+const WHOLE: Duration = Duration::from_secs(2 * 60 * 60);
 /// Biggest file taken in memory.
 const MAX_BYTES: usize = 512 * 1024 * 1024;
 
@@ -363,7 +365,10 @@ async fn get_once(
     url: &reqwest::Url,
     token: Option<&str>,
 ) -> Result<Vec<u8>, Failed> {
-    let mut req = client.http_client().get(url.clone());
+    // The SDK's connection gives every request 30 seconds in all, which cut
+    // off any file that took longer (videos: "error decoding response
+    // body"). The waits below already catch a dead or stalled server.
+    let mut req = client.http_client().get(url.clone()).timeout(WHOLE);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }

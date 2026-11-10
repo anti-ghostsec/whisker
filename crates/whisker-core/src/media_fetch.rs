@@ -56,6 +56,27 @@ const ROOM_AGAIN: Duration = Duration::from_secs(600);
 
 tokio::task_local! {
     static ROOM: OwnedRoomId;
+    static PROGRESS: std::sync::Arc<Progress>;
+}
+
+/// How far a download has come (see [`with_progress`]).
+#[derive(Debug, Default)]
+pub struct Progress {
+    got: std::sync::atomic::AtomicU64,
+    total: std::sync::atomic::AtomicU64,
+}
+
+impl Progress {
+    /// Percent done, once the server has said how big the file is.
+    pub fn percent(&self) -> Option<u8> {
+        let total = self.total.load(Ordering::Relaxed);
+        (total > 0).then(|| (self.got.load(Ordering::Relaxed).min(total) * 100 / total) as u8)
+    }
+}
+
+/// Runs `f`, keeping `progress` up to date with the file it downloads.
+pub async fn with_progress<F: std::future::Future>(progress: std::sync::Arc<Progress>, f: F) -> F::Output {
+    PROGRESS.scope(progress, f).await
 }
 
 /// Runs `f` with `room` as the room whose files it fetches, so a file whose
@@ -432,6 +453,11 @@ async fn get_once(
     }
     let mut out =
         Vec::with_capacity(res.content_length().unwrap_or(0).min(MAX_BYTES as u64) as usize);
+    let progress = PROGRESS.try_with(Clone::clone).ok();
+    if let Some(p) = &progress {
+        p.got.store(0, Ordering::Relaxed);
+        p.total.store(res.content_length().unwrap_or(0), Ordering::Relaxed);
+    }
     loop {
         match tokio::time::timeout(STALL, res.chunk()).await {
             Err(_) => return Err(Failed::Unreachable("the download stalled".into())),
@@ -442,6 +468,9 @@ async fn get_once(
                     return Err(Failed::Refused("the file is too big".into()));
                 }
                 out.extend_from_slice(&chunk);
+                if let Some(p) = &progress {
+                    p.got.store(out.len() as u64, Ordering::Relaxed);
+                }
             }
         }
     }

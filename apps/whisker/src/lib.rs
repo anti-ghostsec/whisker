@@ -264,7 +264,7 @@ fn play_file(path: &std::path::Path, video: bool) {
 type Attempt = (MediaSource, Option<u32>, Preview);
 
 /// Times a preview is tried before it shows as failed.
-const PREVIEW_TRIES: u8 = 4;
+const PREVIEW_TRIES: u8 = 6;
 
 /// Previews downloading at once, across the whole app. Each batch used to
 /// get its own few, so a busy room sent dozens of requests at once and
@@ -633,7 +633,7 @@ impl Ctl {
                         if tries < PREVIEW_TRIES {
                             drop(_slot);
                             tokio::time::sleep(Duration::from_secs(
-                                5 * 3u64.pow(u32::from(tries) - 1),
+                                (5 * 3u64.pow(u32::from(tries) - 1)).min(120),
                             ))
                             .await;
                             c.loading.lock().unwrap().remove(id.as_str());
@@ -3431,14 +3431,21 @@ impl Ctl {
         let dir = media_dir(self.mgr.data_dir());
         let ext = std::path::Path::new(&media.name).extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 5 && e.chars().all(char::is_alphanumeric)).unwrap_or("bin").to_owned();
         let path = dir.join(format!("{}.{ext}", &whisker_core::vault::random_secret()[..16]));
+        let progress = Arc::new(whisker_core::media_fetch::Progress::default());
+        let watching = self.watch_progress(progress.clone(), |c, pct| {
+            c.status(format!("Loading… {pct}%"));
+            c.ui(move |u| u.global::<Player>().set_progress(pct));
+        });
         let r = async {
-            let bytes = timeline::download_in(&client, &key.1, &media.source, None).await?;
+            let bytes = whisker_core::media_fetch::with_progress(progress, timeline::download_in(&client, &key.1, &media.source, None)).await?;
             whisker_core::stores::make_private_dir(&dir)?;
             tokio::fs::write(&path, bytes).await?;
             whisker_core::vault::owner_only(&path, false);
             anyhow::Ok(())
         }
         .await;
+        watching.abort();
+        self.ui(|u| u.global::<Player>().set_progress(0));
         match r {
             Ok(()) => {
                 self.status("");
@@ -3462,6 +3469,43 @@ impl Ctl {
         }
     }
 
+    /// Calls `show` with a download's percentage as it changes, until the
+    /// returned task is stopped.
+    fn watch_progress(&self, progress: Arc<whisker_core::media_fetch::Progress>, show: impl Fn(&Ctl, i32) + Send + 'static) -> tokio::task::JoinHandle<()> {
+        let c = self.clone();
+        self.rt.spawn(async move {
+            let mut last = None;
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let now = progress.percent();
+                if now.is_some() && now != last {
+                    last = now;
+                    show(&c, i32::from(now.unwrap_or(0)));
+                }
+            }
+        })
+    }
+
+    /// A file dragged onto the window: queued for the open room, like "+".
+    #[cfg(not(target_os = "android"))]
+    fn dropped(&self, path: PathBuf) {
+        if !path.is_file() {
+            return;
+        }
+        {
+            let mut st = self.st.lock().unwrap();
+            if st.room.is_none() {
+                drop(st);
+                return self.status("Open a room first, then drop files into it.");
+            }
+            if !st.pending_files.contains(&path) {
+                st.pending_files.push(path);
+            }
+        }
+        self.show_pending_files();
+        self.ui(|u| u.set_focus_request(u.get_focus_request() + 1));
+    }
+
     async fn view_image(&self, key: &RoomKey, m: HistoryItem) {
         let Some(media) = m.media else { return };
         let id = m.event_id.to_string();
@@ -3472,7 +3516,12 @@ impl Ctl {
             u.set_viewer_open(true);
         });
         let Some(client) = self.mgr.client(key.0).await else { return };
-        let decoded = match timeline::download_in(&client, &key.1, &media.source, None).await {
+        let progress = Arc::new(whisker_core::media_fetch::Progress::default());
+        let watching = self.watch_progress(progress.clone(), |c, pct| c.ui(move |u| u.set_viewer_percent(pct)));
+        let got = whisker_core::media_fetch::with_progress(progress, timeline::download_in(&client, &key.1, &media.source, None)).await;
+        watching.abort();
+        self.ui(|u| u.set_viewer_percent(0));
+        let decoded = match got {
             Ok(b) => tokio::task::spawn_blocking(move || (decode(&b, 2560, 2560, false), ui::decode_frames(&b, 1600, 1200))).await.unwrap_or((None, None)),
             Err(_) => (None, None),
         };
@@ -5318,6 +5367,11 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         share::on_share(move |items| c.receive_share(items));
+        #[cfg(not(target_os = "android"))]
+        {
+            let c = ctl.clone();
+            select::on_drop(move |path| c.dropped(path));
+        }
     }
     on!(on_unlock_more, |p| unlock_more);
     on!(on_create_hidden, |p| create_hidden);
@@ -5342,6 +5396,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.global::<Player>().on_seek(move |f| player::seek(&c.ui, f));
         let c = ctl.clone();
         ui.global::<Player>().on_mute(move || player::mute(&c.ui));
+        let c = ctl.clone();
+        ui.global::<Player>().on_toggle_loop(move || player::toggle_loop(&c.ui));
         let c = ctl.clone();
         ui.global::<Player>().on_toggle_subtitles(move || player::subtitles(&c.ui));
         let c = ctl.clone();

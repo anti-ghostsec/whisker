@@ -390,6 +390,11 @@ export global Player {
     // Seconds.
     in-out property <float> position;
     in-out property <float> duration;
+    // Starts over when it ends.
+    in-out property <bool> looping;
+    // Percent of the video downloaded so far (0: not known).
+    in-out property <int> progress;
+    callback toggle-loop();
     // Play or pause message `id`'s video.
     callback toggle(string);
     // Jump to a fraction (0–1) of the way through.
@@ -409,14 +414,35 @@ component Clock inherits Text {
     vertical-alignment: center;
 }
 
-// Play/pause, time, seek bar, length, subtitles, sound and size, over a playing video.
+// Where the video is, as a line: click anywhere on it to jump there.
+component SeekTrack inherits Rectangle {
+    Rectangle {
+        height: 4px; border-radius: 2px;
+        background: #ffffff50;
+        Rectangle {
+            x: 0;
+            width: parent.width * (Player.duration > 0 ? min(1, Player.position / Player.duration) : 0);
+            border-radius: 2px;
+            background: Theme.accent;
+        }
+    }
+    TouchArea { mouse-cursor: pointer; clicked => { Player.seek(self.mouse-x / max(1px, self.width)); } }
+}
+
+// Play/pause, time, seek bar, length, repeat, subtitles, sound and size, over a playing video.
 component VideoBar inherits Rectangle {
     in property <string> id;
-    height: 30px;
+    // Narrow (upright phone videos): the seek bar gets a row of its own,
+    // above the buttons, or it's too short to click.
+    property <bool> stacked: self.width < 320px;
+    height: self.stacked ? 54px : 30px;
     background: #000000a0;
     // Clicks on the bar itself don't pause.
     TouchArea {}
+    if root.stacked: SeekTrack { x: 10px; y: 2px; width: parent.width - 20px; height: 24px; }
     HorizontalLayout {
+        y: root.stacked ? 24px : 0px;
+        height: 30px;
         padding-left: 8px;
         padding-right: 8px;
         spacing: 8px;
@@ -434,21 +460,15 @@ component VideoBar inherits Rectangle {
             TouchArea { mouse-cursor: pointer; clicked => { Player.toggle(root.id); } }
         }
         Clock { seconds: Player.position; }
-        Rectangle {
-            horizontal-stretch: 1;
-            Rectangle {
-                height: 4px; border-radius: 2px;
-                background: #ffffff50;
-                Rectangle {
-                    x: 0;
-                    width: parent.width * (Player.duration > 0 ? min(1, Player.position / Player.duration) : 0);
-                    border-radius: 2px;
-                    background: Theme.accent;
-                }
-            }
-            TouchArea { mouse-cursor: pointer; clicked => { Player.seek(self.mouse-x / max(1px, self.width)); } }
-        }
+        if !root.stacked: SeekTrack { horizontal-stretch: 1; }
+        if root.stacked: Rectangle { horizontal-stretch: 1; }
         Clock { seconds: Player.duration; }
+        Rectangle {
+            width: 18px;
+            // Repeat: lit while videos start over at the end.
+            Text { text: "⟳"; color: Player.looping ? Theme.accent : #ffffff90; font-size: 15px; font-weight: 700; }
+            TouchArea { mouse-cursor: pointer; clicked => { Player.toggle-loop(); } }
+        }
         if Player.has-subtitles: Rectangle {
             width: 22px;
             // "CC", lit while subtitles show.
@@ -653,7 +673,7 @@ component MessageRow inherits Rectangle {
                             if pic.here && Player.loading: Rectangle {
                                 width: 48px; height: 48px; border-radius: 24px;
                                 background: #000000a0;
-                                Text { text: "…"; color: white; font-size: 20px; }
+                                Text { text: Player.progress > 0 ? Player.progress + "%" : "…"; color: white; font-size: Player.progress > 0 ? 13px : 20px; }
                             }
                             // Takes every button, so it opens the menu itself on right-click.
                             pic-area := TouchArea {
@@ -1257,6 +1277,7 @@ export component AppWindow inherits Window {
     in property <int> viewer-frame-ms;
     property <int> viewer-frame;
     in-out property <bool> viewer-open;
+    in-out property <int> viewer-percent;
     // The message the viewer shows (for Save / Forward).
     in property <string> viewer-id;
     // Forward to…
@@ -2705,7 +2726,7 @@ export component AppWindow inherits Window {
     if root.viewer-open: Rectangle {
         background: #000000e0;
         TouchArea { clicked => { root.viewer-open = false; } }
-        if root.viewer-image.width == 0: Text { text: "Loading…"; color: white; }
+        if root.viewer-image.width == 0: Text { text: root.viewer-percent > 0 ? "Loading… " + root.viewer-percent + "%" : "Loading…"; color: white; }
         vcm := ContextMenuArea {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;

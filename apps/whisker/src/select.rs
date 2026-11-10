@@ -69,6 +69,8 @@ struct State {
 }
 
 thread_local! {
+    /// What to do with a file dropped on the window.
+    static ON_DROP: RefCell<Option<Box<dyn Fn(std::path::PathBuf)>>> = RefCell::default();
     static ST: RefCell<State> = RefCell::new(State::default());
     /// Styled pieces under the selection ("list|id|part"), for `TextTools.shaded`.
     static SHADED: RefCell<std::collections::HashSet<String>> = RefCell::default();
@@ -77,6 +79,11 @@ thread_local! {
 /// Whether a drag selection just ended (so a click handler shouldn't act).
 pub fn take_just_dragged() -> bool {
     ST.with(|s| std::mem::take(&mut s.borrow_mut().just_dragged))
+}
+
+/// Sets what happens to files dragged onto the window from elsewhere.
+pub fn on_drop(f: impl Fn(std::path::PathBuf) + 'static) {
+    ON_DROP.with(|d| *d.borrow_mut() = Some(Box::new(f)));
 }
 
 /// Watches the window's mouse and keyboard for drag selections.
@@ -99,6 +106,26 @@ fn on_event(ui: &AppWindow, window: &slint::Window, event: &WindowEvent) -> Even
     match event {
         WindowEvent::ModifiersChanged(m) => {
             ST.with(|s| s.borrow_mut().modifiers = m.state());
+            EventResult::Propagate
+        }
+        WindowEvent::DroppedFile(path) => {
+            ON_DROP.with(|d| {
+                if let Some(f) = d.borrow().as_ref() {
+                    f(path.clone());
+                }
+            });
+            EventResult::Propagate
+        }
+        // The button's release can go to another window; a drag left
+        // "on" kept every mouse move from the rest of the window, so
+        // clicks landed where the mouse had been.
+        WindowEvent::Focused(false) => {
+            ST.with(|s| {
+                let mut s = s.borrow_mut();
+                s.pressed = None;
+                s.dragging = false;
+                s.scroller = None;
+            });
             EventResult::Propagate
         }
         WindowEvent::CursorMoved { position, .. } => {

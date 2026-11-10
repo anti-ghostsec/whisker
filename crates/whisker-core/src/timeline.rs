@@ -1175,19 +1175,27 @@ fn subtitle_kind(codec: &str) -> Option<Subtitles> {
 pub fn probe_video(input: impl AsRef<std::ffi::OsStr>) -> Option<VideoInfo> {
     use std::process::{Command, Stdio};
     let probe = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:format=duration", "-of", "default=nw=1"])
+        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:stream_side_data=rotation:stream_tags=rotate:format=duration", "-of", "default=nw=1"])
         .arg(input)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&probe.stdout);
+    parse_probe(&String::from_utf8_lossy(&probe.stdout))
+}
+
+/// Reads ffprobe's `key=value` lines. The size is the one the video is
+/// shown at: phones film upright videos sideways and mark them "turn 90°",
+/// which players (ffmpeg too) do, so width and height swap.
+fn parse_probe(text: &str) -> Option<VideoInfo> {
     let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=').map(str::trim).filter(|v| *v != "N/A"));
     let width: u32 = field("width")?.parse().ok()?;
     let height: u32 = field("height")?.parse().ok()?;
     if width == 0 || height == 0 {
         return None;
     }
+    let turned = field("rotation").or_else(|| field("TAG:rotate")).and_then(|r| r.parse::<f64>().ok()).is_some_and(|r| (r.round() as i64).rem_euclid(180) == 90);
+    let (width, height) = if turned { (height, width) } else { (width, height) };
     let duration = field("duration").and_then(|d| d.parse::<f64>().ok()).filter(|d| d.is_finite() && *d >= 0.0).map(std::time::Duration::from_secs_f64);
     let audio = text.lines().any(|l| l.trim() == "codec_type=audio");
     // Each stream lists its codec, then its type.
@@ -1242,6 +1250,15 @@ pub async fn send_bytes(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upright_phone_videos_swap_their_size() {
+        let probe = |extra: &str| super::parse_probe(&format!("codec_name=h264\ncodec_type=video\nwidth=1920\nheight=1080\n{extra}duration=1.5\n")).unwrap();
+        assert_eq!((probe("").width, probe("").height), (1920, 1080));
+        assert_eq!((probe("rotation=-90\n").width, probe("rotation=-90\n").height), (1080, 1920));
+        assert_eq!((probe("TAG:rotate=270\n").width, probe("TAG:rotate=270\n").height), (1080, 1920));
+        assert_eq!((probe("rotation=180\n").width, probe("rotation=180\n").height), (1920, 1080));
+    }
+
     use super::*;
 
     #[test]

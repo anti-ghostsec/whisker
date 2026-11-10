@@ -614,7 +614,7 @@ fn hashed_name(data: &[u8], mime: &Mime, original: &str) -> String {
 
 /// Time allowed for an upload of `n` bytes (slow links included).
 fn upload_time(n: usize) -> Duration {
-    Duration::from_secs(60 + n as u64 / 25_000)
+    Duration::from_secs(120 + n as u64 / 8_000)
 }
 
 /// Uploads a prepared file (encrypted when the room is, or when
@@ -757,8 +757,8 @@ pub async fn upload(
 /// Posts an uploaded file's message.
 pub async fn post(room: &Room, message: MessageType) -> Result<OwnedEventId> {
     let config = RequestConfig::default()
-        .retry_limit(3)
-        .max_retry_time(Duration::from_secs(20));
+        .retry_limit(6)
+        .max_retry_time(Duration::from_secs(120));
     Ok(room
         .send(RoomMessageEventContent::new(message))
         .with_request_config(config)
@@ -793,8 +793,8 @@ pub async fn post_reply(
         .await
         .map_err(|e| anyhow::anyhow!("couldn't build the reply: {e}"))?;
     let config = RequestConfig::default()
-        .retry_limit(3)
-        .max_retry_time(Duration::from_secs(20));
+        .retry_limit(6)
+        .max_retry_time(Duration::from_secs(120));
     Ok(room
         .send(content)
         .with_request_config(config)

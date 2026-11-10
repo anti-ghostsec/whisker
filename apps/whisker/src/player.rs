@@ -37,6 +37,14 @@ struct Playing {
 }
 
 static NOW: Mutex<Option<Playing>> = Mutex::new(None);
+/// Videos start over when they end.
+static LOOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns playing videos over and over on or off.
+pub fn toggle_loop(ui: &Weak<AppWindow>) {
+    let on = !LOOP.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = ui.upgrade_in_event_loop(move |u| u.global::<Player>().set_looping(on));
+}
 
 /// Whether this system can play videos in the window.
 pub fn available() -> bool {
@@ -282,9 +290,10 @@ fn run(ui: Weak<AppWindow>, path: PathBuf, at: f64, info: VideoInfo, muted: bool
             }
         }
     });
-    if let Some(mut out) = started {
-        show_frames(&ui, &mut out, size, at, generation);
-    }
+    let shown = match started {
+        Some(mut out) => show_frames(&ui, &mut out, size, at, generation),
+        None => 0,
+    };
     // Played out (not replaced): back to the preview, ready to play again.
     let finished = {
         let mut now = NOW.lock().unwrap();
@@ -300,6 +309,10 @@ fn run(ui: Weak<AppWindow>, path: PathBuf, at: f64, info: VideoInfo, muted: bool
             _ => false,
         }
     };
+    // Looping: from the top again (not when nothing could be shown).
+    if finished && shown > 0 && LOOP.load(std::sync::atomic::Ordering::Relaxed) {
+        return resume(&ui);
+    }
     if finished {
         let _ = ui.upgrade_in_event_loop(|u| {
             let p = u.global::<Player>();

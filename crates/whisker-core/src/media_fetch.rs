@@ -451,17 +451,20 @@ async fn get_once(
             },
         );
     }
-    let mut out =
-        Vec::with_capacity(res.content_length().unwrap_or(0).min(MAX_BYTES as u64) as usize);
+    let whole = res.content_length();
+    let mut out = Vec::with_capacity(whole.unwrap_or(0).min(MAX_BYTES as u64) as usize);
     let progress = PROGRESS.try_with(Clone::clone).ok();
     if let Some(p) = &progress {
         p.got.store(0, Ordering::Relaxed);
-        p.total.store(res.content_length().unwrap_or(0), Ordering::Relaxed);
+        p.total.store(whole.unwrap_or(0), Ordering::Relaxed);
     }
+    let mut resumed = 0;
     loop {
-        match tokio::time::timeout(STALL, res.chunk()).await {
-            Err(_) => return Err(Failed::Unreachable("the download stalled".into())),
-            Ok(Err(e)) => return Err(Failed::Unreachable(format!("the download broke off: {e}"))),
+        let broke = match tokio::time::timeout(STALL, res.chunk()).await {
+            Err(_) => "the download stalled".to_owned(),
+            Ok(Err(e)) => format!("the download broke off: {}", with_causes(&e)),
+            // Ended early without saying why (a proxy in between cut it).
+            Ok(Ok(None)) if whole.is_some_and(|w| (out.len() as u64) < w) => "the download ended early".to_owned(),
             Ok(Ok(None)) => return Ok(out),
             Ok(Ok(Some(chunk))) => {
                 if out.len() + chunk.len() > MAX_BYTES {
@@ -471,9 +474,56 @@ async fn get_once(
                 if let Some(p) = &progress {
                     p.got.store(out.len() as u64, Ordering::Relaxed);
                 }
+                continue;
             }
+        };
+        // A long download (a video) that breaks partway carries on from
+        // where it got to, or from the start if the server can't do that,
+        // rather than failing.
+        if out.is_empty() || resumed >= RESUMES {
+            return Err(Failed::Unreachable(broke));
+        }
+        resumed += 1;
+        tracing::debug!("{}: {broke} after {} bytes; carrying on", url.path(), out.len());
+        let mut again = client.http_client().get(url.clone()).timeout(WHOLE).header(reqwest::header::RANGE, format!("bytes={}-", out.len()));
+        if let Some(t) = token {
+            again = again.bearer_auth(t);
+        }
+        let rest = match tokio::time::timeout(ANSWER, again.send()).await {
+            Ok(Ok(r)) => r,
+            _ => return Err(Failed::Unreachable(broke)),
+        };
+        let from_here = format!("bytes {}-", out.len());
+        let continues = rest.status().as_u16() == 206
+            && rest.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with(&from_here));
+        if continues {
+            res = rest;
+        } else if rest.status().as_u16() == 200 {
+            // No resuming on this server: it sent the whole file again.
+            out.clear();
+            res = rest;
+        } else {
+            return Err(Failed::Unreachable(broke));
         }
     }
+}
+
+/// How many times a download that broke partway is carried on.
+const RESUMES: u32 = 4;
+
+/// An error and what caused it ("error decoding response body: connection
+/// reset"): reqwest's own message leaves the reason out.
+fn with_causes(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        let c_text = c.to_string();
+        if !text.contains(&c_text) {
+            text = format!("{text}: {c_text}");
+        }
+        cause = c.source();
+    }
+    text
 }
 
 #[cfg(test)]

@@ -38,6 +38,32 @@ pub fn runtime_root(data_dir: &Path) -> PathBuf {
     data_dir.join("run")
 }
 
+/// Claims the running-stores folder for this process and empties it of
+/// what an earlier run left behind (after a crash, or a kill): a folder per
+/// account there would count the accounts of every vault that was open,
+/// hidden ones included, for as long as it stayed. What's lost is what
+/// changed since the last snapshot into the vault, as after a power cut.
+///
+/// The returned file holds a lock for as long as it's kept: a second
+/// Whisker started meanwhile doesn't get it, and leaves the folder alone.
+pub fn claim(root: &Path) -> Option<std::fs::File> {
+    make_private_dir(root).ok()?;
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join(LOCK)).ok()?;
+    lock.try_lock().ok()?;
+    for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.file_name().is_some_and(|n| n == LOCK) {
+            continue;
+        }
+        // Not through a symlink: only what's in the folder itself goes.
+        let _ = if e.file_type().is_ok_and(|t| t.is_dir()) { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+    }
+    Some(lock)
+}
+
+/// The file in the running-stores folder whose lock says a Whisker is using it.
+const LOCK: &str = "lock";
+
 /// Takes a consistent copy of the kept databases in `store` (safe while
 /// the client is running) and packs them, compressed.
 pub fn snapshot(store: &Path) -> Result<Vec<u8>> {
@@ -112,8 +138,7 @@ pub fn copy_legacy(legacy: &Path, store: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether `store` holds a running store (left by a crash, so newer than
-/// the vault's snapshot).
+/// Whether `store` holds a running store.
 pub fn has_store(store: &Path) -> bool {
     KEPT.iter().any(|n| store.join(n).exists())
 }
@@ -133,6 +158,25 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claiming_empties_what_a_crash_left() {
+        let root = std::env::temp_dir().join(format!("whisker-run-{}", crate::vault::random_secret()));
+        let left = root.join("some-account").join("store");
+        make_private_dir(&left).unwrap();
+        std::fs::write(left.join(KEYS_DB), b"x").unwrap();
+        std::fs::write(root.join("stray"), b"x").unwrap();
+        let lock = claim(&root).expect("the folder is free");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "only the lock file stays");
+        // A second Whisker, while the first runs, takes nothing away.
+        make_private_dir(&left).unwrap();
+        assert!(claim(&root).is_none());
+        assert!(left.exists());
+        drop(lock);
+        assert!(claim(&root).is_some());
+        assert!(!left.exists());
+        std::fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn snapshot_round_trip() {

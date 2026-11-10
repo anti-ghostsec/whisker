@@ -109,6 +109,9 @@ pub struct AccountManager {
     device_name: Arc<str>,
     /// RAM-backed folder the running stores live in (see [`stores`]).
     runtime: PathBuf,
+    /// Held while this Whisker runs: says the folder is in use (see
+    /// [`stores::claim`]). None when another Whisker already has it.
+    _runtime_lock: Option<Arc<std::fs::File>>,
     /// Whether the periodic store snapshot task is running.
     snapshotter: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -143,8 +146,12 @@ impl AccountManager {
             }
         }
         vault::recover(&data_dir.join("vaults"));
+        let runtime = stores::runtime_root(&data_dir);
+        // Nothing of an earlier run's accounts stays readable in it.
+        let runtime_lock = stores::claim(&runtime).map(Arc::new);
         Self {
-            runtime: stores::runtime_root(&data_dir),
+            runtime,
+            _runtime_lock: runtime_lock,
             snapshotter: Arc::default(),
             data_dir,
             inner: Arc::default(),
@@ -185,9 +192,9 @@ impl AccountManager {
         self.data_dir.join("stores").join(id.to_string())
     }
 
-    /// Readies `record`'s running store: one left by a crash wins (it's
-    /// newer), else the vault's snapshot, else an old on-disk store, which is
-    /// copied. Returns true when it copied an old store.
+    /// Readies `record`'s running store: one already there stays (another
+    /// Whisker is running it), else the vault's snapshot, else an old on-disk
+    /// store, which is copied. Returns true when it copied an old store.
     fn prepare_store(&self, record: &AccountRecord, packed: Option<&[u8]>) -> Result<bool> {
         let store = self.store_dir(record.id);
         if stores::has_store(&store) {

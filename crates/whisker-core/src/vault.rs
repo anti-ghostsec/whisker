@@ -32,6 +32,12 @@ const HEADER_LEN: usize = 8 + 16 + 4 + 4 + 24;
 /// 64 MiB, 3 passes: the same cost Enclave uses.
 const M_COST: u32 = 64 * 1024;
 const T_COST: u32 = 3;
+/// The cost a vault file may ask for: 8 MiB and 1 pass up to 1 GiB and 16
+/// passes. It's read from the file before anything proves the file is ours,
+/// and every file in the folder is tried, so a planted one must neither
+/// weaken the key nor make the app allocate gigabytes.
+const M_COST_RANGE: std::ops::RangeInclusive<u32> = 8 * 1024..=1024 * 1024;
+const T_COST_RANGE: std::ops::RangeInclusive<u32> = 1..=16;
 /// File sizes are powers of two, from 2^16 (64 KiB). Decoys are 2^16..=2^24.
 const MIN_SIZE_LOG2: u32 = 16;
 const DECOY_MAX_LOG2: u32 = 24;
@@ -97,8 +103,8 @@ impl Vault {
         let m_cost = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
         let t_cost = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
         let nonce: [u8; 24] = bytes[32..56].try_into().unwrap();
-        // Refuse a header that asks for a trivially cheap KDF.
-        if m_cost < 8 * 1024 || t_cost < 1 {
+        // Refuse a header that asks for a trivially cheap KDF, or a huge one.
+        if !M_COST_RANGE.contains(&m_cost) || !T_COST_RANGE.contains(&t_cost) {
             return Err(VaultError::Format);
         }
         let key = derive(passphrase, &salt, m_cost, t_cost)?;
@@ -437,6 +443,23 @@ mod tests {
         recover(&dir);
         assert_eq!(Vault::open::<u32>(&path, "pw").unwrap().1, 1);
         assert!(!path.with_extension("tmp").exists() && !path.with_extension("part").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A planted file can't make unlocking allocate gigabytes or run for
+    /// hours: its cost is refused before any key is derived.
+    #[test]
+    fn a_huge_kdf_cost_is_refused() {
+        let dir = std::env::temp_dir().join(format!("whisker-vault-{}", random_secret()));
+        let path = dir.join("a.vault");
+        Vault::create(&path, "pw").unwrap().save(&1u32).unwrap();
+        let good = std::fs::read(&path).unwrap();
+        for (at, value) in [(24, u32::MAX), (24, 1024 * 1024 + 1), (28, 17u32), (24, 1024u32)] {
+            let mut bytes = good.clone();
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            assert!(matches!(Vault::open::<u32>(&path, "pw").err().unwrap(), VaultError::Format));
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 

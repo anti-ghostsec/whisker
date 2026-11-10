@@ -256,15 +256,21 @@ every write all files get the same timestamps, so nothing shows which one is in 
 Unlocking tries every file, so the time it takes doesn't reveal anything either.
 
 While a vault is unlocked, its stores run from a RAM-backed folder (`$XDG_RUNTIME_DIR`
-or `/dev/shm` on Linux), which is wiped when you lock. If Whisker crashes, that copy
-stays in RAM until you log out or reboot, and is used on the next unlock so nothing is
-lost. On Windows the running copy is on disk while unlocked (wiped on lock); on Android
+or `/dev/shm` on Linux), which is wiped when you lock. If Whisker crashes, what it left there is wiped the next
+time Whisker starts, before any passphrase is asked for: a folder per account would
+otherwise count the accounts of every vault that was open. What's lost is what changed
+since the last save into the vault (a few minutes at most). On Windows the running copy is on disk while unlocked (wiped on lock); on Android
 it is in the app's private storage.
 
 What this doesn't hide:
 
 - **Size.** A vault whose accounts are in many big rooms can grow past the largest decoy
   size (16 MiB), and an unusually large file is probably a real vault.
+- **Two copies of the folder.** A decoy never changes once it's made; a vault changes
+  whenever it's used. Someone who copied your disk twice sees which files changed in
+  between, and a changed file that the passphrase you gave doesn't open is another vault.
+  Whisker can't churn the decoys to cover this: it can't tell a decoy from a vault it
+  hasn't the passphrase for.
 - **Deep forensics.** Filesystem journals, SSD wear-levelling, backups and snapshots can
   keep older copies or timings that no app can control. Use full-disk encryption.
 - **Your servers.** A homeserver knows which accounts log in from the same IP unless you

@@ -34,8 +34,8 @@ jobs:
 
       - name: Install system libraries
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get -o Acquire::Retries=6 update
+          sudo apt-get -o Acquire::Retries=6 install -y --no-install-recommends \
             cmake clang libclang-dev nasm pkg-config \
             libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
             libfontconfig1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
@@ -63,8 +63,8 @@ jobs:
 
       - name: Install system libraries
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get -o Acquire::Retries=6 update
+          sudo apt-get -o Acquire::Retries=6 install -y --no-install-recommends \
             cmake clang libclang-dev nasm pkg-config \
             libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
             libfontconfig1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
@@ -127,8 +127,8 @@ jobs:
 
       - name: Install Android build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang llvm lld
+          sudo apt-get -o Acquire::Retries=6 update
+          sudo apt-get -o Acquire::Retries=6 install -y --no-install-recommends clang llvm lld
 
       - uses: actions/setup-java@v5
         with:

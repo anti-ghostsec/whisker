@@ -532,8 +532,11 @@ component MessageRow inherits Rectangle {
     callback show-readers([Reader]);
     // Text selected in the message, for the menu's Copy.
     property <string> selection;
+    // Lit for a moment: a click on a reply to it just scrolled here.
+    in property <bool> flash;
 
     background: area.has-hover ? Theme.hover : transparent;
+    if root.flash: Rectangle { background: Theme.accent.transparentize(0.75); }
     // Wraps the whole row, so it keeps its hover over names, pictures,
     // links and chips too (their own touch areas sit inside it).
     area := TouchArea {
@@ -635,11 +638,15 @@ component MessageRow inherits Rectangle {
                             if root.item.trust == 2: Text { text: "⚠ Identity changed"; color: Theme.danger; font-size: 10px; font-weight: 700; vertical-alignment: center; }
                             Text { text: root.item.time; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
                         }
-                        if root.item.reply-name != "": HorizontalLayout {
-                            spacing: 6px;
-                            Rectangle { width: 2px; background: Theme.muted.transparentize(0.5); }
-                            Text { text: root.item.reply-name; font-size: 12px; font-weight: 700; color: Theme.muted; }
-                            Text { text: root.item.reply-text; font-size: 12px; color: Theme.muted; overflow: elide; horizontal-stretch: 1; }
+                        // What it answers: click to go to that message.
+                        if root.item.reply-name != "": Rectangle {
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Rectangle { width: 2px; background: Theme.muted.transparentize(0.5); }
+                                Text { text: root.item.reply-name; font-size: 12px; font-weight: 700; color: reply-area.has-hover ? Theme.text : Theme.muted; }
+                                Text { text: root.item.reply-text; font-size: 12px; color: reply-area.has-hover ? Theme.text : Theme.muted; overflow: elide; horizontal-stretch: 1; }
+                            }
+                            reply-area := TouchArea { mouse-cursor: pointer; clicked => { root.action("jump", root.item.id); } }
                         }
                         // Narrow chat (side panel open): shrink, keeping the shape.
                         // Pictures, and videos that came with a preview frame.
@@ -1278,6 +1285,9 @@ export component AppWindow inherits Window {
     property <int> viewer-frame;
     in-out property <bool> viewer-open;
     in-out property <int> viewer-percent;
+    // The message a reply was clicked for: scrolled to and lit, then cleared.
+    in-out property <string> jump-id;
+    Timer { interval: 1.8s; running: root.jump-id != ""; triggered => { root.jump-id = ""; } }
     // The message the viewer shows (for Save / Forward).
     in property <string> viewer-id;
     // Forward to…
@@ -1888,6 +1898,15 @@ export component AppWindow inherits Window {
                             padding-bottom: 16px;
                             for m in root.messages: MessageRow {
                                 item: m;
+                                // A click on a reply to this message: scroll it into view.
+                                flash: root.jump-id == m.id;
+                                changed flash => {
+                                    if self.flash {
+                                        root.stick-bottom = false;
+                                        msgs.content-y = min(0px, max(msgs.visible-height - msgs.content-height, 80px - self.y));
+                                        msgs.from-bottom = max(0px, msgs.content-height + msgs.content-y - msgs.visible-height);
+                                    }
+                                }
                                 can-moderate: root.can-moderate;
                                 room-id: root.current-room;
                                 quick-reactions: root.quick-reactions;

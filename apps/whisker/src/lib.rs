@@ -74,6 +74,9 @@ struct State {
     older: HashMap<RoomKey, Option<String>>,
     /// While a room is opening: how many of its newest rows are drawn so far.
     row_limit: Option<usize>,
+    /// Messages replied to that aren't loaded, fetched on their own: sender
+    /// and text (`None`: being fetched, or it couldn't be).
+    reply_cache: HashMap<OwnedEventId, Option<(String, String)>>,
     /// Emoji reactions seen in each opened room.
     reactions: HashMap<RoomKey, Vec<timeline::Reaction>>,
     /// The message the "Forward to…" dialog is for.
@@ -1141,7 +1144,10 @@ impl Ctl {
                     || prev.is_none_or(|p| p.notice || p.sender != m.sender || i64::from(m.ts.get()) - i64::from(p.ts.get()) > 5 * 60 * 1000);
                 let reply = m.reply_to.as_ref().map(|r| match by_id.get(r) {
                     Some(o) => (o.sender_label().to_owned(), o.body.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned()),
-                    None => ("↪".to_owned(), "an earlier message".to_owned()),
+                    None => match st.reply_cache.get(r) {
+                        Some(Some((name, text))) => (name.clone(), text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned()),
+                        _ => ("↪".to_owned(), "an earlier message".to_owned()),
+                    },
                 });
                 MsgRow {
                     picture: st.pictures.get(&m.event_id).cloned().flatten(),
@@ -1205,6 +1211,7 @@ impl Ctl {
         };
         let mut rows = self.rows(&key).await;
         let total = rows.len();
+        self.fetch_reply_targets(&key, &rows);
         if let Some(n) = self.st.lock().unwrap().row_limit
             && total > n
         {
@@ -1223,6 +1230,81 @@ impl Ctl {
             u.set_has_older(older);
         });
         total
+    }
+
+    /// Fetches the messages that `rows` reply to and that aren't loaded, so
+    /// the reply line can say who and what, then redraws.
+    fn fetch_reply_targets(&self, key: &RoomKey, rows: &[MsgRow]) {
+        let wanted: Vec<OwnedEventId> = {
+            let mut st = self.st.lock().unwrap();
+            let have: HashSet<OwnedEventId> = st.messages.get(key).map(|l| l.iter().map(|m| m.event_id.clone()).collect()).unwrap_or_default();
+            // Newest replies first, a screenful at a time.
+            let mut seen = HashSet::new();
+            let wanted: Vec<OwnedEventId> = rows
+                .iter()
+                .rev()
+                .filter_map(|r| r.item.reply_to.clone())
+                .filter(|id| !have.contains(id) && !st.reply_cache.contains_key(id) && seen.insert(id.clone()))
+                .take(30)
+                .collect();
+            for id in &wanted {
+                st.reply_cache.insert(id.clone(), None);
+            }
+            wanted
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let (c, key) = (self.clone(), key.clone());
+        self.spawn(async move {
+            let Some(room) = c.mgr.client(key.0).await.and_then(|cl| cl.get_room(&key.1)) else { return };
+            let mut found = false;
+            for id in wanted {
+                match timeline::message_text(&room, &id).await {
+                    Ok(got) => {
+                        c.st.lock().unwrap().reply_cache.insert(id, Some(got));
+                        found = true;
+                    }
+                    Err(e) => tracing::debug!("couldn't fetch the replied-to message {id}: {e:#}"),
+                }
+            }
+            if found && c.current().as_ref() == Some(&key) {
+                c.show_messages().await;
+            }
+        });
+    }
+
+    /// A click on a reply's line: goes to the message it answers when
+    /// that's loaded, or shows it in a window of its own.
+    async fn jump_to(&self, key: &RoomKey, room: &matrix_sdk::Room, target: OwnedEventId) {
+        let loaded = self.st.lock().unwrap().messages.get(key).is_some_and(|l| l.iter().any(|m| m.event_id == target && m.thread.is_none()));
+        if loaded {
+            let id = target.to_string();
+            return self.ui(move |u| u.set_jump_id(s(id)));
+        }
+        let cached = self.st.lock().unwrap().reply_cache.get(&target).cloned().flatten();
+        let got = match cached {
+            Some(g) => Some(g),
+            None => match timeline::message_text(room, &target).await {
+                Ok(g) => {
+                    self.st.lock().unwrap().reply_cache.insert(target.clone(), Some(g.clone()));
+                    Some(g)
+                }
+                Err(e) => {
+                    tracing::debug!("couldn't fetch the replied-to message {target}: {e:#}");
+                    None
+                }
+            },
+        };
+        match got {
+            Some((name, text)) => self.ui(move |u| {
+                u.set_topic_title(s(format!("Message from {name}")));
+                u.set_topic_blocks(ui::blocks(&text, &[]));
+                u.set_topic_text(s(text));
+                u.set_topic_open(true);
+            }),
+            None => self.status("Couldn't load that message: it may have been deleted, or your server doesn't have it."),
+        }
     }
 
     /// Appends the newest message of the open room without redrawing the rest.
@@ -2886,6 +2968,11 @@ impl Ctl {
             // Clicking a name replies, but not when that "click" ended a drag selection.
             #[cfg(not(target_os = "android"))]
             "reply" if select::take_just_dragged() => {}
+            "jump" => {
+                if let Some(target) = m.reply_to.clone() {
+                    self.jump_to(&key, &room, target).await;
+                }
+            }
             "reply" => {
                 self.st.lock().unwrap().reply_to = Some(m.event_id.clone());
                 let label = format!("{}: {}", m.sender_label(), m.body.lines().next().unwrap_or_default());

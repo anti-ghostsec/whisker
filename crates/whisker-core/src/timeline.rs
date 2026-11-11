@@ -818,6 +818,26 @@ pub async fn notice_item(
     })
 }
 
+/// One message's sender name and text, asked of the server: for a reply to
+/// a message that isn't among the loaded ones.
+pub async fn message_text(room: &Room, id: &EventId) -> Result<(String, String)> {
+    let ev = room.event(id, None).await?;
+    let (sender, body) = match ev.raw().deserialize()? {
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m))) => {
+            let (Parsed::New { body, .. } | Parsed::Edit { body, .. }) = parse(&m.content);
+            (m.sender, body)
+        }
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Sticker(SyncMessageLikeEvent::Original(m))) => {
+            let (Parsed::New { body, .. } | Parsed::Edit { body, .. }) = parse_sticker(&m.content);
+            (m.sender, body)
+        }
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(m))) => (m.sender, UNDECRYPTABLE.to_owned()),
+        _ => bail!("that isn't a message"),
+    };
+    let name = member_profile(room, &sender).await.0.unwrap_or_else(|| sender.localpart().to_owned());
+    Ok((name, body))
+}
+
 /// Downloads media (decrypting it if needed). With `thumb`, asks the server
 /// for a small version; encrypted media has no server thumbnails, so then
 /// the full file comes back. Cached in the account's encrypted media store.

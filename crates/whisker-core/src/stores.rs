@@ -31,7 +31,11 @@ pub fn runtime_root(data_dir: &Path) -> PathBuf {
         for c in candidates.into_iter().flatten() {
             if c.parent().is_some_and(Path::is_dir) && std::fs::create_dir_all(&c).is_ok() {
                 crate::vault::owner_only(&c, true);
-                return c;
+                // `/dev/shm` is shared: someone else may have made "our"
+                // folder first. Then it isn't used (the next place is).
+                if ours(&c) {
+                    return c;
+                }
             }
         }
     }
@@ -48,6 +52,9 @@ pub fn runtime_root(data_dir: &Path) -> PathBuf {
 /// Whisker started meanwhile doesn't get it, and leaves the folder alone.
 pub fn claim(root: &Path) -> Option<std::fs::File> {
     make_private_dir(root).ok()?;
+    if !ours(root) {
+        return None;
+    }
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join(LOCK)).ok()?;
     lock.try_lock().ok()?;
     for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
@@ -59,6 +66,32 @@ pub fn claim(root: &Path) -> Option<std::fs::File> {
         let _ = if e.file_type().is_ok_and(|t| t.is_dir()) { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
     }
     Some(lock)
+}
+
+/// Whether `dir` is a real folder (not a link to one) that belongs to this
+/// user and that nobody else can get into. In a shared place another user
+/// can create the folder we'd use before we do, and then watch or swap what
+/// goes into it, or point it somewhere for the startup wipe to empty.
+#[cfg(unix)]
+fn ours(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::symlink_metadata(dir) else { return false };
+    if !meta.is_dir() || meta.permissions().mode() & 0o077 != 0 {
+        return false;
+    }
+    // A file made in it belongs to us: its owner must be the folder's too.
+    // (`create_new` refuses a name that's already there, links included.)
+    let probe = dir.join(format!(".owner-check-{}", std::process::id()));
+    let Ok(file) = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) else { return false };
+    let mine = file.metadata().map(|m| m.uid()).ok();
+    drop(file);
+    let _ = std::fs::remove_file(&probe);
+    mine == Some(meta.uid())
+}
+
+#[cfg(not(unix))]
+fn ours(_dir: &Path) -> bool {
+    true
 }
 
 /// The file in the running-stores folder whose lock says a Whisker is using it.
@@ -158,6 +191,26 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Our own private folder passes; a link to it, or one others can
+    /// enter, doesn't.
+    #[cfg(unix)]
+    #[test]
+    fn only_our_own_private_folder_is_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("whisker-ours-test-{}", std::process::id()));
+        let dir = base.join("real");
+        make_private_dir(&dir).unwrap();
+        assert!(ours(&dir));
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "the check leaves nothing behind");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(!ours(&link));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!ours(&dir));
+        assert!(!ours(&base.join("missing")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn claiming_empties_what_a_crash_left() {

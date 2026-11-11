@@ -178,6 +178,9 @@ struct Ctl {
     /// the next try.
     avatar_tries: Arc<Mutex<HashMap<OwnedMxcUri, u8>>>,
     loading: Arc<Mutex<HashSet<String>>>,
+    /// How many times the app has been locked: work started before a lock
+    /// compares it, and drops what it fetched if it has changed.
+    locks: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn local(ts: MilliSecondsSinceUnixEpoch) -> Option<chrono::DateTime<chrono::Local>> {
@@ -834,6 +837,7 @@ impl Ctl {
     }
 
     async fn lock(&self) {
+        self.locks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let agents = std::mem::take(&mut self.st.lock().unwrap().agents);
         for a in agents.into_values() {
             a.abort();
@@ -1256,13 +1260,28 @@ impl Ctl {
             return;
         }
         let (c, key) = (self.clone(), key.clone());
+        let locks = self.locks.load(std::sync::atomic::Ordering::SeqCst);
         self.spawn(async move {
             let Some(room) = c.mgr.client(key.0).await.and_then(|cl| cl.get_room(&key.1)) else { return };
             let mut found = false;
             for id in wanted {
+                // The room was left: the rest can wait until it's open again.
+                if c.current().as_ref() != Some(&key) {
+                    let mut st = c.st.lock().unwrap();
+                    if c.locks.load(std::sync::atomic::Ordering::SeqCst) == locks && st.reply_cache.get(&id) == Some(&None) {
+                        st.reply_cache.remove(&id);
+                    }
+                    continue;
+                }
                 match timeline::message_text(&room, &id).await {
                     Ok(got) => {
-                        c.st.lock().unwrap().reply_cache.insert(id, Some(got));
+                        let mut st = c.st.lock().unwrap();
+                        // Locked meanwhile: decrypted text doesn't go back
+                        // into memory, or onto the screen.
+                        if c.locks.load(std::sync::atomic::Ordering::SeqCst) != locks {
+                            return;
+                        }
+                        st.reply_cache.insert(id, Some(got));
                         found = true;
                     }
                     Err(e) => tracing::debug!("couldn't fetch the replied-to message {id}: {e:#}"),
@@ -1282,12 +1301,19 @@ impl Ctl {
             let id = target.to_string();
             return self.ui(move |u| u.set_jump_id(s(id)));
         }
+        let locks = self.locks.load(std::sync::atomic::Ordering::SeqCst);
         let cached = self.st.lock().unwrap().reply_cache.get(&target).cloned().flatten();
         let got = match cached {
             Some(g) => Some(g),
             None => match timeline::message_text(room, &target).await {
                 Ok(g) => {
-                    self.st.lock().unwrap().reply_cache.insert(target.clone(), Some(g.clone()));
+                    let mut st = self.st.lock().unwrap();
+                    // Locked while it was fetched: nothing is kept or shown.
+                    if self.locks.load(std::sync::atomic::Ordering::SeqCst) != locks {
+                        return;
+                    }
+                    st.reply_cache.insert(target.clone(), Some(g.clone()));
+                    drop(st);
                     Some(g)
                 }
                 Err(e) => {
@@ -5410,6 +5436,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         avatars: Arc::default(),
         avatar_tries: Arc::default(),
         loading: Arc::default(),
+        locks: Arc::default(),
     };
 
     // Runs `method` on the tokio runtime with the callback's arguments.

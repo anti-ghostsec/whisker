@@ -1194,6 +1194,9 @@ export component SettingsPage inherits Rectangle {
             if root.narrow: HorizontalLayout {
                 padding: 8px;
                 IconBtn { icon: "‹"; clicked => { root.selected = ""; } }
+                // Without this the row can't be wider than its button, and
+                // the whole column (the page below too) is held to that width.
+                Rectangle { horizontal-stretch: 1; }
             }
             if root.message != "": Rectangle {
                 background: Theme.accent-soft;

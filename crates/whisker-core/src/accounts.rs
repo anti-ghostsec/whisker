@@ -521,17 +521,17 @@ impl AccountManager {
         self.inner.read().await.vaults.keys().cloned().collect()
     }
 
-    /// `known`: `homeserver` is the URL a login already resolved, so skip
-    /// discovery. Discovery is network round trips, and doing them for every
-    /// account on unlock left it hanging whenever a server was slow.
-    async fn build_client(&self, id: AccountId, homeserver: &str, known: bool, store_pass: &str, proxy: Option<&str>) -> Result<Client> {
+    /// `homeserver` is the client API's URL, already found (at sign-in by
+    /// [`resolve_homeserver`]): the SDK's own discovery is network round
+    /// trips on every unlock, and gives up on servers it needn't.
+    async fn build_client(&self, id: AccountId, homeserver: &str, store_pass: &str, proxy: Option<&str>) -> Result<Client> {
         let mut b = Client::builder();
         // See `crate::tls`: the system's check doesn't work on Android.
         #[cfg(target_os = "android")]
         {
             b = b.disable_built_in_root_certificates().add_root_certificates(crate::tls::roots());
         }
-        b = if known { b.homeserver_url(homeserver) } else { b.server_name_or_homeserver_url(homeserver) };
+        b = b.homeserver_url(homeserver);
         let mut b = b.sqlite_store_with_cache_path(self.store_dir(id), self.cache_dir(id), Some(store_pass));
         if let Some(p) = proxy {
             b = b.proxy(p);
@@ -562,7 +562,7 @@ impl AccountManager {
             .await?;
         }
         let client = self
-            .build_client(record.id, &record.homeserver, true, &record.store_passphrase, record.proxy.as_deref())
+            .build_client(record.id, &record.homeserver, &record.store_passphrase, record.proxy.as_deref())
             .await?;
         client.restore_session(record.session.clone()).await?;
         self.go_live(vault, record, client).await;
@@ -784,10 +784,13 @@ impl AccountManager {
         }
         let id = AccountId::new();
         let store_passphrase = random_secret();
+        // Found here, leniently: the SDK's own lookup gives up on a server
+        // whose well-known file is missing or odd.
+        let homeserver = resolve_homeserver(req.homeserver, req.proxy.as_deref()).await;
         let client = self
-            .build_client(id, req.homeserver, false, &store_passphrase, req.proxy.as_deref())
+            .build_client(id, &homeserver, &store_passphrase, req.proxy.as_deref())
             .await
-            .context("could not reach homeserver")?;
+            .with_context(|| format!("could not use {homeserver} as the homeserver"))?;
         if req.register {
             self.register_on(&client, req.username, req.password, req.token).await?;
         } else {
@@ -1290,14 +1293,30 @@ impl AccountManager {
 /// `/.well-known/matrix/client`), or `None` if it doesn't say in time.
 async fn discover(record: &AccountRecord) -> Option<String> {
     let server = record.user_id.split_once(':')?.1;
+    well_known(&format!("{}://{server}", crate::rooms::scheme_for(server)), record.proxy.as_deref()).await
+}
+
+/// The client API address `origin` (`https://server`) names in its
+/// `/.well-known/matrix/client`, or `None` if it names none in time.
+async fn well_known(origin: &str, proxy: Option<&str>) -> Option<String> {
     let mut http = crate::tls::http_builder().timeout(std::time::Duration::from_secs(6));
-    if let Some(p) = &record.proxy {
+    if let Some(p) = proxy {
         http = http.proxy(reqwest::Proxy::all(p).ok()?);
     }
-    let url = format!("{}://{server}/.well-known/matrix/client", crate::rooms::scheme_for(server));
+    let url = format!("{origin}/.well-known/matrix/client");
     let v: serde_json::Value = http.build().ok()?.get(url).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
     let base = v.get("m.homeserver")?.get("base_url")?.as_str()?.trim_end_matches('/');
     base.starts_with("http").then(|| base.to_owned())
+}
+
+/// The client API address for a server typed at sign-in: what its
+/// `/.well-known/matrix/client` names, or else the server itself. Many
+/// servers have no such file, or one that isn't quite right; the sign-in
+/// that follows says so if the address turns out wrong.
+async fn resolve_homeserver(typed: &str, proxy: Option<&str>) -> String {
+    let typed = typed.trim().trim_end_matches('/');
+    let origin = if typed.contains("://") { typed.to_owned() } else { format!("{}://{typed}", crate::rooms::scheme_for(typed)) };
+    well_known(&origin, proxy).await.unwrap_or(origin)
 }
 
 fn random_byte() -> u8 {

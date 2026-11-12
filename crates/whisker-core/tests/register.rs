@@ -85,3 +85,23 @@ async fn explains_email_only_signup() {
     assert!(e.contains("an email address") && e.contains("website"), "{e}");
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// The typed server only says where its client API lives; the account is
+/// made there.
+#[tokio::test(flavor = "multi_thread")]
+async fn follows_the_servers_well_known() {
+    let (server, mgr, vault, dir) = setup().await;
+    Mock::given(method("POST")).and(path("/_matrix/client/v3/register")).and(body_partial_json(json!({"auth": {"type": "m.login.dummy", "session": "sess1"}})))
+        .respond_with(ok()).mount(server.server()).await;
+    Mock::given(method("POST")).and(path("/_matrix/client/v3/register")).respond_with(uiaa(&["m.login.dummy"])).mount(server.server()).await;
+    let front = wiremock::MockServer::start().await;
+    Mock::given(method("GET")).and(path("/.well-known/matrix/client"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"m.homeserver": {"base_url": server.uri()}})))
+        .mount(&front).await;
+
+    let uri = front.uri();
+    mgr.login(req(&vault, &uri, None)).await.unwrap();
+    assert_eq!(mgr.accounts().await[0].user_id, "@newbie:localhost");
+    mgr.lock_all().await;
+    std::fs::remove_dir_all(dir).ok();
+}

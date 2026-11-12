@@ -1,7 +1,11 @@
 use std::fmt::Write;
 
 fn main() {
-    slint_build::compile("ui/app.slint").expect("Slint UI failed to compile");
+    // One widget style everywhere. Left to itself Slint picks Material on
+    // Android, whose widgets size differently from the ones the pages were
+    // laid out with.
+    let config = slint_build::CompilerConfiguration::new().with_style("fluent".into());
+    slint_build::compile_with_config("ui/app.slint", config).expect("Slint UI failed to compile");
     emoji_table();
 }
 

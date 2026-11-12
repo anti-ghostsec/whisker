@@ -126,8 +126,10 @@ operating system and the **Wisp** browser.
   whole-word `:smile` is converted when you send. The ☺ button's picker takes the keyboard
   too: type to search, arrows to move, Enter to insert, Escape to close. Replying, editing,
   quoting, picking an emoji or switching rooms puts the cursor back in the message box.
-- **Clear messages (moderators):** Room info → *Clear messages…*, or type `/clear` on its own,
+- **Clear messages:** Room info → *Clear messages…*, or type `/clear` on its own,
   deletes the last 50, last 500 or all messages in the room for everyone (after asking).
+  Moderators clear everyone's messages; anyone else clears only their own, and the
+  numbers count their own messages.
   The command can be renamed (e.g. `?clear`) or turned off in Settings → *Commands*.
 - **Notifications** (Linux desktops) for direct messages, mentions, and rooms you've set to
   notify, never for the room you're looking at or for messages from your own accounts.

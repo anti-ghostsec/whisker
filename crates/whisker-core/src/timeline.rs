@@ -1027,14 +1027,24 @@ pub async fn forward(from: &Room, event_id: &EventId, to: &Room, edited_body: Op
 /// and the like, newest first (`None`: all of them). Room events (joins,
 /// names…) and what's already deleted stay. `progress` hears the count so
 /// far. Returns (deleted, failed).
-pub async fn clear_room(room: &Room, limit: Option<usize>, progress: impl Fn(usize)) -> Result<(usize, usize)> {
+///
+/// With `only`, just that person's messages are deleted and counted (what
+/// someone who can't delete others' messages clears: their own).
+pub async fn clear_room(room: &Room, limit: Option<usize>, only: Option<&UserId>, progress: impl Fn(usize)) -> Result<(usize, usize)> {
     let limit = limit.unwrap_or(usize::MAX);
     let (mut done, mut failed) = (0usize, 0usize);
-    let mut from = None;
+    let mut from: Option<String> = None;
+    // Pages in a row with nothing in them (a server that filters by sender
+    // after cutting the page can send some before the room's start).
+    let mut empty = 0;
     loop {
         let mut opts = MessagesOptions::backward();
         opts.limit = UInt::from(100u32);
-        opts.from = from;
+        opts.from = from.clone();
+        if let Some(who) = only {
+            // The server skips everyone else's, so a long room goes quickly.
+            opts.filter.senders = Some(vec![who.to_owned()]);
+        }
         let page = room.messages(opts).await?;
         for ev in &page.chunk {
             if done + failed >= limit {
@@ -1045,6 +1055,11 @@ pub async fn clear_room(room: &Room, limit: Option<usize>, progress: impl Fn(usi
             let is_state = raw.get_field::<serde_json::Value>("state_key").ok().flatten().is_some();
             let gone = raw.get_field::<serde_json::Value>("unsigned").ok().flatten().is_some_and(|u| u.get("redacted_because").is_some());
             if is_state || gone || kind == "m.room.redaction" {
+                continue;
+            }
+            if let Some(who) = only
+                && raw.get_field::<OwnedUserId>("sender").ok().flatten().as_deref() != Some(who)
+            {
                 continue;
             }
             let Some(id) = ev.event_id() else { continue };
@@ -1061,8 +1076,10 @@ pub async fn clear_room(room: &Room, limit: Option<usize>, progress: impl Fn(usi
             // Gentle on the server's rate limits.
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         }
+        empty = if page.chunk.is_empty() { empty + 1 } else { 0 };
+        let patience = if only.is_some() { 10 } else { 1 };
         match page.end {
-            Some(end) if !page.chunk.is_empty() => from = Some(end),
+            Some(end) if empty < patience && from.as_ref() != Some(&end) => from = Some(end),
             _ => return Ok((done, failed)),
         }
     }

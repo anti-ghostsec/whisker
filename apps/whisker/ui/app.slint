@@ -1435,6 +1435,13 @@ export component AppWindow inherits Window {
     callback filter-image-models(string);
     callback create-room(string, string, bool, string, bool, string);
 
+    // Closes the side panel (profile, room info, thread).
+    function close-panel() {
+        root.profile-open = false;
+        root.room-info-open = false;
+        root.info-editing = false;
+        root.thread-open = false;
+    }
     // Opens a profile card at once with what we already know; Rust fills in the rest.
     public function show-profile(user: string, name: string, initial: string, hue: int, avatar: image) {
         root.profile = { user-id: user, name: name, initial: initial, hue: hue, avatar: avatar, verified: -1 };
@@ -1464,6 +1471,8 @@ export component AppWindow inherits Window {
     callback set-clear-command(string);
     // "Clear messages" dialog: open, and delete the newest `n` (0 = all).
     in-out property <bool> clear-open;
+    // The dialog is for your own messages only (you can't delete others').
+    in-out property <bool> clear-own;
     callback clear-messages(int);
     callback set-menu-entry(string, bool);
 
@@ -1525,7 +1534,7 @@ export component AppWindow inherits Window {
                             drag-from: root.rail-drag-from;
                             drag-dy: root.rail-drag-dy;
                             selected: a.id == root.current-account;
-                            clicked => { root.activity(); root.current-account = a.id; root.select-account(a.id); root.pane = 1; }
+                            clicked => { root.activity(); root.current-account = a.id; root.select-account(a.id); root.pane = 1; if root.narrow { root.close-panel(); } }
                             double-clicked => { if !root.narrow { root.rooms-hidden = !root.rooms-hidden; } }
                             dragging(dy) => {
                                 root.rail-drag-from = dy != 0 ? i : -1;
@@ -1632,6 +1641,8 @@ export component AppWindow inherits Window {
                             clicked => {
                                 root.activity();
                                 root.exploring = false; root.current-room = r.id; root.select-room(r.id); root.pane = 2; root.stick-bottom = true;
+                                // Phones: the chat shows, not a profile left open.
+                                if root.narrow { root.close-panel(); }
                             }
                             menu(action) => { root.activity(); root.room-menu(action, r.id); }
                         }
@@ -2206,13 +2217,18 @@ export component AppWindow inherits Window {
                             alignment: center;
                             IconBtn { icon: "‹"; clicked => { root.profile-open = false; } }
                         }
+                        // Phones: back to the chat, as on the other panes.
+                        if root.narrow && !(root.profile-open && root.room-info-open): VerticalLayout {
+                            alignment: center;
+                            IconBtn { icon: "‹"; clicked => { root.close-panel(); } }
+                        }
                         Text {
                             text: root.profile-open ? "Profile" : root.room-info-open ? (root.current-space ? "Space info" : "Room info") : "Thread";
                             font-size: 16px; font-weight: 800; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1;
                         }
                         VerticalLayout {
                             alignment: center;
-                            IconBtn { icon: "✕"; clicked => { root.profile-open = false; root.room-info-open = false; root.info-editing = false; root.thread-open = false; } }
+                            IconBtn { icon: "✕"; clicked => { root.close-panel(); } }
                         }
                     }
                     Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
@@ -2542,7 +2558,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Rectangle { height: 6px; }
-                            if root.can-moderate && !root.current-space: Btn { text: "Clear messages…"; danger: true; clicked => { root.clear-open = true; } }
+                            if !root.current-space: Btn { text: root.can-moderate ? "Clear messages…" : "Clear my messages…"; danger: true; clicked => { root.clear-own = !root.can-moderate; root.clear-open = true; } }
                             Btn { text: root.current-space ? "Leave space" : "Leave room"; danger: true; clicked => { root.room-menu("leave", root.room-details.id); root.room-info-open = false; } }
                         }
                     }
@@ -2927,9 +2943,9 @@ export component AppWindow inherits Window {
 
     if root.clear-open: Overlay {
         dismiss => { root.clear-open = false; }
-        Text { text: "Clear messages"; font-size: 18px; font-weight: 800; color: Theme.text; }
+        Text { text: root.clear-own ? "Clear my messages" : "Clear messages"; font-size: 18px; font-weight: 800; color: Theme.text; }
         Text {
-            text: "Deletes messages in " + root.current-room-name + " for everyone, newest first. Their text is gone from the server and every app; this can't be undone. Room events (joins, renames) stay.";
+            text: (root.clear-own ? "Deletes the messages you sent in " : "Deletes messages in ") + root.current-room-name + " for everyone, newest first. Their text is gone from the server and every app; this can't be undone. " + (root.clear-own ? "Other people's messages stay; the numbers count yours only." : "Room events (joins, renames) stay.");
             color: Theme.muted; font-size: 12px; wrap: word-wrap;
         }
         HorizontalLayout {

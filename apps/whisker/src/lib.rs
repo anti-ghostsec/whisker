@@ -2459,14 +2459,17 @@ impl Ctl {
         // The clear command opens its confirmation instead of being posted.
         let clear = self.settings.lock().unwrap().clear_command.trim().to_owned();
         if !clear.is_empty() && text.eq_ignore_ascii_case(&clear) && self.st.lock().unwrap().editing.is_none() {
-            let allowed = match (room.power_levels().await, room.client().user_id()) {
-                (Ok(pl), Some(me)) => pl.user_can_redact_event_of_other(me),
-                _ => false,
-            };
-            if allowed {
-                self.ui(|u| u.set_clear_open(true));
-            } else {
-                self.status("Only moderators can clear messages here.");
+            // Moderators clear everyone's; anyone else clears their own.
+            match clear_rights(&room).await {
+                (true, _) => self.ui(|u| {
+                    u.set_clear_own(false);
+                    u.set_clear_open(true);
+                }),
+                (false, true) => self.ui(|u| {
+                    u.set_clear_own(true);
+                    u.set_clear_open(true);
+                }),
+                _ => self.status("This room doesn't let you delete messages."),
             }
             return;
         }
@@ -3918,12 +3921,24 @@ impl Ctl {
 
     async fn clear_messages(&self, n: i32) {
         let Some((_, room)) = self.current_room().await else { return };
-        self.status("Clearing messages…");
+        // Decided here, not by what the dialog said: only your own unless
+        // the room lets you delete other people's.
+        let own = match clear_rights(&room).await {
+            (true, _) => None,
+            (false, true) => room.client().user_id().map(ToOwned::to_owned),
+            _ => {
+                self.status("This room doesn't let you delete messages.");
+                return;
+            }
+        };
+        let what = if own.is_some() { "your messages" } else { "messages" };
+        let of = if own.is_some() { "of your messages" } else { "messages" };
+        self.status(format!("Clearing {what}…"));
         let me = self.clone();
         let limit = usize::try_from(n).ok().filter(|n| *n > 0);
-        match timeline::clear_room(&room, limit, move |done| me.status(format!("Clearing messages… {done} deleted"))).await {
-            Ok((done, 0)) => self.status(format!("Deleted {done} messages.")),
-            Ok((done, failed)) => self.status(format!("Deleted {done} messages; {failed} couldn't be deleted.")),
+        match timeline::clear_room(&room, limit, own.as_deref(), move |done| me.status(format!("Clearing {what}… {done} deleted"))).await {
+            Ok((done, 0)) => self.status(format!("Deleted {done} {of}.")),
+            Ok((done, failed)) => self.status(format!("Deleted {done} {of}; {failed} couldn't be deleted.")),
             Err(e) => self.status(format!("Couldn't clear messages: {e:#}")),
         }
     }
@@ -5833,6 +5848,14 @@ fn apply_menu(ui: &AppWindow, hidden: &std::collections::BTreeSet<String>) {
     p.set_menu_profile(on("profile"));
     p.set_menu_copy_id(on("copy-id"));
     p.set_menu_source(on("source"));
+}
+
+/// Whether we may delete (other people's messages, our own) in `room`.
+async fn clear_rights(room: &matrix_sdk::Room) -> (bool, bool) {
+    match (room.power_levels().await, room.client().user_id()) {
+        (Ok(pl), Some(me)) => (pl.user_can_redact_event_of_other(me), pl.user_can_redact_own_event(me)),
+        _ => (false, false),
+    }
 }
 
 #[cfg(test)]

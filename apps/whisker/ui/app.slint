@@ -286,6 +286,8 @@ component Blocks inherits VerticalLayout {
             width: root.avail;
             text: b.plain;
             read-only: true;
+            // Touch screens: left to the row, so press-and-hold opens its menu.
+            enabled: !Prefs.touch;
             accessible-description: "sel|" + root.key + "|" + (i + 1);
             single-line: false;
             wrap: word-wrap;
@@ -311,6 +313,8 @@ component Blocks inherits VerticalLayout {
                 width: root.avail - 11px;
                 text: b.plain;
                 read-only: true;
+                // Touch screens: left to the row, so press-and-hold opens its menu.
+                enabled: !Prefs.touch;
             accessible-description: "sel|" + root.key + "|" + (i + 1);
                 single-line: false;
                 wrap: word-wrap;
@@ -340,6 +344,8 @@ component Blocks inherits VerticalLayout {
                     width: root.avail - 16px;
                     text: b.plain;
                     read-only: true;
+                    // Touch screens: left to the row, so press-and-hold opens its menu.
+                    enabled: !Prefs.touch;
             accessible-description: "sel|" + root.key + "|" + (i + 1);
                     single-line: false;
                     wrap: word-wrap;
@@ -356,6 +362,8 @@ component Blocks inherits VerticalLayout {
             width: root.avail;
             text: b.plain;
             read-only: true;
+            // Touch screens: left to the row, so press-and-hold opens its menu.
+            enabled: !Prefs.touch;
             accessible-description: "sel|" + root.key + "|" + (i + 1);
             single-line: false;
             wrap: word-wrap;
@@ -626,6 +634,8 @@ component MessageRow inherits Rectangle {
                             TextInput {
                                 text: root.item.name;
                                 read-only: true;
+                                // Touch screens: left to the row, so press-and-hold opens its menu.
+                                enabled: !Prefs.touch;
                                 accessible-description: "sel|" + root.list + "|" + root.item.id + "|0";
                                 selection-background-color: Theme.accent.transparentize(0.55);
                                 font-weight: 700;

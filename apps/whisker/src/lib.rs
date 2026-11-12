@@ -1556,10 +1556,16 @@ impl Ctl {
         // fetch it now so pressing Enter doesn't wait for it.
         if room.encryption_state().is_encrypted() {
             let r = room.clone();
+            let (c, k) = (self.clone(), key.clone());
             tokio::spawn(async move {
                 let started = Instant::now();
                 if r.sync_members().await.is_ok() {
                     tracing::debug!(room = %r.room_id(), ms = started.elapsed().as_millis() as u64, "members fetched ahead of sending");
+                    // Read receipts are looked up per member: again, now
+                    // that all of them are known.
+                    if c.current().as_ref() == Some(&k) {
+                        c.schedule_marks(k);
+                    }
                 }
             });
         }
@@ -1608,6 +1614,8 @@ impl Ctl {
             }
         }
         self.ui(|u| u.set_loading_history(false));
+        // The history brought more members (and their receipts) with it.
+        self.schedule_marks(key.clone());
         self.grow_messages(&key).await;
         self.mark_read(&key).await;
     }
@@ -5405,6 +5413,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.set_auto_lock(prefs.auto_lock_index());
     ui.set_encryption_summary(ENCRYPTION_SUMMARY.into());
     ui.global::<Prefs>().set_rich_text(prefs.rich_text);
+    #[cfg(target_os = "android")]
+    ui.global::<Prefs>().set_touch(true);
     ui.global::<Prefs>().set_show_events(prefs.show_events);
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);

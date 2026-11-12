@@ -38,6 +38,8 @@ export global TextTools {
 }
 
 export global Prefs {
+    // A touch screen (Android): no mouse, so no drag-selecting text.
+    in-out property <bool> touch: false;
     // Rich (styled, clickable links) vs plain drag-selectable message text.
     in-out property <bool> rich-text: false;
     // Typed alone in the composer, opens "Clear messages" (moderators).

@@ -9,6 +9,7 @@ whisker-core.workspace = true
 anyhow.workspace = true
 matrix-sdk.workspace = true
 reqwest.workspace = true
+url = "2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

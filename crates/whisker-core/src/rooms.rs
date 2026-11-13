@@ -215,17 +215,23 @@ pub async fn details(room: &Room) -> RoomDetails {
         HistoryVisibility::Joined => "History: members, from when they joined",
         _ => "",
     };
-    let mut pinned = Vec::new();
-    for id in room.pinned_event_ids().unwrap_or_default().into_iter().rev().take(5) {
-        let Ok(ev) = room.event(&id, None).await else { continue };
-        if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)))) = ev.raw().deserialize() {
-            let who = timeline::member_profile(room, &m.sender).await.0.unwrap_or_else(|| m.sender.localpart().to_owned());
-            pinned.push((who, timeline::message_body(&m.content.msgtype).0));
+    // Pinned messages from the local cache when it has them, all at once,
+    // alongside the description (which may need the server).
+    let pins = room.pinned_event_ids().unwrap_or_default().into_iter().rev().take(5).map(|id| async move {
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), room.load_or_fetch_event(&id, None)).await.ok()?.ok()?;
+        match ev.raw().deserialize() {
+            Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)))) => {
+                let who = timeline::member_profile(room, &m.sender).await.0.unwrap_or_else(|| m.sender.localpart().to_owned());
+                Some((who, timeline::message_body(&m.content.msgtype).0))
+            }
+            _ => None,
         }
-    }
+    });
+    let (pinned, topic) = tokio::join!(futures_util::future::join_all(pins), topic(room));
+    let pinned: Vec<(String, String)> = pinned.into_iter().flatten().collect();
     RoomDetails {
         name: timeline::room_name(room).await,
-        topic: topic(room).await,
+        topic,
         alias: room
             .canonical_alias()
             .map(|a| a.to_string())
@@ -271,7 +277,9 @@ pub async fn topic(room: &Room) -> String {
         StateEventType::RoomTopic,
         String::new(),
     );
-    match tokio::time::timeout(std::time::Duration::from_secs(10), room.client().send(req)).await {
+    // Usually there's simply no description (the server says 404): don't
+    // hold the room's info page up for long over it.
+    match tokio::time::timeout(std::time::Duration::from_secs(3), room.client().send(req)).await {
         Ok(Ok(resp)) => serde_json::from_str::<serde_json::Value>(resp.event_or_content.get())
             .ok()
             .and_then(|v| topic_text(&v))
@@ -369,9 +377,17 @@ pub struct Member {
 /// Joined members, admins and moderators first. Fetches the full list from
 /// the server the first time (sync only sends the members it needs).
 pub async fn members(room: &Room) -> Result<Vec<Member>> {
-    let mut out: Vec<Member> = room
-        .members(RoomMemberships::JOIN)
-        .await?
+    Ok(sorted(room.members(RoomMemberships::JOIN).await?))
+}
+
+/// Joined members this device already knows, without asking the server
+/// (instant, but maybe not everyone until [`members`] has run once).
+pub async fn members_cached(room: &Room) -> Result<Vec<Member>> {
+    Ok(sorted(room.members_no_sync(RoomMemberships::JOIN).await?))
+}
+
+fn sorted(list: Vec<matrix_sdk::room::RoomMember>) -> Vec<Member> {
+    let mut out: Vec<Member> = list
         .into_iter()
         .map(|m| Member {
             name: m.display_name().map(str::to_owned).unwrap_or_else(|| m.user_id().localpart().to_owned()),
@@ -384,7 +400,7 @@ pub async fn members(room: &Room) -> Result<Vec<Member>> {
         })
         .collect();
     out.sort_by(|a, b| b.level.cmp(&a.level).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
-    Ok(out)
+    out
 }
 
 pub fn role_name(level: i64) -> String {

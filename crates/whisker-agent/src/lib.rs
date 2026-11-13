@@ -11,6 +11,7 @@ pub mod permissions;
 pub mod reply;
 pub mod runner;
 pub mod tools;
+pub mod web;
 
 pub use api::{ApiConfig, ApiFormat, Detected, detect};
 pub use config::{AgentConfig, Trigger};

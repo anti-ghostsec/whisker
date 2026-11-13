@@ -2281,31 +2281,14 @@ impl Ctl {
             u.set_room_info_open(true);
             u.set_pane(2);
         });
+        // What this device knows first (instant), then the full list.
+        if let Ok(list) = whisker_core::rooms::members_cached(&room).await
+            && !list.is_empty()
+        {
+            self.show_members(key.0, list, true);
+        }
         match whisker_core::rooms::members(&room).await {
-            Ok(list) => {
-                self.fetch_avatars(key.0, list.iter().take(200).filter_map(|m| m.avatar.clone()));
-                let px = self.avatars.clone();
-                self.ui(move |u| {
-                    let items: Vec<MemberItem> = ui::with(|m| {
-                        list.iter()
-                            .map(|mem| {
-                                let (initial, hue) = initial_hue(&mem.name);
-                                MemberItem {
-                                    user_id: s(mem.user_id.as_str()),
-                                    name: s(&mem.name),
-                                    initial,
-                                    hue,
-                                    avatar: m.avatar(&mem.avatar, &px),
-                                    role: s(whisker_core::rooms::role_name(mem.level)),
-                                }
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                    u.set_members(ModelRc::new(VecModel::from(items)));
-                    u.set_members_loading(false);
-                });
-            }
+            Ok(list) => self.show_members(key.0, list, false),
             Err(e) => {
                 let m = format!("Couldn't load members: {e}");
                 self.ui(move |u| {
@@ -2314,6 +2297,32 @@ impl Ctl {
                 });
             }
         }
+    }
+
+    /// Fills the room info's member list (`loading`: more may come).
+    fn show_members(&self, account: AccountId, list: Vec<whisker_core::rooms::Member>, loading: bool) {
+        self.fetch_avatars(account, list.iter().take(200).filter_map(|m| m.avatar.clone()));
+        let px = self.avatars.clone();
+        self.ui(move |u| {
+            let items: Vec<MemberItem> = ui::with(|m| {
+                list.iter()
+                    .map(|mem| {
+                        let (initial, hue) = initial_hue(&mem.name);
+                        MemberItem {
+                            user_id: s(mem.user_id.as_str()),
+                            name: s(&mem.name),
+                            initial,
+                            hue,
+                            avatar: m.avatar(&mem.avatar, &px),
+                            role: s(whisker_core::rooms::role_name(mem.level)),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+            u.set_members(ModelRc::new(VecModel::from(items)));
+            u.set_members_loading(loading);
+        });
     }
 
     async fn room_invite(&self, users: String) {
@@ -4587,7 +4596,25 @@ impl Ctl {
                     _ => 0,
                 };
                 session = (verified, client.device_id().map(|d| d.to_string()).unwrap_or_default());
-                identity = (whisker_core::verify::has_identity(&client).await, whisker_core::verify::recovery_on(&client));
+                // What this device already knows, so the page opens at once;
+                // asking the server (a keys query) happens after it's shown.
+                let known = whisker_core::verify::known_identity(&client).await;
+                identity = (known.unwrap_or(false), whisker_core::verify::recovery_on(&client));
+                if known.is_none() {
+                    let me = self.clone();
+                    self.spawn(async move {
+                        if whisker_core::verify::has_identity(&client).await {
+                            let id = aid.to_string();
+                            me.ui(move |u| {
+                                let mut f = u.get_account_form();
+                                if f.id.as_str() == id {
+                                    f.has_identity = true;
+                                    u.set_account_form(f);
+                                }
+                            });
+                        }
+                    });
+                }
             }
         }
         if let Some(rest) = id.strip_prefix("ai:")
@@ -4600,8 +4627,13 @@ impl Ctl {
             agent = agent_form::to_form(aid, &a.display_name, cfg);
             // Opening the page again drops an import that wasn't saved.
             self.st.lock().unwrap().pending_cards.remove(&aid);
-            let png = self.card_picture(&a.vault, aid).await;
-            self.show_card_picture(png);
+            // The card's picture is decoded after the page shows (it can be big).
+            self.ui(|u| u.set_card_picture(Image::default()));
+            let (me, vault) = (self.clone(), a.vault.clone());
+            self.spawn(async move {
+                let png = me.card_picture(&vault, aid).await;
+                me.show_card_picture(png).await;
+            });
             if let Some(d) = self.st.lock().unwrap().detected.get(&aid) {
                 models = d.models.iter().map(s).collect();
                 image_models = d.vision.iter().map(s).collect();
@@ -4853,8 +4885,9 @@ impl Ctl {
         whisker_agent::card::decode_base64(&text).ok().filter(|b| !b.is_empty())
     }
 
-    fn show_card_picture(&self, png: Option<Vec<u8>>) {
-        let px = png.and_then(|b| decode(&b, 512, 512, false));
+    async fn show_card_picture(&self, png: Option<Vec<u8>>) {
+        // Decoding a big picture is slow: off the async workers.
+        let px = tokio::task::spawn_blocking(move || png.and_then(|b| decode(&b, 512, 512, false))).await.ok().flatten();
         self.ui(move |u| u.set_card_picture(px.map(Image::from_rgba8).unwrap_or_default()));
     }
 
@@ -4882,7 +4915,7 @@ impl Ctl {
                             if imp.png.is_some() { " with its picture" } else { "" }
                         );
                         let form = f.clone().with_card(Some(&imp.card));
-                        self.show_card_picture(imp.png.clone());
+                        self.show_card_picture(imp.png.clone()).await;
                         self.st.lock().unwrap().pending_cards.insert(id, Some((imp.card, imp.png)));
                         self.ui(move |u| u.set_agent_form(form));
                         self.settings_msg(msg);
@@ -4893,7 +4926,7 @@ impl Ctl {
             "remove" => {
                 self.st.lock().unwrap().pending_cards.insert(id, None);
                 let form = f.clone().with_card(None);
-                self.show_card_picture(None);
+                self.show_card_picture(None).await;
                 self.ui(move |u| u.set_agent_form(form));
                 self.settings_msg("Card removed. Press Save to keep it that way.");
             }

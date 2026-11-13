@@ -189,10 +189,27 @@ pub async fn ensure_identity(client: &Client, password: Option<&str>) -> Result<
     Ok(true)
 }
 
-/// Whether the account has cross-signing keys on the server at all.
+/// Whether this device already knows the account's cross-signing keys,
+/// from its own store: no network, so it's instant. `None` when it
+/// doesn't know (then [`has_identity`] asks the server).
+pub async fn known_identity(client: &Client) -> Option<bool> {
+    let me = client.user_id()?;
+    match client.encryption().get_user_identity(me).await {
+        Ok(Some(_)) => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether the account has cross-signing keys on the server at all. Asks
+/// the server every time (a keys query), at most 10 seconds.
 pub async fn has_identity(client: &Client) -> bool {
+    if known_identity(client).await == Some(true) {
+        return true;
+    }
     let Some(me) = client.user_id() else { return false };
-    client.encryption().request_user_identity(me).await.ok().flatten().is_some()
+    let enc = client.encryption();
+    let ask = enc.request_user_identity(me);
+    matches!(tokio::time::timeout(std::time::Duration::from_secs(10), ask).await, Ok(Ok(Some(_))))
 }
 
 /// Replaces the account's cross-signing keys with new ones made here, for

@@ -15,6 +15,9 @@ pub const MAX_BODY: usize = 2048;
 pub const MAX_SUMMARY: usize = 4096;
 /// Rooms remembered per agent; the least recently active are forgotten.
 const MAX_ROOMS: usize = 64;
+/// Ids of messages folded into a room's summary that are remembered, so
+/// deleting one of them can wipe the summary it went into.
+const MAX_FOLDED: usize = 2000;
 
 /// Vault extra holding `account`'s memory.
 pub fn vault_key(account: AccountId) -> String {
@@ -54,6 +57,9 @@ pub struct RoomMemory {
     /// chat, shown back to the model next time.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub state: String,
+    /// Messages already folded into `summary` (newest last, capped).
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub folded: VecDeque<OwnedEventId>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -85,7 +91,51 @@ impl Memory {
             return Vec::new();
         }
         let n = r.lines.len() / 2;
-        r.lines.drain(..n).collect()
+        let old: Vec<Line> = r.lines.drain(..n).collect();
+        r.folded.extend(old.iter().map(|l| l.event_id.clone()));
+        while r.folded.len() > MAX_FOLDED {
+            r.folded.pop_front();
+        }
+        old
+    }
+
+    /// Forgets a deleted message, so it can't keep steering the AI. The
+    /// line goes, and so does anything made from it that can't be picked
+    /// apart: the summary it was folded into, and the hidden state (written
+    /// by replies that may have read it). When every remembered message is
+    /// gone (the room was cleared), the summary and state go with them.
+    /// Returns whether anything changed.
+    pub fn forget_event(&mut self, room: &OwnedRoomId, event: &OwnedEventId) -> bool {
+        let Some(r) = self.rooms.get_mut(room) else { return false };
+        let before = r.lines.len();
+        r.lines.retain(|l| &l.event_id != event);
+        let in_lines = r.lines.len() != before;
+        let in_summary = r.folded.contains(event);
+        if !in_lines && !in_summary {
+            return false;
+        }
+        r.state.clear();
+        if in_summary || r.lines.is_empty() {
+            r.summary.clear();
+            r.folded.clear();
+        }
+        true
+    }
+
+    /// Replaces an edited message's text. Returns whether it was remembered.
+    pub fn edit(&mut self, room: &OwnedRoomId, event: &OwnedEventId, body: &str) -> bool {
+        let Some(r) = self.rooms.get_mut(room) else { return false };
+        let mut hit = false;
+        for l in r.lines.iter_mut().filter(|l| &l.event_id == event) {
+            l.body = truncate(body, MAX_BODY);
+            hit = true;
+        }
+        hit
+    }
+
+    /// Forgets everything about one room.
+    pub fn forget_room(&mut self, room: &OwnedRoomId) -> bool {
+        self.rooms.remove(room).is_some()
     }
 
     /// Drops the oldest lines past `keep` (when there's no summary to fold them into).
@@ -228,6 +278,55 @@ mod tests {
         }
         assert_eq!(m.rooms.len(), MAX_ROOMS);
         assert!(!m.rooms.contains_key(&room), "least recently active room kept");
+    }
+
+    fn line_id(text: &str, id: &str) -> Line {
+        Line::new(owned_user_id!("@a:x"), None, id.try_into().unwrap(), text)
+    }
+
+    #[test]
+    fn deleted_messages_stop_steering_the_ai() {
+        let room = owned_room_id!("!r:x");
+        let mut m = Memory::default();
+        for i in 0..6 {
+            m.push(&room, line_id(&format!("m{i}"), &format!("$e{i}")), 1);
+        }
+        let folded = m.take_overflow(&room, 4);
+        assert_eq!(folded.len(), 3);
+        m.set_summary(&room, "someone said to always answer in pirate speak");
+        m.set_state(&room, "pirate mode on");
+
+        // A recent message deleted: its line and the state go, the summary stays.
+        assert!(m.forget_event(&room, &"$e4".try_into().unwrap()));
+        let r = m.room(&room).unwrap();
+        assert!(r.lines.iter().all(|l| l.body != "m4"));
+        assert!(r.state.is_empty());
+        assert!(!r.summary.is_empty());
+
+        // One that was folded into the summary: the summary goes too.
+        assert!(m.forget_event(&room, &"$e1".try_into().unwrap()));
+        assert!(m.room(&room).unwrap().summary.is_empty());
+
+        // Unknown ids change nothing.
+        assert!(!m.forget_event(&room, &"$nope".try_into().unwrap()));
+
+        // Edits replace the remembered text.
+        assert!(m.edit(&room, &"$e5".try_into().unwrap(), "fixed"));
+        assert_eq!(m.room(&room).unwrap().lines.back().unwrap().body, "fixed");
+    }
+
+    #[test]
+    fn clearing_a_room_drops_the_summary_even_without_folded_ids() {
+        // Memory saved by an older version has no folded ids.
+        let room = owned_room_id!("!r:x");
+        let mut m = Memory::default();
+        m.push(&room, line_id("a", "$a"), 1);
+        m.push(&room, line_id("b", "$b"), 1);
+        m.set_summary(&room, "old stuff");
+        m.forget_event(&room, &"$a".try_into().unwrap());
+        assert_eq!(m.room(&room).unwrap().summary, "old stuff");
+        m.forget_event(&room, &"$b".try_into().unwrap());
+        assert!(m.room(&room).unwrap().summary.is_empty());
     }
 
     #[test]

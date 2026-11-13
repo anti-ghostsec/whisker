@@ -106,6 +106,25 @@ export component Avatar inherits Rectangle {
     }
 }
 
+// A small "AI" tag laid over the corner of an AI account's picture (in the
+// account rail and settings, never in rooms). Place it inside the avatar's
+// parent, after the Avatar, so it draws on top, and set x and y there.
+export component AiBadge inherits Rectangle {
+    in property <length> avatar-size: 42px;
+    width: max(16px, avatar-size * 0.5);
+    height: max(12px, avatar-size * 0.32);
+    border-radius: self.height / 2;
+    background: Theme.accent;
+    border-width: 2px;
+    border-color: Theme.bg;
+    Text {
+        text: "AI";
+        color: Theme.on-accent;
+        font-weight: 800;
+        font-size: max(7px, root.height * 0.58);
+    }
+}
+
 export component Btn inherits Rectangle {
     horizontal-stretch: 0;
     in property <string> text;

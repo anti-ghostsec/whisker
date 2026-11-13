@@ -34,6 +34,17 @@ operating system and the **Wisp** browser.
   Whisker works out what kind of API it is, lists its models, and has a Test button. With
   Venice, its own system prompt and web search are always sent as *off* (web search would
   pass chat messages to a third-party search engine) unless you switch them on for that AI.
+- **AI accounts are marked.** In the account list and settings, an AI account's picture
+  carries a small **AI** tag (in rooms it looks like anyone else).
+- **AI web reading** (off unless you switch it on, per AI). The AI can read links and public
+  GitHub repositories, folders and files. It only fetches public addresses (never your
+  network or this device), through the AI account's proxy if it has one, and only links
+  posted in the chat, links in pages it already read, or sites you list (GitHub by
+  default), so a message can't make it send the chat to some other site. Pages are treated
+  as untrusted, and after reading the web the AI can't moderate until the next message.
+- **Deleted means forgotten.** When a message is deleted (or a room cleared), the AI drops
+  it from its memory, along with the summary it went into and its hidden state; edits
+  replace the remembered text.
 - **AI memory.** Each AI remembers the last messages of every room word for word (40 by
   default, saved in the vault so restarts don't wipe it) and folds older ones into a
   running summary, made by the chat model or a cheaper one you name. The prompt stays
@@ -183,8 +194,9 @@ operating system and the **Wisp** browser.
   account → *Set up verification* does it for an account that has none yet). *Make a
   recovery key* turns on key backup; a later login can enter that key to verify itself and
   read older messages. Lost every session and the key? *Reset verification* starts over.
-  Your AI accounts and your other accounts on this device verify each other automatically
-  (but two people-accounts never do, so alts stay unlinked).
+  Your AI accounts and your other accounts in the same vault verify each other automatically
+  (but two people-accounts never do, and nothing is verified across vaults, so alts and
+  hidden vaults stay unlinked).
 - **Room info** (click the room name or **i**, opens in the side panel): description, pinned messages (where rooms
   usually keep their rules), who can join, history visibility, encryption, the member list
   (click anyone to see their profile), inviting people, and editing the name/description if

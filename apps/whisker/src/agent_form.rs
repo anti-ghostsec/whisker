@@ -84,6 +84,8 @@ pub fn to_form(account: AccountId, name: &str, cfg: Option<&AgentConfig>) -> Age
         venice_web_search: c.venice_web_search,
         see_images: c.see_images,
         image_model: c.image_model.as_str().into(),
+        web: c.web,
+        web_sites: c.web_sites.join(", ").into(),
         reply_chars: c.reply_chars.min(20_000) as i32,
         cooldown: c.cooldown_secs.min(3600) as i32,
         max_steps: c.max_steps.min(20) as i32,
@@ -228,6 +230,8 @@ pub fn from_form(account: AccountId, f: &AgentForm, old: Option<&AgentConfig>, d
     cfg.venice_web_search = f.venice_web_search;
     cfg.see_images = f.see_images;
     cfg.image_model = f.image_model.trim().to_owned();
+    cfg.web = f.web;
+    cfg.web_sites = f.web_sites.split([',', ' ', '\n']).map(|s| s.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
     cfg.reply_chars = f.reply_chars.max(0) as usize;
     cfg.cooldown_secs = f.cooldown.max(0) as u64;
     cfg.max_steps = f.max_steps.max(1) as usize;

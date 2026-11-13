@@ -88,6 +88,14 @@ pub struct AgentConfig {
     /// chat messages on to a third-party search engine.
     #[serde(default)]
     pub venice_web_search: bool,
+    /// Let the model read web pages and GitHub repositories (see
+    /// [`crate::web`]). Off by default: it makes requests to other sites.
+    #[serde(default)]
+    pub web: bool,
+    /// Sites the model may read anything from; other addresses only when
+    /// they appear in the chat. Empty: GitHub. `*`: any public site.
+    #[serde(default)]
+    pub web_sites: Vec<String>,
     /// Room where every moderation action is logged. Recommended.
     #[serde(default)]
     pub audit_room: Option<OwnedRoomId>,
@@ -136,6 +144,12 @@ pub fn default_prompt() -> String {
 impl AgentConfig {
     pub fn venice(&self) -> crate::llm::Venice {
         crate::llm::Venice { system_prompt: self.venice_system_prompt, web_search: self.venice_web_search }
+    }
+
+    /// The sites the model may read freely.
+    pub fn web_sites(&self) -> Vec<String> {
+        let listed: Vec<String> = self.web_sites.iter().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+        if listed.is_empty() { crate::web::DEFAULT_SITES.iter().map(|s| (*s).to_owned()).collect() } else { listed }
     }
 
     pub fn new(account: AccountId, api: ApiConfig) -> Self {

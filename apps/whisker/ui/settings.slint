@@ -1,5 +1,5 @@
 import { ComboBox, SpinBox, Switch, TextEdit, ScrollView, ListView } from "std-widgets.slint";
-import { Theme, Prefs, Avatar, Btn, IconBtn, Input } from "theme.slint";
+import { Theme, Prefs, Avatar, AiBadge, Btn, IconBtn, Input } from "theme.slint";
 
 // One entry in the settings sidebar. `id` is "general", "account:<id>" or "ai:<id>".
 export struct NavItem {
@@ -63,6 +63,8 @@ export struct AgentForm {
     venice-web-search: bool,
     see-images: bool,
     image-model: string,
+    web: bool,
+    web-sites: string,
     reply-chars: int,
     g-reply: bool,
     g-redact: bool,
@@ -197,7 +199,12 @@ component NavRow inherits Rectangle {
         spacing: 10px;
         if root.item.section != "": VerticalLayout {
             alignment: center;
-            Avatar { initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; robot: root.item.robot && root.item.avatar.width == 0; size: 30px; }
+            Rectangle {
+                width: 30px;
+                height: 30px;
+                Avatar { initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; robot: root.item.robot && root.item.avatar.width == 0; size: 30px; }
+                if root.item.robot && root.item.avatar.width > 0: AiBadge { avatar-size: 30px; x: parent.width - self.width + 2px; y: parent.height - self.height + 2px; }
+            }
         }
         VerticalLayout {
             alignment: center;
@@ -562,7 +569,14 @@ component AccountPage inherits VerticalLayout {
         subtitle: "What everyone in your rooms sees.";
         HorizontalLayout {
             spacing: 14px;
-            Avatar { initial: root.account.initial; hue: root.account.hue; image: root.account.avatar; size: 72px; }
+            Rectangle {
+                width: 72px;
+                height: 72px;
+                horizontal-stretch: 0;
+                vertical-stretch: 0;
+                Avatar { initial: root.account.initial; hue: root.account.hue; image: root.account.avatar; robot: root.account.is-agent && root.account.avatar.width == 0; size: 72px; }
+                if root.account.is-agent && root.account.avatar.width > 0: AiBadge { avatar-size: 72px; x: parent.width - self.width + 2px; y: parent.height - self.height + 2px; }
+            }
             VerticalLayout {
                 alignment: center;
                 spacing: 8px;
@@ -844,6 +858,8 @@ component AgentPage inherits VerticalLayout {
     property <bool> a-venice-prompt: agent.venice-system-prompt;
     property <bool> a-venice-search: agent.venice-web-search;
     property <bool> a-see-images: agent.see-images;
+    property <bool> a-web: agent.web;
+    property <string> a-web-sites: agent.web-sites;
     property <string> a-image-model: agent.image-model;
     property <int> a-reply-chars: agent.reply-chars;
     property <int> a-cooldown: agent.cooldown;
@@ -883,6 +899,7 @@ component AgentPage inherits VerticalLayout {
             cooldown: root.a-cooldown, max-steps: root.a-steps, yield-secs: root.a-yield, max-rapid: root.a-rapid,
             venice-system-prompt: root.a-venice-prompt, venice-web-search: root.a-venice-search,
             see-images: root.a-see-images, image-model: root.a-image-model, reply-chars: root.a-reply-chars,
+            web: root.a-web, web-sites: root.a-web-sites,
             g-reply: root.a-reply, g-redact: root.a-redact, g-kick: root.a-kick, g-ban: root.a-ban,
             g-unban: root.a-unban, g-invite: root.a-invite, g-power: root.a-power,
             commanders: root.a-commanders, min-level: root.a-min-level, autonomous: root.a-autonomous,
@@ -969,6 +986,16 @@ component AgentPage inherits VerticalLayout {
                 }
                 Btn { text: "Use it"; clicked => { root.a-image-model = root.default-image-model; } }
             }
+        }
+        Toggle { text: "Let the AI read links, web pages and GitHub repositories"; checked <=> root.a-web; }
+        Text {
+            text: "Fetches go out from this device (through the account's proxy, if it has one), only to public addresses, and only to links posted in the chat or to the sites below. After reading the web, the AI can't use moderation tools until the next message.";
+            font-size: 11px; color: Theme.muted; wrap: word-wrap;
+        }
+        if root.a-web: Field {
+            label: "Sites it may read anything from";
+            hint: "Comma-separated, subdomains included. Empty: GitHub only. * allows any public site (less private: the AI can then visit addresses it makes up).";
+            Input { text <=> root.a-web-sites; placeholder: "github.com, raw.githubusercontent.com"; }
         }
         Text {
             text: "Venice only (api.venice.ai). Both stay off unless you turn them on.";

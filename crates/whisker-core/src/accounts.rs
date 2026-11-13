@@ -1233,20 +1233,22 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Your AI accounts and the other accounts on this device mark each
+    /// Your AI accounts and the other accounts in the same vault mark each
     /// other verified, so their messages don't show as unverified. Two
-    /// people-accounts never do: that would tie alts together.
+    /// people-accounts never do: that would tie alts together. Nor do
+    /// accounts in different vaults: a cross-signing signature is uploaded
+    /// to the server (and the other account's id lands in this one's key
+    /// store), so an AI in the main vault vouching for an account in a
+    /// hidden vault would link the two and record the hidden one's address
+    /// outside its vault.
     pub async fn vouch_own(&self) {
-        let live: Vec<(AccountKind, Client)> = self.inner.read().await.live.values().map(|l| (l.record.kind, l.client.clone())).collect();
-        for (ka, a) in &live {
-            for (kb, b) in &live {
-                if *ka == AccountKind::Human && *kb == AccountKind::Human {
-                    continue;
-                }
-                let Some(other) = b.user_id() else { continue };
-                if let Err(e) = crate::verify::vouch(a, other).await {
-                    tracing::debug!("couldn't vouch for {other}: {e:#}");
-                }
+        let live: Vec<(AccountKind, VaultId, Client)> =
+            self.inner.read().await.live.values().map(|l| (l.record.kind, l.vault.clone(), l.client.clone())).collect();
+        let shape: Vec<(AccountKind, &str)> = live.iter().map(|(k, v, _)| (*k, v.as_str())).collect();
+        for (i, j) in vouch_pairs(&shape) {
+            let Some(other) = live[j].2.user_id() else { continue };
+            if let Err(e) = crate::verify::vouch(&live[i].2, other).await {
+                tracing::debug!("couldn't vouch for {other}: {e:#}");
             }
         }
     }
@@ -1331,5 +1333,36 @@ struct AbortOnDrop(JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Which accounts vouch for which (indexes into `accounts`: kind and vault):
+/// an AI and another account, both in the same vault. Never two
+/// people-accounts, never across vaults.
+fn vouch_pairs(accounts: &[(AccountKind, &str)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (i, (ka, va)) in accounts.iter().enumerate() {
+        for (j, (kb, vb)) in accounts.iter().enumerate() {
+            if i != j && va == vb && (*ka == AccountKind::Agent || *kb == AccountKind::Agent) {
+                out.push((i, j));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod vouch_tests {
+    use super::*;
+
+    #[test]
+    fn vouching_stays_inside_a_vault() {
+        use AccountKind::{Agent, Human};
+        // main: a person and an AI; hidden: an alt and its own AI.
+        let accounts = [(Human, "main"), (Agent, "main"), (Human, "hidden"), (Agent, "hidden")];
+        let pairs = vouch_pairs(&accounts);
+        assert_eq!(pairs, vec![(0, 1), (1, 0), (2, 3), (3, 2)]);
+        // Two people never, even in one vault.
+        assert!(vouch_pairs(&[(Human, "main"), (Human, "main")]).is_empty());
     }
 }

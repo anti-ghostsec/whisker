@@ -1,5 +1,5 @@
 import { ListView, ScrollView, Palette, TextEdit, Switch, ComboBox } from "std-widgets.slint";
-import { Theme, Prefs, TextTools, Avatar, Btn, IconBtn, Input, Pill } from "theme.slint";
+import { Theme, Prefs, TextTools, Avatar, AiBadge, Btn, IconBtn, Input, Pill } from "theme.slint";
 import { SettingsPage, AccountForm, AgentForm, NavItem, ModelInfo } from "settings.slint";
 // Colour emoji for all text (a trimmed Noto Color Emoji: no letters, digits
 // or spaces, so text still comes from the normal fonts). See assets/fonts.
@@ -906,6 +906,8 @@ component RailAccount inherits Rectangle {
                 size: 42px;
                 opacity: root.selected || ta.has-hover || root.lifted ? 1 : 0.8;
             }
+            // AI accounts with their own picture still say they're an AI.
+            if root.item.is-agent && root.item.avatar.width > 0: AiBadge { avatar-size: 42px; x: parent.width - self.width + 2px; y: parent.height - self.height + 2px; }
         }
         if root.item.unread > 0: Pill { x: 38px; y: 6px; text: root.item.unread > 99 ? "99+" : root.item.unread; strong: true; }
     }

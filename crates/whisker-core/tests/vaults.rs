@@ -60,8 +60,10 @@ async fn account_stores_live_in_ram_and_inside_the_vault() {
     let key = mgr.client(id).await.unwrap().encryption().ed25519_key().await.unwrap();
 
     // Running: the store is in the RAM folder, and only vault files are on disk.
-    let running = whisker_core::stores::runtime_root(&dir).join(id.to_string());
-    assert!(whisker_core::stores::has_store(&running.join("store")));
+    // Its folder there has a random name, not the account's id.
+    let root = whisker_core::stores::runtime_root(&dir);
+    let running = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.path()).find(|p| whisker_core::stores::has_store(&p.join("store"))).expect("a running store");
+    assert_ne!(running.file_name().unwrap().to_string_lossy(), id.to_string());
     assert!(files(&dir).iter().all(|f| f.starts_with("vaults/") && f.ends_with(".vault")), "{:?}", files(&dir));
 
     // Locked: the RAM copy is gone; unlocking brings back the same device.

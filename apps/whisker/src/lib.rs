@@ -154,6 +154,9 @@ struct State {
     /// Rooms marked read locally: the server's unread count at that moment.
     /// The badge stays hidden until the server reports a different count.
     cleared: HashMap<RoomKey, u64>,
+    /// The first vault opened since the last lock. Accounts in vaults opened
+    /// after it (hidden ones) never put names in notifications.
+    main_vault: Option<VaultId>,
     /// Messages from others that arrived in rooms that weren't open, since
     /// each was last read. The server's count only has the ones your push
     /// rules alert for, so rooms set to mentions only never showed new
@@ -784,6 +787,12 @@ impl Ctl {
     }
 
     async fn after_unlock(&self, vaults: Vec<VaultId>) {
+        {
+            let mut st = self.st.lock().unwrap();
+            if st.main_vault.is_none() {
+                st.main_vault = vaults.first().cloned();
+            }
+        }
         let mut handles = Vec::new();
         for v in &vaults {
             if let Some(words) = self.mgr.extra::<Vec<String>>(v, spell::VAULT_KEY).await {
@@ -3932,6 +3941,16 @@ impl Ctl {
         }
     }
 
+    fn set_key_sharing(&self, mode: i32) {
+        let mut st = self.settings.lock().unwrap();
+        st.key_sharing = mode.clamp(0, 2);
+        let _ = st.save(self.mgr.data_dir());
+        self.mgr.set_key_sharing(st.key_sharing as u8);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_key_sharing(st.key_sharing);
+        }
+    }
+
     fn set_menu_entry(&self, key: String, on: bool) {
         let mut st = self.settings.lock().unwrap();
         let (mark, set) = if MENU_OFF_BY_DEFAULT.contains(&key.as_str()) { (format!("+{key}"), on) } else { (key, !on) };
@@ -4157,6 +4176,10 @@ impl Ctl {
         if looking || me.is_none_or(|a| a.kind == AccountKind::Agent) || accounts.iter().any(|a| a.user_id == sender.as_str()) {
             return;
         }
+        // A hidden vault's rooms and people must not reach the desktop's
+        // notification history (or a locked screen): just "New message".
+        let hidden = me.is_some_and(|a| self.st.lock().unwrap().main_vault.as_ref().is_some_and(|m| m != &a.vault));
+        let detail = if hidden && detail != notify::Detail::Off { notify::Detail::Nothing } else { detail };
         let Some(client) = self.mgr.client(account).await else { return };
         let Some(room) = client.get_room(&room_id) else { return };
         let direct = room.is_direct().await.unwrap_or(false) || room.joined_members_count() <= 2;
@@ -5469,6 +5492,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_touch(true);
     ui.global::<Prefs>().set_show_events(prefs.show_events);
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
+    ui.global::<Prefs>().set_key_sharing(prefs.key_sharing.clamp(0, 2));
+    mgr.set_key_sharing(prefs.key_sharing.clamp(0, 2) as u8);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
     ui.global::<Prefs>().set_spell_check(prefs.spell_check);
@@ -5739,6 +5764,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     }
     {
         let c = ctl.clone();
+        ui.on_set_key_sharing(move |i| c.set_key_sharing(i));
+    }
+    {
+        let c = ctl.clone();
         ui.on_set_send_typing(move |b| c.set_send_typing(b));
         let c = ctl.clone();
         ui.on_set_autocorrect(move |b| c.set_autocorrect(b));
@@ -5847,6 +5876,25 @@ async fn quit_on_signal() {
     });
 }
 
+/// `<app data>/no_backup`, the folder Android's `getNoBackupFilesDir`
+/// names, next to `files`. Data an older version kept in `files` moves
+/// there first (the same disk, so it's a rename).
+#[cfg(target_os = "android")]
+fn no_backup_dir(files: &std::path::Path) -> PathBuf {
+    let Some(base) = files.parent() else { return files.to_owned() };
+    let dir = base.join("no_backup");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return files.to_owned();
+    }
+    for e in std::fs::read_dir(files).into_iter().flatten().flatten() {
+        let to = dir.join(e.file_name());
+        if !to.exists() {
+            let _ = std::fs::rename(e.path(), to);
+        }
+    }
+    dir
+}
+
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: slint::android::AndroidApp) {
@@ -5867,7 +5915,21 @@ fn android_main(app: slint::android::AndroidApp) {
     if !shares.is_empty() {
         share::deliver(shares);
     }
-    let dir = app.internal_data_path().unwrap_or_else(|| PathBuf::from("/data/local/tmp/whisker"));
+    // No screenshots, screen recording or picture in the recent-apps list:
+    // chats stay on the screen only.
+    {
+        use slint::android::android_activity::WindowManagerFlags;
+        app.set_window_flags(WindowManagerFlags::SECURE, WindowManagerFlags::empty());
+    }
+    // App-private storage only (never a shared temporary folder), and its
+    // no_backup folder: Android leaves that out of cloud and device backups,
+    // which would otherwise give someone copies of the vault folder over
+    // time (and show which file changes).
+    let Some(files) = app.internal_data_path() else {
+        eprintln!("whisker: no app-private storage; not starting");
+        return;
+    };
+    let dir = no_backup_dir(&files);
     slint::android::init(app).expect("Slint Android backend");
     if let Err(e) = run(dir) {
         eprintln!("whisker: {e:#}");

@@ -94,7 +94,10 @@ impl Vault {
         path: impl Into<PathBuf>,
         passphrase: &str,
     ) -> Result<(Self, T, Attachments), VaultError> {
-        let path = path.into();
+        Self::open_inner(path.into(), passphrase, true)
+    }
+
+    fn open_inner<T: DeserializeOwned>(path: PathBuf, passphrase: &str, journals: bool) -> Result<(Self, T, Attachments), VaultError> {
         let bytes = std::fs::read(&path)?;
         if bytes.len() < HEADER_LEN || &bytes[..8] != MAGIC {
             return Err(VaultError::Format);
@@ -108,6 +111,11 @@ impl Vault {
             return Err(VaultError::Format);
         }
         let key = derive(passphrase, &salt, m_cost, t_cost)?;
+        // A save cut off by a crash: its journal (which only this key opens)
+        // holds the whole new file. Put it in place and read that instead.
+        if journals && finish_journal(&path, &key) {
+            return Self::open_inner(path, passphrase, false);
+        }
         let cipher = XChaCha20Poly1305::new(&Key::from(*key));
         let plain = Zeroizing::new(
             cipher
@@ -127,6 +135,12 @@ impl Vault {
 
     /// Encrypts `value` and `attachments` and rewrites the vault file in place.
     pub fn save_with<T: Serialize>(&self, value: &T, attachments: &Attachments) -> Result<(), VaultError> {
+        let out = self.encrypt(value, attachments)?;
+        self.write(&out, &[&self.key])
+    }
+
+    /// The vault file's bytes for `value` and `attachments`.
+    fn encrypt<T: Serialize>(&self, value: &T, attachments: &Attachments) -> Result<Vec<u8>, VaultError> {
         let mut plain = encode(value, attachments)?;
         let padded = file_size(plain.len()) - HEADER_LEN - 16;
         plain.resize(padded, 0);
@@ -145,8 +159,11 @@ impl Vault {
             .encrypt(&XNonce::from(nonce), Payload { msg: &plain, aad: &out[..HEADER_LEN] })
             .map_err(|_| VaultError::Decrypt)?;
         out.extend_from_slice(&ct);
+        Ok(out)
+    }
 
-        write_in_place(&self.path, &out)?;
+    fn write(&self, out: &[u8], keys: &[&Zeroizing<[u8; 32]>]) -> Result<(), VaultError> {
+        write_in_place(&self.path, out, keys)?;
         if let Some(dir) = self.path.parent() {
             blend(dir)?;
         }
@@ -164,9 +181,18 @@ impl Vault {
         value: &T,
         attachments: &Attachments,
     ) -> Result<(), VaultError> {
+        let old_key = self.key.clone();
+        let old_salt = self.salt;
         getrandom::fill(&mut self.salt).map_err(|e| VaultError::Kdf(e.to_string()))?;
         self.key = derive(new_passphrase, &self.salt, self.m_cost, self.t_cost)?;
-        self.save_with(value, attachments)
+        // The journal is written for both keys: a crash part-way leaves the
+        // file's header old or new, and either passphrase must finish it.
+        let r = self.encrypt(value, attachments).and_then(|out| self.write(&out, &[&self.key, &old_key]));
+        if r.is_err() {
+            self.salt = old_salt;
+            self.key = old_key;
+        }
+        r
     }
 }
 
@@ -248,7 +274,10 @@ pub fn write_decoy(path: &Path) -> Result<(), VaultError> {
     out.extend_from_slice(&T_COST.to_le_bytes());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&body);
-    write_in_place(path, &out)?;
+    // Written like a real save (journal and all), under a throwaway key.
+    let mut throwaway = Zeroizing::new([0u8; 32]);
+    getrandom::fill(&mut throwaway[..]).map_err(|e| VaultError::Kdf(e.to_string()))?;
+    write_in_place(path, &out, &[&throwaway])?;
     if let Some(dir) = path.parent() {
         blend(dir)?;
     }
@@ -273,25 +302,95 @@ pub fn blend(dir: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
+const JOURNAL_MAGIC: &[u8; 8] = b"WHSKJRN1";
+const JOURNAL_EXT: &str = "jrnl";
+
+/// The key a vault's journals are sealed with, made from the vault's key
+/// (so a journal can't be matched to a vault by anything in it).
+fn journal_key(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let cipher = XChaCha20Poly1305::new(&Key::from(*key));
+    let ks = cipher.encrypt(&XNonce::from(*b"whisker vault journal ke"), [0u8; 32].as_slice()).expect("fixed-size encrypt");
+    let mut k = Zeroizing::new([0u8; 32]);
+    k.copy_from_slice(&ks[..32]);
+    k
+}
+
 /// Rewrites `path` with `bytes` in place, so the file keeps its identity
-/// and creation time. The new bytes go to `<name>.part` first, which is
-/// renamed to `<name>.tmp` once complete; [`recover`] finishes the job if
-/// we crash after that.
-fn write_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// and creation time. The new bytes are first sealed into a journal with
+/// a random name, under each of `keys`: if we crash while copying, opening
+/// the vault (with its passphrase) finishes the copy. Nothing in a journal,
+/// left over or not, says which vault it's for, and two saves never share one.
+fn write_in_place(path: &Path, bytes: &[u8], keys: &[&Zeroizing<[u8; 32]>]) -> std::io::Result<()> {
     use std::io::Write;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        owner_only(dir, true);
+    let dir = path.parent().map(Path::to_owned).unwrap_or_default();
+    std::fs::create_dir_all(&dir)?;
+    owner_only(&dir, true);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut plain = Zeroizing::new(Vec::with_capacity(bytes.len() + name.len() + 2));
+    plain.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    plain.extend_from_slice(name.as_bytes());
+    plain.extend_from_slice(bytes);
+    let mut journals = Vec::new();
+    for key in keys {
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).map_err(std::io::Error::other)?;
+        let jk = journal_key(key);
+        let ct = XChaCha20Poly1305::new(&Key::from(*jk))
+            .encrypt(&XNonce::from(nonce), Payload { msg: &plain, aad: JOURNAL_MAGIC })
+            .map_err(|_| std::io::Error::other("couldn't seal the journal"))?;
+        let j = dir.join(format!("{}.{JOURNAL_EXT}", &random_secret()[..16]));
+        let mut f = private_file(&j)?;
+        f.write_all(JOURNAL_MAGIC)?;
+        f.write_all(&nonce)?;
+        f.write_all(&ct)?;
+        f.sync_all()?;
+        journals.push(j);
     }
-    let part = path.with_extension("part");
-    let tmp = path.with_extension("tmp");
-    let mut f = private_file(&part)?;
+    copy_over_bytes(bytes, path)?;
+    for j in journals {
+        let _ = std::fs::remove_file(j);
+    }
+    Ok(())
+}
+
+/// Puts a journal left by a crashed save of `path` in place, if `key`
+/// opens one. Journals of other vaults (other keys) are left alone.
+fn finish_journal(path: &Path, key: &[u8; 32]) -> bool {
+    let Some(dir) = path.parent() else { return false };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let jk = journal_key(key);
+    let cipher = XChaCha20Poly1305::new(&Key::from(*jk));
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let j = e.path();
+        if j.extension().is_none_or(|x| x != JOURNAL_EXT) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&j) else { continue };
+        if bytes.len() < 32 || &bytes[..8] != JOURNAL_MAGIC {
+            continue;
+        }
+        let nonce: [u8; 24] = bytes[8..32].try_into().unwrap();
+        let Ok(plain) = cipher.decrypt(&XNonce::from(nonce), Payload { msg: &bytes[32..], aad: JOURNAL_MAGIC }) else { continue };
+        let plain = Zeroizing::new(plain);
+        let Some(len) = plain.get(..2).map(|l| u16::from_le_bytes([l[0], l[1]]) as usize) else { continue };
+        if plain.get(2..2 + len) != Some(name.as_bytes()) {
+            continue;
+        }
+        if copy_over_bytes(&plain[2 + len..], path).is_ok() {
+            let _ = std::fs::remove_file(&j);
+            return true;
+        }
+    }
+    false
+}
+
+fn copy_over_bytes(bytes: &[u8], to: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(to)?;
+    owner_only(to, false);
     f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&part, &tmp)?;
-    copy_over(&tmp, path)?;
-    std::fs::remove_file(&tmp)
+    f.set_len(bytes.len() as u64)?;
+    f.sync_all()
 }
 
 fn copy_over(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -369,6 +468,45 @@ pub fn random_secret() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_crashed_save_is_finished_by_its_own_passphrase_only() {
+        let dir = std::env::temp_dir().join(format!("whisker-journal-test-{}", random_secret()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("aaaa.vault");
+        let b = dir.join("bbbb.vault");
+        let va = Vault::create(&a, "first passphrase").unwrap();
+        va.save(&serde_json::json!({"n": 1})).unwrap();
+        let vb = Vault::create(&b, "second passphrase").unwrap();
+        vb.save(&serde_json::json!({"m": 1})).unwrap();
+        // A save of A that crashed mid-copy: the journal is there, A is torn.
+        let new = va.encrypt(&serde_json::json!({"n": 2}), &Attachments::new()).unwrap();
+        let name = "aaaa.vault";
+        let mut plain = (name.len() as u16).to_le_bytes().to_vec();
+        plain.extend_from_slice(name.as_bytes());
+        plain.extend_from_slice(&new);
+        let nonce = [7u8; 24];
+        let ct = XChaCha20Poly1305::new(&Key::from(*journal_key(&va.key))).encrypt(&XNonce::from(nonce), Payload { msg: &plain, aad: JOURNAL_MAGIC }).unwrap();
+        let j = dir.join("0123456789abcdef.jrnl");
+        std::fs::write(&j, [JOURNAL_MAGIC.as_slice(), &nonce, &ct].concat()).unwrap();
+        let mut torn = std::fs::read(&a).unwrap();
+        torn.truncate(torn.len() / 2);
+        std::fs::write(&a, &torn).unwrap();
+        // Nothing in the journal names A.
+        let jb = std::fs::read(&j).unwrap();
+        assert!(!jb.windows(4).any(|w| w == b"aaaa"));
+        assert!(!jb.windows(16).any(|w| w == va.salt));
+        // B's passphrase leaves it alone; A's finishes it.
+        let _: (Vault, serde_json::Value) = Vault::open(&b, "second passphrase").unwrap();
+        assert!(j.exists());
+        let (_, v): (Vault, serde_json::Value) = Vault::open(&a, "first passphrase").unwrap();
+        assert_eq!(v["n"], 2);
+        assert!(!j.exists());
+        // Normal saves leave no journal behind.
+        va.save(&serde_json::json!({"n": 3})).unwrap();
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| e.path().extension().is_none_or(|x| x != JOURNAL_EXT)));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     use super::*;
 
     #[test]

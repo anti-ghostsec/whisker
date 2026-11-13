@@ -104,6 +104,10 @@ pub struct Prepared {
     pub size: Option<(u32, u32)>,
     pub duration: Option<Duration>,
     pub thumb: Option<Thumb>,
+    /// Why the metadata couldn't be removed, when that was asked for. The
+    /// file isn't sent then (see [`crate::timeline`]): sending it as it is
+    /// would quietly send what the setting promises to remove.
+    pub unclean: Option<String>,
 }
 
 /// Makes `data` (called `name`) ready to send. Slow for big pictures: run it
@@ -116,13 +120,20 @@ pub fn prepare(
 ) -> Prepared {
     let mut mime = mime_guess::from_path(name).first_or_octet_stream();
     let (mut data, mut size, mut thumb, mut duration) = (data, None, None, None);
+    let mut unclean = None;
     if let Some(format) = picture_format(&data) {
         let p = prepare_picture(data, format, opts);
         data = p.0;
         mime = p.1;
         size = p.2;
         thumb = p.3;
+        if p.4 {
+            unclean = Some("its metadata couldn't be removed".to_owned());
+        }
     } else {
+        if opts.strip_metadata && let Some(kind) = carries_metadata(name, &mime) {
+            unclean = Some(format!("Whisker can't remove the metadata (author, camera, place, history) that {kind} files can carry"));
+        }
         let av = matches!(
             mime.type_(),
             mime_guess::mime::VIDEO | mime_guess::mime::AUDIO
@@ -130,9 +141,13 @@ pub fn prepare(
         if av && opts.strip_metadata {
             match strip_av(&data, name, mime.type_() == mime_guess::mime::VIDEO) {
                 Some(clean) => data = clean,
-                None => tracing::warn!(
-                    "couldn't remove the metadata of {mime} (is ffmpeg installed?); sending it as it is"
-                ),
+                None => {
+                    unclean = Some(if crate::timeline::ffmpeg_available() {
+                        "ffmpeg couldn't read it to remove its metadata".to_owned()
+                    } else {
+                        "removing a video's or sound's metadata needs ffmpeg, which isn't installed".to_owned()
+                    });
+                }
             }
         }
         if let Some(p) = poster {
@@ -157,13 +172,33 @@ pub fn prepare(
         size,
         duration,
         thumb,
+        unclean,
     }
+}
+
+/// Kinds of file that can carry personal metadata Whisker can't take out
+/// (as a word for the message), by name and type. Pictures Whisker can
+/// read are cleaned instead, and videos and sound go through ffmpeg.
+fn carries_metadata(name: &str, mime: &Mime) -> Option<String> {
+    let ext = std::path::Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let known = [
+        ("heic", "HEIC"), ("heif", "HEIF"), ("avif", "AVIF"), ("jxl", "JPEG XL"), ("svg", "SVG"),
+        ("dng", "RAW"), ("cr2", "RAW"), ("cr3", "RAW"), ("nef", "RAW"), ("arw", "RAW"), ("orf", "RAW"), ("rw2", "RAW"), ("raf", "RAW"),
+        ("pdf", "PDF"), ("doc", "Word"), ("docx", "Word"), ("xls", "Excel"), ("xlsx", "Excel"), ("ppt", "PowerPoint"), ("pptx", "PowerPoint"),
+        ("odt", "OpenDocument"), ("ods", "OpenDocument"), ("odp", "OpenDocument"), ("rtf", "RTF"), ("epub", "EPUB"),
+    ];
+    if let Some((_, kind)) = known.iter().find(|(e, _)| *e == ext) {
+        return Some((*kind).to_owned());
+    }
+    // Any other picture type this can't read.
+    (mime.type_() == mime_guess::mime::IMAGE).then(|| ext.to_ascii_uppercase()).filter(|e| !e.is_empty())
 }
 
 /// Picture formats we can work on.
 fn picture_format(data: &[u8]) -> Option<ImageFormat> {
     match image::guess_format(data).ok()? {
-        f @ (ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP | ImageFormat::Gif) => {
+        // TIFF and BMP can't be cleaned in place: they're redrawn as PNG.
+        f @ (ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP | ImageFormat::Gif | ImageFormat::Tiff | ImageFormat::Bmp) => {
             Some(f)
         }
         _ => None,
@@ -175,16 +210,21 @@ fn format_mime(f: ImageFormat) -> Mime {
         ImageFormat::Jpeg => mime_guess::mime::IMAGE_JPEG,
         ImageFormat::Png => mime_guess::mime::IMAGE_PNG,
         ImageFormat::Gif => mime_guess::mime::IMAGE_GIF,
+        ImageFormat::Tiff => "image/tiff".parse().expect("valid"),
+        ImageFormat::Bmp => mime_guess::mime::IMAGE_BMP,
         _ => "image/webp".parse().expect("valid"),
     }
 }
 
-/// (bytes, type, width and height, preview).
+/// (bytes, type, width and height, preview, metadata left in although
+/// asked to remove it).
+type Picture = (Vec<u8>, Mime, Option<(u32, u32)>, Option<Thumb>, bool);
+
 fn prepare_picture(
     data: Vec<u8>,
     format: ImageFormat,
     opts: &UploadOptions,
-) -> (Vec<u8>, Mime, Option<(u32, u32)>, Option<Thumb>) {
+) -> Picture {
     let animated = is_animated(&data, format);
     // Decoded once, only when something needs the pixels.
     let decoded = || decode_upright(&data, format);
@@ -225,12 +265,8 @@ fn prepare_picture(
             }),
             None => None,
         };
-        if out.is_none() {
-            tracing::warn!(
-                "couldn't remove the metadata of a {format:?} picture; sending it as it is"
-            );
-        }
     }
+    let unclean = out.is_none() && opts.strip_metadata;
     let (bytes, format) = out.unwrap_or((data, format));
     let size = img.as_ref().map(|i| (i.width(), i.height())).or_else(|| {
         image::ImageReader::with_format(Cursor::new(&bytes), format)
@@ -242,7 +278,7 @@ fn prepare_picture(
         .then(|| img.or_else(|| decode_upright(&bytes, format)))
         .flatten()
         .and_then(|im| make_thumb(&im, opts));
-    (bytes, format_mime(format), size, thumb)
+    (bytes, format_mime(format), size, thumb, unclean)
 }
 
 fn decode_upright(data: &[u8], format: ImageFormat) -> Option<DynamicImage> {
@@ -841,6 +877,27 @@ pub fn with_caption(message: MessageType, caption: &str) -> MessageType {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn files_it_cant_clean_are_held_back() {
+        let opts = UploadOptions::default();
+        assert!(opts.strip_metadata);
+        let pdf = prepare("report.pdf", b"%PDF-1.7 /Author (Me)".to_vec(), &opts, None);
+        assert!(pdf.unclean.as_deref().is_some_and(|w| w.contains("PDF")));
+        let heic = prepare("IMG_0001.HEIC", vec![0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c'], &opts, None);
+        assert!(heic.unclean.is_some());
+        // Plain text has nothing to remove; with the setting off, nothing is held.
+        assert!(prepare("notes.txt", b"hi".to_vec(), &opts, None).unclean.is_none());
+        let off = UploadOptions { strip_metadata: false, ..UploadOptions::default() };
+        assert!(prepare("report.pdf", b"%PDF".to_vec(), &off, None).unclean.is_none());
+        // TIFF is redrawn as PNG.
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]));
+        let mut tiff = Cursor::new(Vec::new());
+        img.write_to(&mut tiff, ImageFormat::Tiff).unwrap();
+        let t = prepare("scan.tiff", tiff.into_inner(), &opts, None);
+        assert!(t.unclean.is_none());
+        assert_eq!(t.mime.essence_str(), "image/png");
+    }
+
     use super::*;
 
     /// A tiny JPEG with EXIF (and a comment), made here.

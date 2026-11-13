@@ -30,6 +30,11 @@ pub fn runtime_root(data_dir: &Path) -> PathBuf {
         ];
         for c in candidates.into_iter().flatten() {
             if c.parent().is_some_and(Path::is_dir) && std::fs::create_dir_all(&c).is_ok() {
+                // A link planted there by someone else isn't followed (nor
+                // its target's permissions changed).
+                if !std::fs::symlink_metadata(&c).is_ok_and(|m| m.is_dir()) {
+                    continue;
+                }
                 crate::vault::owner_only(&c, true);
                 // `/dev/shm` is shared: someone else may have made "our"
                 // folder first. Then it isn't used (the next place is).
@@ -63,9 +68,50 @@ pub fn claim(root: &Path) -> Option<std::fs::File> {
             continue;
         }
         // Not through a symlink: only what's in the folder itself goes.
-        let _ = if e.file_type().is_ok_and(|t| t.is_dir()) { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            shred_dir(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
     }
     Some(lock)
+}
+
+/// Overwrites every file in `dir` with zeros, then removes it. On a disk
+/// (Windows, or a Linux without a RAM folder) a plain delete leaves the
+/// data for undelete tools; this leaves zeros. (An SSD may still keep old
+/// copies of blocks: full-disk encryption is the real answer there.)
+pub fn shred_dir(dir: &Path) {
+    use std::io::Write;
+    fn walk(dir: &Path) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => walk(&p),
+                Ok(t) if t.is_file() => {
+                    if let Ok(len) = e.metadata().map(|m| m.len())
+                        && let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&p)
+                    {
+                        let zeros = vec![0u8; 1 << 16];
+                        let mut left = len;
+                        while left > 0 {
+                            let n = left.min(zeros.len() as u64) as usize;
+                            if f.write_all(&zeros[..n]).is_err() {
+                                break;
+                            }
+                            left -= n as u64;
+                        }
+                        let _ = f.sync_all();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        walk(dir);
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Whether `dir` is a real folder (not a link to one) that belongs to this

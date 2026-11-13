@@ -12,6 +12,7 @@ name = "whisker"
 path = "src/main.rs"
 
 [dependencies]
+url = "2"
 whisker-core.workspace = true
 whisker-agent.workspace = true
 anyhow.workspace = true

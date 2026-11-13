@@ -230,6 +230,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-rich-text(bool);
     callback set-show-events(bool);
     callback set-notify-level(int);
+    callback set-key-sharing(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -411,8 +412,8 @@ component GeneralPage inherits VerticalLayout {
         title: "Uploads";
         subtitle: "Applied to every file you send, so nothing asks each time.";
         UpSwitch {
-            text: "Remove photo metadata (EXIF etc.)";
-            hint: "Photos often carry where they were taken, the phone or camera, and when. This removes it from pictures (JPEG, PNG, WebP, GIF), and from videos and sound files when ffmpeg is installed. Nothing is re-encoded, so quality stays the same.";
+            text: "Remove metadata (EXIF etc.)";
+            hint: "Photos often carry where they were taken, the phone or camera, and when. This removes it from pictures (JPEG, PNG, WebP and GIF as they are; TIFF and BMP redrawn as PNG), and from videos and sound files when ffmpeg is installed. A file it can't clean isn't sent: HEIC, AVIF, RAW and SVG pictures, PDFs and office documents, or a video without ffmpeg. Turn this off to send those as they are.";
             checked: Prefs.up-strip;
             toggled(b) => { root.set-upload("strip", b ? 1 : 0); }
         }
@@ -549,6 +550,15 @@ component GeneralPage inherits VerticalLayout {
     Card {
         title: "Privacy & encryption";
         Text { text: root.encryption-summary; wrap: word-wrap; font-size: 12px; color: Theme.text; }
+        Field {
+            label: "Who can read what you send";
+            hint: "Every device: also devices no one has signed for, which a server could add to someone's account to read along. Signed devices (recommended): only devices their owner has signed; people with no published identity can't read new messages. Verified only: just devices you've verified. Takes effect from the next unlock.";
+            ComboBox {
+                model: ["Every device", "Devices their owner signed", "Only devices I've verified"];
+                current-index: Prefs.key-sharing;
+                selected => { root.set-key-sharing(self.current-index); }
+            }
+        }
     }
 }
 
@@ -1151,6 +1161,7 @@ export component SettingsPage inherits Rectangle {
     callback set-rich-text(bool);
     callback set-show-events(bool);
     callback set-notify-level(int);
+    callback set-key-sharing(int);
     callback set-send-typing(bool);
     callback set-clear-command(string);
     callback set-autocorrect(bool);
@@ -1251,6 +1262,7 @@ export component SettingsPage inherits Rectangle {
                             set-rich-text(b) => { root.set-rich-text(b); }
                             set-show-events(b) => { root.set-show-events(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
+                            set-key-sharing(i) => { root.set-key-sharing(i); }
                             set-send-typing(b) => { root.set-send-typing(b); }
                             set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }

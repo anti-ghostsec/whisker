@@ -13,7 +13,7 @@ getrandom.workspace = true
 flate2 = "1.1.10"
 mime_guess = "2.0.5"
 # Metadata removal, conversion and previews of pictures before upload (the version the app uses).
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "tiff", "bmp"] }
 sha2 = "0.10.9"
 # Upload progress (the version matrix-sdk uses).
 eyeball = "0.8.8"

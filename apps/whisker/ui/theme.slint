@@ -48,6 +48,8 @@ export global Prefs {
     in-out property <bool> show-events: false;
     // 0 off, 1 "New message" only, 2 sender and room, 3 with message text.
     in-out property <int> notify-level: 2;
+    // Room keys: 0 every device, 1 devices signed by their owner, 2 verified only.
+    in-out property <int> key-sharing: 1;
     in-out property <bool> send-typing: false;
     in-out property <bool> autocorrect: true;
     in-out property <bool> spell-check: true;

@@ -1174,6 +1174,9 @@ async fn upload_bytes(
         crate::upload::prepare(&name, data, &opts2, poster)
     })
     .await?;
+    if let Some(why) = &prepared.unclean {
+        bail!("not sent: {why}. To send it as it is, turn off \"Remove metadata\" in Settings → Uploads");
+    }
     let limit = upload_limit(room).await;
     if prepared.data.len() as u64 > limit {
         return Err(too_big(limit));
@@ -1232,6 +1235,20 @@ pub const SAFE_FORMATS: &str = "mov,mp4,m4a,3gp,matroska,webm,avi,mpegts,ogg,mp3
 /// Input options that hold ffmpeg to `input` itself: through the relay
 /// (an `http://127.0.0.1` address) only http over tcp, else only local
 /// files, and only [`SAFE_FORMATS`]. Goes before `-i`.
+/// Whether ffmpeg can be run here.
+pub fn ffmpeg_available() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
 pub fn ffmpeg_guard(input: &std::ffi::OsStr) -> [&'static str; 4] {
     let remote = input.to_string_lossy().starts_with("http://");
     ["-protocol_whitelist", if remote { "http,tcp" } else { "file" }, "-format_whitelist", SAFE_FORMATS]

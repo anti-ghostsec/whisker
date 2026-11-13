@@ -1465,6 +1465,7 @@ export component AppWindow inherits Window {
     callback set-rich-text(bool);
     callback set-show-events(bool);
     callback set-notify-level(int);
+    callback set-key-sharing(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -2604,6 +2605,7 @@ export component AppWindow inherits Window {
         set-rich-text(b) => { root.set-rich-text(b); }
         set-show-events(b) => { root.set-show-events(b); }
         set-notify-level(i) => { root.set-notify-level(i); }
+        set-key-sharing(i) => { root.set-key-sharing(i); }
         set-send-typing(b) => { root.set-send-typing(b); }
         set-autocorrect(b) => { root.set-autocorrect(b); }
         set-spell-check(b) => { root.set-spell-check(b); }

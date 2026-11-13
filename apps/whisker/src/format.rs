@@ -114,8 +114,53 @@ pub fn link_mentions(source: &str, pills: &[(String, String)]) -> String {
     out
 }
 
+/// After each Markdown web link whose text isn't its address, the site it
+/// really goes to, so `[bank.com](https://evil.example)` can't pass for a
+/// link to bank.com. Matrix links (mentions, rooms) open inside Whisker and
+/// are left alone.
+fn reveal_targets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find('[') {
+        let Some(mid) = rest[open..].find("](").map(|m| open + m) else { break };
+        let Some(close) = rest[mid + 2..].find(')').map(|c| mid + 2 + c) else { break };
+        let text = &rest[open + 1..mid];
+        let url = rest[mid + 2..close].trim();
+        // A `[` inside the text: the real link starts later.
+        if let Some(inner) = text.rfind('[') {
+            out.push_str(&rest[..open + 1 + inner]);
+            rest = &rest[open + 1 + inner..];
+            continue;
+        }
+        out.push_str(&rest[..=close]);
+        if let Some(host) = shown_host(text, url) {
+            out.push_str(" (");
+            out.push_str(&host.replace(['[', ']', '(', ')', '*', '_', '`', '~', '<', '>'], ""));
+            out.push(')');
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The host to show next to a link with this text, or None when the text
+/// already is the address (or it's a Matrix link).
+fn shown_host(text: &str, url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) || lower.starts_with("https://matrix.to/") {
+        return None;
+    }
+    let bare = |u: &str| u.trim().trim_start_matches('<').trim_end_matches('>').trim_end_matches('/').to_ascii_lowercase();
+    if bare(text) == bare(url) {
+        return None;
+    }
+    let host = url::Url::parse(url).ok()?.host_str()?.to_owned();
+    Some(host)
+}
+
 pub fn styled(source: &str) -> StyledText {
-    StyledText::from_markdown(&autolink(source)).unwrap_or_else(|_| StyledText::from_plain_text(source))
+    StyledText::from_markdown(&reveal_targets(&autolink(source))).unwrap_or_else(|_| StyledText::from_plain_text(source))
 }
 
 #[cfg(test)]
@@ -140,6 +185,16 @@ mod tests {
         assert_eq!(l[2].source, "quoted");
         assert_eq!(l[4].source, "let x = 1;\n");
         assert_eq!(l[5].source, "Title");
+    }
+
+    #[test]
+    fn link_targets_are_shown() {
+        assert_eq!(reveal_targets("[bank.com](https://evil.example/x)"), "[bank.com](https://evil.example/x) (evil.example)");
+        assert_eq!(reveal_targets("<https://a.org>"), "<https://a.org>");
+        assert_eq!(reveal_targets("[https://a.org](https://a.org/)"), "[https://a.org](https://a.org/)");
+        assert_eq!(reveal_targets("[Bob](https://matrix.to/#/@bob:x)"), "[Bob](https://matrix.to/#/@bob:x)");
+        assert_eq!(reveal_targets("[a] [b](http://c.d)"), "[a] [b](http://c.d) (c.d)");
+        assert_eq!(reveal_targets("no [links"), "no [links");
     }
 
     #[test]

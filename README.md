@@ -253,6 +253,21 @@ operating system and the **Wisp** browser.
   its own: while a vault is unlocked the store runs from RAM, and it is packed back into
   the vault every 10 minutes and when you lock or quit. Caches (timeline, media) stay
   in RAM and are rebuilt from the server.
+- **Who can read what you send.** By default, keys to read your messages only go to
+  devices their owner has signed, so a server can't quietly add a device to someone's
+  account and read along. Settings → General → *Privacy & encryption* can widen this to
+  every device or narrow it to devices you've verified.
+- **Uploads without metadata.** With *Remove metadata* on (the default) pictures are
+  redrawn (JPEG, PNG, WebP, GIF, TIFF, BMP) and video and audio are rewritten by ffmpeg
+  without tags. Files Whisker can't clean (HEIC, AVIF, RAW, PDF, Office documents and the
+  like, or video when ffmpeg is missing) are held back with a message instead of being
+  sent as they are; turn the setting off to send them anyway.
+- **Links show where they go.** A link whose text isn't its address shows the real site
+  next to it.
+- **Notifications from hidden vaults** only ever say "New message": who and where are
+  shown only for accounts in the first vault you unlocked.
+- **Android.** Screenshots and the recent-apps preview are blocked, and everything is
+  kept in the app's `no_backup` folder, so it's left out of device backups.
 - **Owner-only files.** On Linux and Android the data folder and everything in it are
   readable by your user only (folders 0700, files 0600), including installs made by
   older versions. Older versions kept stores in a `stores` folder; each one moves into
@@ -272,11 +287,16 @@ without a passphrase nobody can tell it from a vault, and "Whisker made those" i
 a true answer. A vault is rewritten in place, so it keeps its creation time, and after
 every write all files get the same timestamps, so nothing shows which one is in use.
 Unlocking tries every file, so the time it takes doesn't reveal anything either.
+A new vault is written in the middle of a burst of new decoys, at a random place in it,
+so creation times don't single it out. A save interrupted by a crash leaves a recovery
+file with a random name whose contents (including which vault it belongs to) are
+encrypted with that vault's key; only unlocking that vault finishes and removes it.
 
 While a vault is unlocked, its stores run from a RAM-backed folder (`$XDG_RUNTIME_DIR`
 or `/dev/shm` on Linux), which is wiped when you lock. If Whisker crashes, what it left there is wiped the next
 time Whisker starts, before any passphrase is asked for: a folder per account would
-otherwise count the accounts of every vault that was open. What's lost is what changed
+otherwise count the accounts of every vault that was open. Each account's folder there
+gets a random name for that run, and is zero-filled before it's deleted. What's lost is what changed
 since the last save into the vault (a few minutes at most). On Windows the running copy is on disk while unlocked (wiped on lock); on Android
 it is in the app's private storage.
 

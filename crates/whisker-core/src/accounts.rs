@@ -109,11 +109,18 @@ pub struct AccountManager {
     device_name: Arc<str>,
     /// RAM-backed folder the running stores live in (see [`stores`]).
     runtime: PathBuf,
+    /// Each account's folder there: a random name for this run, not the
+    /// account's id, so a folder left on disk (Windows, after a crash)
+    /// can't be matched to an account record.
+    run_names: Arc<std::sync::Mutex<HashMap<AccountId, String>>>,
     /// Held while this Whisker runs: says the folder is in use (see
     /// [`stores::claim`]). None when another Whisker already has it.
     _runtime_lock: Option<Arc<std::fs::File>>,
     /// Whether the periodic store snapshot task is running.
     snapshotter: Arc<std::sync::atomic::AtomicBool>,
+    /// Who gets the keys to read messages sent from here: see
+    /// [`AccountManager::set_key_sharing`].
+    key_sharing: Arc<std::sync::atomic::AtomicU8>,
 }
 
 pub struct LoginRequest<'a> {
@@ -151,8 +158,10 @@ impl AccountManager {
         let runtime_lock = stores::claim(&runtime).map(Arc::new);
         Self {
             runtime,
+            run_names: Default::default(),
             _runtime_lock: runtime_lock,
             snapshotter: Arc::default(),
+            key_sharing: Arc::new(std::sync::atomic::AtomicU8::new(1)),
             data_dir,
             inner: Arc::default(),
             latest: Arc::default(),
@@ -163,6 +172,14 @@ impl AccountManager {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Which devices messages sent from here are readable on, for accounts
+    /// signed in from now on: 0 every device (including ones nobody signed
+    /// for, which a server can add), 1 devices their owner has signed (the
+    /// default), 2 only devices you have verified.
+    pub fn set_key_sharing(&self, mode: u8) {
+        self.key_sharing.store(mode.min(2), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// For code that reports progress into the shared event stream.
@@ -180,11 +197,16 @@ impl AccountManager {
 
     /// The running store of an account (RAM-backed, see [`stores`]).
     fn store_dir(&self, id: AccountId) -> PathBuf {
-        self.runtime.join(id.to_string()).join("store")
+        self.run_dir(id).join("store")
     }
 
     fn cache_dir(&self, id: AccountId) -> PathBuf {
-        self.runtime.join(id.to_string()).join("cache")
+        self.run_dir(id).join("cache")
+    }
+
+    fn run_dir(&self, id: AccountId) -> PathBuf {
+        let name = self.run_names.lock().unwrap().entry(id).or_insert_with(|| random_secret()[..16].to_owned()).clone();
+        self.runtime.join(name)
     }
 
     /// Where versions before stores moved into vaults kept them.
@@ -201,7 +223,7 @@ impl AccountManager {
             return Ok(false);
         }
         stores::make_private_dir(&self.runtime)?;
-        stores::make_private_dir(&self.runtime.join(record.id.to_string()))?;
+        stores::make_private_dir(&self.run_dir(record.id))?;
         if let Some(packed) = packed {
             stores::unpack(packed, &store)?;
             return Ok(false);
@@ -339,19 +361,29 @@ impl AccountManager {
     /// Keeps the decoy count unpredictable: tops a folder up to at least a
     /// few files (first run, or an install from before decoys), and now and
     /// then adds one more, so files don't only appear when a vault is made.
-    fn stir_decoys(dir: &Path, created_vault: bool) -> Result<(), VaultError> {
-        let count = std::fs::read_dir(dir)?.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "vault")).count();
+    ///
+    /// Files are made in bursts, and a burst made while unlocking looks like
+    /// one made with a new vault: both are 1 to 3 files (more on the first
+    /// run), and a new vault sits at a random place in its burst. So when
+    /// files were created (which [`vault::blend`] can't change) doesn't show
+    /// which one is a vault, or that a second vault was made.
+    fn decoys_needed(dir: &Path, created_vault: bool) -> u8 {
+        let count = std::fs::read_dir(dir).map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "vault")).count()).unwrap_or(0);
         let r = random_byte();
-        let n = if count < 4 {
-            4 + r % 5 - count as u8
-        } else if created_vault {
-            1 + r % 2
-        } else if r.is_multiple_of(10) && count < 32 {
-            1
+        if count < 4 {
+            (4 + r % 5).saturating_sub(count as u8 + u8::from(created_vault))
+        } else if created_vault || (r.is_multiple_of(10) && count < 32) {
+            // A new vault adds 0-2 decoys (a burst of 1-3 files); an unlock
+            // now and then adds 1-3 decoys alone.
+            let n = (r / 10) % 3;
+            if created_vault { n } else { n + 1 }
         } else {
             0
-        };
-        Self::add_decoys(dir, n)
+        }
+    }
+
+    fn stir_decoys(dir: &Path, created_vault: bool) -> Result<(), VaultError> {
+        Self::add_decoys(dir, Self::decoys_needed(dir, created_vault))
     }
 
     /// True if no vault exists yet (first run).
@@ -371,9 +403,17 @@ impl AccountManager {
         let pass = passphrase.to_owned();
         let profile = Profile::default();
         let vault = tokio::task::spawn_blocking(move || -> Result<Vault, VaultError> {
+            let dir = path.parent().unwrap().to_owned();
+            std::fs::create_dir_all(&dir)?;
+            // The vault goes in at a random place among its decoys.
+            let decoys = Self::decoys_needed(&dir, true);
+            let before = random_byte() % (decoys + 1);
+            // The key first (the slow part), so no pause in the burst
+            // gives away which file came after it.
             let v = Vault::create(&path, &pass)?;
+            Self::add_decoys(&dir, before)?;
             v.save(&Profile::default())?;
-            Self::stir_decoys(path.parent().unwrap(), true)?;
+            Self::add_decoys(&dir, decoys - before)?;
             Ok(v)
         })
         .await??;
@@ -476,6 +516,13 @@ impl AccountManager {
                 }
             }))
             .await;
+            // Places saved by older versions were numbered across vaults:
+            // close the gaps in this one's.
+            let mine: Vec<(AccountId, u32)> = self.accounts().await.into_iter().filter(|a| a.vault == id).map(|a| (a.id, a.position)).collect();
+            if mine.iter().enumerate().any(|(i, (_, p))| *p != i as u32) {
+                let order: Vec<AccountId> = mine.iter().map(|(a, _)| *a).collect();
+                let _ = self.renumber(&order).await;
+            }
             // Stores copied from the old per-account folders: move them into
             // the vault now, so those folders can go.
             if migrated && let Err(e) = self.persist(&id).await {
@@ -522,7 +569,9 @@ impl AccountManager {
             ids
         };
         for id in ids {
-            let _ = tokio::fs::remove_dir_all(self.runtime.join(id.to_string())).await;
+            let dir = self.run_dir(id);
+            self.run_names.lock().unwrap().remove(&id);
+            let _ = tokio::task::spawn_blocking(move || stores::shred_dir(&dir)).await;
         }
         let _ = self.events.send(ClientEvent::AccountsChanged);
     }
@@ -546,6 +595,12 @@ impl AccountManager {
         if let Some(p) = proxy {
             b = b.proxy(p);
         }
+        use matrix_sdk_base::crypto::CollectStrategy;
+        b = b.with_room_key_recipient_strategy(match self.key_sharing.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => CollectStrategy::AllDevices,
+            2 => CollectStrategy::OnlyTrustedDevices,
+            _ => CollectStrategy::IdentityBasedStrategy,
+        });
         let client = b.build().await?;
         client
             .set_media_fetcher(std::sync::Arc::new(
@@ -815,7 +870,9 @@ impl AccountManager {
                 .context("login failed")?;
         }
         let session = client.matrix_auth().session().ok_or_else(|| anyhow!("no session after login"))?;
-        let position = self.inner.read().await.live.values().map(|a| a.record.position).max().map_or(0, |p| p + 1);
+        // Counted within the vault only: places numbered across vaults would
+        // leave gaps in the main vault that hint at accounts kept elsewhere.
+        let position = self.inner.read().await.live.values().filter(|a| a.vault == req.vault).map(|a| a.record.position).max().map_or(0, |p| p + 1);
 
         let record = AccountRecord {
             id,
@@ -916,11 +973,23 @@ impl AccountManager {
         let mut order = order;
         let moved = order.remove(i);
         order.insert(j, moved);
-        for (pos, acc) in order.iter().enumerate() {
-            let pos = pos as u32;
+        self.renumber(&order).await?;
+        let _ = self.events.send(ClientEvent::AccountsChanged);
+        Ok(())
+    }
+
+    /// Numbers accounts 0, 1, 2, … in `order`, counting each vault on its
+    /// own, so no vault's numbers have gaps left by another's accounts.
+    async fn renumber(&self, order: &[AccountId]) -> Result<()> {
+        let vaults: HashMap<AccountId, VaultId> = self.inner.read().await.live.iter().map(|(id, l)| (*id, l.vault.clone())).collect();
+        let mut next: HashMap<VaultId, u32> = HashMap::new();
+        for acc in order {
+            let Some(v) = vaults.get(acc) else { continue };
+            let n = next.entry(v.clone()).or_default();
+            let pos = *n;
+            *n += 1;
             self.mutate_account_quiet(*acc, |r| r.position = pos).await?;
         }
-        let _ = self.events.send(ClientEvent::AccountsChanged);
         Ok(())
     }
 
@@ -943,6 +1012,9 @@ impl AccountManager {
                 p.accounts.retain(|a| a.id != id);
             })
             .await?;
+            // Close the gap it leaves.
+            let order: Vec<AccountId> = self.accounts().await.into_iter().filter(|a| a.vault == vault).map(|a| a.id).collect();
+            self.renumber(&order).await?;
             let removed = match self.inner.write().await.vaults.get_mut(&vault) {
                 Some(ov) => {
                     let gone = ov.attachments.remove(&store_key(id)).is_some();
@@ -958,13 +1030,14 @@ impl AccountManager {
             }
         }
         let _ = self.events.send(ClientEvent::AccountsChanged);
-        let (running, legacy) = (self.runtime.join(id.to_string()), self.legacy_store_dir(id));
+        let (running, legacy) = (self.run_dir(id), self.legacy_store_dir(id));
+        self.run_names.lock().unwrap().remove(&id);
         tokio::spawn(async move {
             if let Some(live) = live {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(20), live.client.logout()).await;
                 drop(live);
             }
-            let _ = tokio::fs::remove_dir_all(running).await;
+            let _ = tokio::task::spawn_blocking(move || stores::shred_dir(&running)).await;
             let _ = tokio::fs::remove_dir_all(legacy).await;
         });
         Ok(())
@@ -1064,9 +1137,17 @@ impl AccountManager {
             })?;
         let mut inner = self.inner.write().await;
         let ov = inner.vaults.get_mut(vault).ok_or_else(|| anyhow!("vault is locked"))?;
-        let (profile, attachments) = (ov.profile.clone(), ov.attachments.clone());
+        let (profile, attachments, version, written) = (ov.profile.clone(), ov.attachments.clone(), ov.version, ov.written.clone());
         let vault_ref = &mut ov.vault;
-        tokio::task::block_in_place(|| vault_ref.change_passphrase(&new_, &profile, &attachments))?;
+        // Through the same lock as background saves, and counted as one: a
+        // save that copied the old key earlier then sees it's out of date
+        // and doesn't write the vault back under the old passphrase.
+        tokio::task::block_in_place(|| {
+            let mut on_disk = written.lock().unwrap();
+            vault_ref.change_passphrase(&new_, &profile, &attachments)?;
+            *on_disk = (*on_disk).max(version);
+            anyhow::Ok(())
+        })?;
         Ok(())
     }
 

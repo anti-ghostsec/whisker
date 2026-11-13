@@ -50,6 +50,11 @@ pub struct AppSettings {
     /// Notifications: 0 off, 1 just "New message", 2 sender and room, 3 with text.
     #[serde(default = "two")]
     pub notify_level: i32,
+    /// Who can read messages you send: 0 every device, 1 devices signed by
+    /// their owner, 2 only devices you've verified (see
+    /// `AccountManager::set_key_sharing`).
+    #[serde(default = "one")]
+    pub key_sharing: i32,
     /// Tell others when you're typing (off: it's metadata the server sees).
     #[serde(default)]
     pub send_typing: bool,
@@ -90,6 +95,10 @@ fn clear_command() -> String {
 
 fn yes() -> bool {
     true
+}
+
+fn one() -> i32 {
+    1
 }
 
 fn two() -> i32 {

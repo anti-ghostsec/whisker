@@ -442,15 +442,42 @@ pub async fn set_display_name(client: &Client, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Most pixels a side of a profile or room picture.
+const AVATAR_PX: u32 = 1024;
+
+/// A picture redrawn from its pixels, so nothing else in the file goes
+/// along: no camera data or location (EXIF, XMP), no character card text
+/// in a PNG. Avatars are public, readable by anyone. PNG when it has
+/// see-through parts, else JPEG; shrunk to [`AVATAR_PX`].
+pub fn clean_avatar(data: Vec<u8>) -> Result<(mime_guess::Mime, Vec<u8>)> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format().context("can't read that picture")?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader.decode().context("pick a PNG, JPEG, WebP or GIF picture")?;
+    let img = if img.width() > AVATAR_PX || img.height() > AVATAR_PX { img.thumbnail(AVATAR_PX, AVATAR_PX) } else { img };
+    let mut out = std::io::Cursor::new(Vec::new());
+    if img.color().has_alpha() {
+        image::DynamicImage::ImageRgba8(img.to_rgba8()).write_to(&mut out, image::ImageFormat::Png)?;
+        Ok((mime_guess::mime::IMAGE_PNG, out.into_inner()))
+    } else {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode_image(&image::DynamicImage::ImageRgb8(img.to_rgb8()))?;
+        Ok((mime_guess::mime::IMAGE_JPEG, out.into_inner()))
+    }
+}
+
+async fn cleaned(data: Vec<u8>) -> Result<(mime_guess::Mime, Vec<u8>)> {
+    tokio::task::spawn_blocking(move || clean_avatar(data)).await?
+}
+
 /// Uploads a picture and makes it our avatar; `None` removes it.
 pub async fn set_avatar(client: &Client, image: Option<&std::path::Path>) -> Result<()> {
     match image {
         Some(p) => {
             let data = tokio::fs::read(p).await.context("can't read that file")?;
-            let mime = mime_guess::from_path(p).first_or_octet_stream();
-            if mime.type_() != "image" {
-                bail!("pick an image file");
-            }
+            let (mime, data) = cleaned(data).await?;
             client.account().upload_avatar(&mime, data).await?;
         }
         None => client.account().set_avatar_url(None).await?,
@@ -460,11 +487,11 @@ pub async fn set_avatar(client: &Client, image: Option<&std::path::Path>) -> Res
 
 /// Makes picture bytes (PNG, JPEG, …) our avatar.
 pub async fn set_avatar_data(client: &Client, data: Vec<u8>) -> Result<()> {
-    let mime = match data.get(..4) {
-        Some([0x89, b'P', b'N', b'G']) => mime_guess::mime::IMAGE_PNG,
-        Some([0xff, 0xd8, ..]) => mime_guess::mime::IMAGE_JPEG,
-        _ => bail!("the picture must be a PNG or JPEG"),
-    };
+    if !matches!(data.get(..4), Some([0x89, b'P', b'N', b'G']) | Some([0xff, 0xd8, ..])) {
+        bail!("the picture must be a PNG or JPEG");
+    }
+    // A character card's PNG carries the whole card: only the picture goes.
+    let (mime, data) = cleaned(data).await?;
     client.account().upload_avatar(&mime, data).await?;
     Ok(())
 }
@@ -474,10 +501,7 @@ pub async fn set_room_avatar(room: &Room, image: Option<&std::path::Path>) -> Re
     match image {
         Some(p) => {
             let data = tokio::fs::read(p).await.context("can't read that file")?;
-            let mime = mime_guess::from_path(p).first_or_octet_stream();
-            if mime.type_() != "image" {
-                bail!("pick an image file");
-            }
+            let (mime, data) = cleaned(data).await?;
             room.upload_avatar(&mime, data, None).await?;
         }
         None => {
@@ -670,11 +694,11 @@ async fn preview_messages(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -
             }
             AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)) => match timeline::parse(&m.content) {
                 timeline::Parsed::Edit { target, body } => {
-                    edits.entry(target).or_insert(body);
+                    edits.entry((target, m.sender)).or_insert(body);
                 }
                 timeline::Parsed::New { body, reply_to, media, thread, pills, .. } => {
                     let (sender_name, sender_avatar) = people.get(&m.sender).cloned().unwrap_or_default();
-                    let edited = edits.remove(&m.event_id);
+                    let edited = edits.remove(&(m.event_id.clone(), m.sender.clone()));
                     out.push(timeline::HistoryItem {
                         edited: edited.is_some(),
                         body: edited.unwrap_or(body),
@@ -698,4 +722,28 @@ async fn preview_messages(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -
     }
     out.reverse();
     Ok((out, reactions, encrypted))
+}
+
+#[cfg(test)]
+mod avatar_tests {
+    #[test]
+    fn avatars_lose_everything_but_the_picture() {
+        // A PNG with a text chunk (as a character card has) after the header.
+        let img = image::RgbImage::from_fn(40, 30, |x, _| image::Rgb([x as u8 * 5, 10, 200]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let mut png = png.into_inner();
+        let mut chunk = Vec::new();
+        let body = b"chara\0SECRET CARD TEXT";
+        chunk.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        chunk.extend_from_slice(b"tEXt");
+        chunk.extend_from_slice(body);
+        chunk.extend_from_slice(&[0, 0, 0, 0]);
+        png.splice(33..33, chunk);
+        let (mime, out) = super::clean_avatar(png).unwrap();
+        assert_eq!(mime, mime_guess::mime::IMAGE_JPEG);
+        assert!(!out.windows(6).any(|w| w == b"SECRET"));
+        let back = image::load_from_memory(&out).unwrap();
+        assert_eq!((back.width(), back.height()), (40, 30));
+    }
 }

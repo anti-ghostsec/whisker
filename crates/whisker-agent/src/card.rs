@@ -457,7 +457,8 @@ fn png_card_text(png: &[u8]) -> Result<String> {
                 if rest.first() != Some(&0) {
                     continue; // compressed: no card tool writes these
                 }
-                let mut parts = rest[2..].splitn(3, |b| *b == 0);
+                let Some(rest) = rest.get(2..) else { continue };
+                let mut parts = rest.splitn(3, |b| *b == 0);
                 let (_, _, Some(text)) = (parts.next(), parts.next(), parts.next()) else { continue };
                 (key, String::from_utf8_lossy(text).into_owned())
             }

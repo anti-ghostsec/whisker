@@ -96,6 +96,10 @@ pub struct AgentConfig {
     /// they appear in the chat. Empty: GitHub. `*`: any public site.
     #[serde(default)]
     pub web_sites: Vec<String>,
+    /// Most answers per person per hour (0: no limit), so no one member can
+    /// run up the bill for the AI service.
+    #[serde(default = "default_hourly")]
+    pub hourly_replies: u32,
     /// Room where every moderation action is logged. Recommended.
     #[serde(default)]
     pub audit_room: Option<OwnedRoomId>,
@@ -133,6 +137,9 @@ fn default_steps() -> usize {
 }
 fn default_cooldown() -> u64 {
     2
+}
+fn default_hourly() -> u32 {
+    30
 }
 fn default_max_tokens() -> u32 {
     1024

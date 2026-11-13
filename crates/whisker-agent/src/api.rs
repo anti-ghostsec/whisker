@@ -104,8 +104,12 @@ fn marked(v: &Value, trait_name: &str) -> Option<String> {
     })
 }
 
-fn http() -> reqwest::Client {
-    whisker_core::tls::http_builder().timeout(Duration::from_secs(15)).build().expect("http client")
+fn http(proxy: Option<&str>) -> Result<reqwest::Client> {
+    let mut b = whisker_core::tls::http_builder().timeout(Duration::from_secs(15));
+    if let Some(p) = proxy {
+        b = b.proxy(reqwest::Proxy::all(p).map_err(|e| anyhow::anyhow!("bad proxy: {e}"))?);
+    }
+    Ok(b.build()?)
 }
 
 /// Adds a scheme if missing (http for local addresses, https otherwise) and
@@ -188,12 +192,18 @@ async fn get_json(req: reqwest::RequestBuilder) -> Result<(u16, Option<Value>)> 
 
 /// Finds out what API is at `url`. Tries the most specific guess first.
 pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
+    detect_via(url, key, None).await
+}
+
+/// [`detect`] through a proxy (the AI account's, so the AI service sees
+/// the same address as the account's server does).
+pub async fn detect_via(url: &str, key: Option<&str>, proxy: Option<&str>) -> Result<Detected> {
     let full = normalize_url(url);
     let parsed = reqwest::Url::parse(&full).map_err(|_| anyhow!("that isn't a valid address"))?;
     let service = service_name(&parsed);
     let origin = parsed.origin().ascii_serialization();
     let key = key.filter(|k| !k.trim().is_empty()).map(str::trim);
-    let c = http();
+    let c = http(proxy)?;
 
     // A full endpoint URL was pasted: trust its shape.
     for (suffix, format) in [("/chat/completions", ApiFormat::OpenAiChat), ("/messages", ApiFormat::AnthropicMessages)] {

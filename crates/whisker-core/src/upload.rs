@@ -554,11 +554,19 @@ fn strip_av(data: &[u8], name: &str, video: bool) -> Option<Vec<u8>> {
             &["-map", "0:a"]
         };
         let ok = Command::new("ffmpeg")
-            .args(["-v", "error", "-nostdin", "-y", "-i"])
+            // Only the file itself: a playlist can't make ffmpeg fetch anything.
+            .args(["-v", "error", "-nostdin", "-y", "-protocol_whitelist", "file", "-i"])
             .arg(&src)
             .args(maps)
             .args([
                 "-map_metadata",
+                "-1",
+                // Each stream's own tags too (a phone's creation time, its name).
+                "-map_metadata:s:v",
+                "-1",
+                "-map_metadata:s:a",
+                "-1",
+                "-map_metadata:s:s",
                 "-1",
                 "-map_chapters",
                 "-1",

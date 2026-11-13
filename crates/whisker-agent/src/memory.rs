@@ -2,7 +2,7 @@
 //! a running summary of everything older. Saved in the vault (as an extra
 //! per agent), so it survives restarts.
 
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
@@ -122,11 +122,13 @@ impl Memory {
         true
     }
 
-    /// Replaces an edited message's text. Returns whether it was remembered.
-    pub fn edit(&mut self, room: &OwnedRoomId, event: &OwnedEventId, body: &str) -> bool {
+    /// Replaces an edited message's text, when `editor` wrote it (anyone
+    /// can send an edit aimed at someone else's message). Returns whether
+    /// it changed anything.
+    pub fn edit(&mut self, room: &OwnedRoomId, event: &OwnedEventId, editor: &UserId, body: &str) -> bool {
         let Some(r) = self.rooms.get_mut(room) else { return false };
         let mut hit = false;
-        for l in r.lines.iter_mut().filter(|l| &l.event_id == event) {
+        for l in r.lines.iter_mut().filter(|l| &l.event_id == event && l.sender == editor) {
             l.body = truncate(body, MAX_BODY);
             hit = true;
         }
@@ -310,8 +312,9 @@ mod tests {
         // Unknown ids change nothing.
         assert!(!m.forget_event(&room, &"$nope".try_into().unwrap()));
 
-        // Edits replace the remembered text.
-        assert!(m.edit(&room, &"$e5".try_into().unwrap(), "fixed"));
+        // Edits replace the remembered text, but only the sender's own.
+        assert!(!m.edit(&room, &"$e5".try_into().unwrap(), &owned_user_id!("@mallory:x"), "forged"));
+        assert!(m.edit(&room, &"$e5".try_into().unwrap(), &owned_user_id!("@a:x"), "fixed"));
         assert_eq!(m.room(&room).unwrap().lines.back().unwrap().body, "fixed");
     }
 

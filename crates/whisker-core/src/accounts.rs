@@ -363,6 +363,9 @@ impl AccountManager {
 
     /// Creates a new vault under `passphrase` and keeps it open.
     pub async fn create_vault(&self, passphrase: &str) -> Result<VaultId> {
+        if passphrase.chars().count() < 8 {
+            bail!("use a passphrase of at least 8 characters");
+        }
         let id = random_secret()[..16].to_string();
         let path = self.vaults_dir().join(format!("{id}.vault"));
         let pass = passphrase.to_owned();
@@ -452,10 +455,17 @@ impl AccountManager {
                 }
             }
             self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile, attachments, version: 0, written: Default::default() });
-            // All at once: one slow account shouldn't hold up the rest.
+            // All at once: one slow account shouldn't hold up the rest. Each
+            // waits a moment first (up to 3 s, at random), so the servers
+            // don't see a vault's accounts connect in the same instant.
+            let many = records.len() > 1;
             futures_util::future::join_all(records.into_iter().map(|rec| {
                 let id = &id;
                 async move {
+                    if many {
+                        let wait = u64::from_str_radix(&random_secret()[..4], 16).unwrap_or(0) % 3000;
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    }
                     if let Err(e) = self.restore(id, rec.clone()).await {
                         tracing::warn!("could not restore {}: {e:#}", rec.user_id);
                         let _ = self.events.send(ClientEvent::AccountError {
@@ -589,7 +599,7 @@ impl AccountManager {
                 }
                 match timeline::parse(&ev.content) {
                     timeline::Parsed::Edit { target, body } => {
-                        let _ = tx.send(ClientEvent::Edited { account, room_id: room.room_id().to_owned(), target, body });
+                        let _ = tx.send(ClientEvent::Edited { account, room_id: room.room_id().to_owned(), target, sender: ev.sender.clone(), body });
                     }
                     timeline::Parsed::New { body, is_text, reply_to, media, thread, pills } => {
                         let is_notice = matches!(ev.content.msgtype, matrix_sdk::ruma::events::room::message::MessageType::Notice(_));
@@ -692,7 +702,9 @@ impl AccountManager {
             filter.room.state.lazy_load_options = LazyLoadOptions::Enabled { include_redundant_members: false };
             filter.room.timeline.lazy_load_options = LazyLoadOptions::Enabled { include_redundant_members: false };
             filter.room.timeline.limit = Some(UInt::from(20u32));
-            let settings = SyncSettings::default().filter(filter.into());
+            // Never "online": presence would show all of a vault's accounts
+            // coming and going together, which ties alts to each other.
+            let settings = SyncSettings::default().filter(filter.into()).set_presence(matrix_sdk::ruma::presence::PresenceState::Offline);
             // `sync_with_callback` only returns on an error; back off and keep going.
             let mut delay = 1u64;
             loop {

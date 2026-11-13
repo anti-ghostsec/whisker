@@ -24,36 +24,49 @@ const MAX_FRAMES: usize = 150;
 /// The frames of an animated GIF or WebP, shrunk to fit; `None` for still
 /// pictures (and anything that isn't one of those).
 pub fn decode_frames(bytes: &[u8], max_w: u32, max_h: u32) -> Option<Frames> {
-    use image::AnimationDecoder;
+    use image::{AnimationDecoder, ImageDecoder};
     let cursor = std::io::Cursor::new(bytes);
-    let frames: Vec<image::Frame> = if bytes.starts_with(b"GIF8") {
-        image::codecs::gif::GifDecoder::new(cursor).ok()?.into_frames().take(MAX_FRAMES).collect::<Result<_, _>>().ok()?
-    } else if bytes.get(8..12) == Some(b"WEBP") {
-        let d = image::codecs::webp::WebPDecoder::new(cursor).ok()?;
-        if !d.has_animation() {
+    // The canvas size is read first: a few bytes can claim a huge one, and
+    // every frame is that big before it's shrunk.
+    let fits = |(w, h): (u32, u32)| w > 0 && h > 0 && u64::from(w) * u64::from(h) <= MAX_FRAME_AREA;
+    let frames: Box<dyn Iterator<Item = image::ImageResult<image::Frame>>> = if bytes.starts_with(b"GIF8") {
+        let d = image::codecs::gif::GifDecoder::new(cursor).ok()?;
+        if !fits(d.dimensions()) {
             return None;
         }
-        d.into_frames().take(MAX_FRAMES).collect::<Result<_, _>>().ok()?
+        Box::new(d.into_frames())
+    } else if bytes.get(8..12) == Some(b"WEBP") {
+        let d = image::codecs::webp::WebPDecoder::new(cursor).ok()?;
+        if !d.has_animation() || !fits(d.dimensions()) {
+            return None;
+        }
+        Box::new(d.into_frames())
     } else {
         return None;
     };
-    if frames.len() < 2 {
+    // One frame at a time, shrunk as it comes, so only the small copies pile up.
+    let mut out: Vec<Pixels> = Vec::new();
+    let mut ms = 100;
+    for f in frames.take(MAX_FRAMES) {
+        let f = f.ok()?;
+        if out.is_empty() {
+            let (num, den) = f.delay().numer_denom_ms();
+            // Browsers treat very short delays as 100 ms; so do we.
+            ms = num.checked_div(den).filter(|ms| *ms > 10).unwrap_or(100);
+        }
+        let img = image::DynamicImage::ImageRgba8(f.into_buffer());
+        let img = if img.width() > max_w || img.height() > max_h { img.resize(max_w, max_h, image::imageops::FilterType::Triangle) } else { img };
+        let img = img.to_rgba8();
+        out.push(Pixels::clone_from_slice(img.as_raw(), img.width(), img.height()));
+    }
+    if out.len() < 2 {
         return None;
     }
-    let (num, den) = frames[0].delay().numer_denom_ms();
-    // Browsers treat very short delays as 100 ms; so do we.
-    let ms = num.checked_div(den).filter(|ms| *ms > 10).unwrap_or(100);
-    let out: Vec<Pixels> = frames
-        .into_iter()
-        .map(|f| {
-            let img = image::DynamicImage::ImageRgba8(f.into_buffer());
-            let img = if img.width() > max_w || img.height() > max_h { img.resize(max_w, max_h, image::imageops::FilterType::Triangle) } else { img };
-            let img = img.to_rgba8();
-            Pixels::clone_from_slice(img.as_raw(), img.width(), img.height())
-        })
-        .collect();
     Some((Arc::new(out), ms))
 }
+
+/// Biggest animation canvas decoded (pixels): 4096 × 4096.
+const MAX_FRAME_AREA: u64 = 4096 * 4096;
 pub type PixelCache = Arc<Mutex<HashMap<OwnedMxcUri, Option<Pixels>>>>;
 
 pub struct Models {

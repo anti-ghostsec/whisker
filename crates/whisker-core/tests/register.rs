@@ -28,7 +28,7 @@ async fn setup() -> (MatrixMockServer, AccountManager, String, std::path::PathBu
     server.mock_query_keys().ok().mount().await;
     let dir = std::env::temp_dir().join(format!("whisker-reg-{}", whisker_core::vault::random_secret()));
     let mgr = AccountManager::new(&dir);
-    let vault = mgr.create_vault("pw").await.unwrap();
+    let vault = mgr.create_vault("register test pw").await.unwrap();
     (server, mgr, vault, dir)
 }
 

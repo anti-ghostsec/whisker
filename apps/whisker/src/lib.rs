@@ -217,7 +217,14 @@ fn split_tags(t: &str) -> Vec<String> {
 }
 
 fn decode(bytes: &[u8], max_w: u32, max_h: u32, square: bool) -> Option<Pixels> {
-    let img = image::load_from_memory(bytes).ok()?;
+    // Limits first: a small file can claim a picture of billions of pixels.
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
     let img = if square {
         img.resize_to_fill(max_w, max_h, image::imageops::FilterType::Triangle)
     } else if img.width() > max_w || img.height() > max_h {
@@ -257,6 +264,9 @@ fn media_dir(data_dir: &std::path::Path) -> PathBuf {
 fn play_file(path: &std::path::Path, video: bool) {
     let mut cmd = std::process::Command::new("mpv");
     cmd.arg("--force-window=yes").arg("--title=Whisker").arg("--no-terminal");
+    // The file only: no playlists, no fetching addresses inside it.
+    cmd.args(["--no-ytdl", "--load-unsafe-playlists=no", "--demuxer-lavf-o=protocol_whitelist=[file]"]);
+    cmd.arg(format!("--demuxer-lavf-o-append=format_whitelist=[{}]", whisker_core::timeline::SAFE_FORMATS));
     if video {
         cmd.arg("--loop-file=inf").arg("--mute=yes");
     }
@@ -3521,7 +3531,7 @@ impl Ctl {
         #[cfg(not(target_os = "android"))]
         {
             let Some(media) = m.media else { return };
-            let name = media.name.clone();
+            let name = timeline::plain_name(&media.name).replace(['/', '\\'], "_");
             let Some(path) = tokio::task::spawn_blocking(move || rfd::FileDialog::new().set_file_name(name).save_file()).await.ok().flatten() else {
                 return;
             };
@@ -3562,8 +3572,10 @@ impl Ctl {
             });
         }
         let dir = media_dir(self.mgr.data_dir());
-        let ext = std::path::Path::new(&media.name).extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 5 && e.chars().all(char::is_alphanumeric)).unwrap_or("bin").to_owned();
-        let path = dir.join(format!("{}.{ext}", &whisker_core::vault::random_secret()[..16]));
+        // The name is the sender's (`holiday.exe`): the file is named
+        // after what its bytes really are, and only audio and video play.
+        let name = whisker_core::vault::random_secret()[..16].to_owned();
+        let mut path = dir.join(&name);
         let progress = Arc::new(whisker_core::media_fetch::Progress::default());
         let watching = self.watch_progress(progress.clone(), |c, pct| {
             c.status(format!("Loading… {pct}%"));
@@ -3571,6 +3583,10 @@ impl Ctl {
         });
         let r = async {
             let bytes = whisker_core::media_fetch::with_progress(progress, timeline::download_in(&client, &key.1, &media.source, None)).await?;
+            let Some(ext) = timeline::sniff_media(&bytes) else {
+                anyhow::bail!("it isn't a video or audio file Whisker knows (use Save to keep it)");
+            };
+            path.set_extension(ext);
             whisker_core::stores::make_private_dir(&dir)?;
             tokio::fs::write(&path, bytes).await?;
             whisker_core::vault::owner_only(&path, false);
@@ -4780,7 +4796,9 @@ impl Ctl {
         } else {
             Some(key)
         };
-        match whisker_agent::detect(&url, key.as_deref()).await {
+        // Through the AI account's proxy, like its replies.
+        let proxy = self.mgr.details(account).await.and_then(|d| d.1);
+        match whisker_agent::detect_via(&url, key.as_deref(), proxy.as_deref()).await {
             Ok(d) => {
                 let status = format!(
                     "✓ {} ({}) · {} models",
@@ -5158,11 +5176,12 @@ impl Ctl {
                         self.schedule_marks(key);
                     }
                 }
-                ClientEvent::Edited { account, room_id, target, body } => {
+                ClientEvent::Edited { account, room_id, target, sender, body } => {
                     let key = (account, room_id);
                     let found = {
                         let mut st = self.st.lock().unwrap();
-                        st.messages.get_mut(&key).and_then(|l| l.iter_mut().find(|m| m.event_id == target)).map(|m| {
+                        // Only the message's own sender can edit it.
+                        st.messages.get_mut(&key).and_then(|l| l.iter_mut().find(|m| m.event_id == target && m.sender == sender)).map(|m| {
                             m.body = body;
                             m.edited = true;
                         })

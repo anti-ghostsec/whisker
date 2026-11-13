@@ -231,7 +231,10 @@ async fn relay_one(mut sock: tokio::net::TcpStream, client: &Client, at: &Addres
     let mut res = tokio::time::timeout(std::time::Duration::from_secs(30), req.send()).await??;
     let status = res.status();
     let mut out = format!("HTTP/1.1 {} {}\r\nConnection: close\r\n", status.as_u16(), status.canonical_reason().unwrap_or(""));
-    for h in [reqwest::header::CONTENT_TYPE, reqwest::header::CONTENT_LENGTH, reqwest::header::CONTENT_RANGE, reqwest::header::ACCEPT_RANGES] {
+    // Not the sender's content type: ffmpeg would take it as a hint (a
+    // playlist type makes it read the file as a playlist).
+    out.push_str("Content-Type: application/octet-stream\r\n");
+    for h in [reqwest::header::CONTENT_LENGTH, reqwest::header::CONTENT_RANGE, reqwest::header::ACCEPT_RANGES] {
         if let Some(v) = res.headers().get(&h).and_then(|v| v.to_str().ok()) {
             out.push_str(&format!("{h}: {v}\r\n"));
         }

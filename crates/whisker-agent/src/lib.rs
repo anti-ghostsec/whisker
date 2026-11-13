@@ -13,7 +13,7 @@ pub mod runner;
 pub mod tools;
 pub mod web;
 
-pub use api::{ApiConfig, ApiFormat, Detected, detect};
+pub use api::{ApiConfig, ApiFormat, Detected, detect, detect_via};
 pub use config::{AgentConfig, Trigger};
 pub use llm::Llm;
 pub use permissions::{Permission, Permissions};

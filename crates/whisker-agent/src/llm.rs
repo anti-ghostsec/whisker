@@ -48,6 +48,7 @@ pub struct Llm {
     extra: Map<String, Value>,
     venice: Venice,
     http: reqwest::Client,
+    proxy: Option<String>,
     /// Format and endpoint, detected on first use if the config has none.
     resolved: OnceCell<(ApiFormat, String)>,
 }
@@ -55,7 +56,19 @@ pub struct Llm {
 impl Llm {
     pub fn new(api: ApiConfig, max_tokens: u32, extra: Map<String, Value>) -> Result<Self> {
         let http = whisker_core::tls::http_builder().timeout(Duration::from_secs(300)).build()?;
-        Ok(Self { api, max_tokens, extra, http, resolved: OnceCell::new(), venice: Venice::default() })
+        Ok(Self { api, max_tokens, extra, http, proxy: None, resolved: OnceCell::new(), venice: Venice::default() })
+    }
+
+    /// Sends every request through `proxy` (the AI account's), so the AI
+    /// service never sees the real address of an account kept behind Tor.
+    pub fn set_proxy(&mut self, proxy: Option<String>) -> Result<()> {
+        let mut b = whisker_core::tls::http_builder().timeout(Duration::from_secs(300));
+        if let Some(p) = &proxy {
+            b = b.proxy(reqwest::Proxy::all(p).map_err(|e| anyhow::anyhow!("bad proxy: {e}"))?);
+        }
+        self.http = b.build()?;
+        self.proxy = proxy;
+        Ok(())
     }
 
     pub fn with_venice(mut self, venice: Venice) -> Self {
@@ -74,7 +87,7 @@ impl Llm {
                 if self.api.format != ApiFormat::Unknown && !self.api.endpoint.is_empty() {
                     return Ok((self.api.format, self.api.endpoint.clone()));
                 }
-                let d = api::detect(&self.api.url, self.api.api_key.as_deref()).await?;
+                let d = api::detect_via(&self.api.url, self.api.api_key.as_deref(), self.proxy.as_deref()).await?;
                 Ok::<_, anyhow::Error>((d.format, d.endpoint))
             })
             .await

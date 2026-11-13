@@ -42,6 +42,10 @@ operating system and the **Wisp** browser.
   posted in the chat, links in pages it already read, or sites you list (GitHub by
   default), so a message can't make it send the chat to some other site. Pages are treated
   as untrusted, and after reading the web the AI can't moderate until the next message.
+- **AI safety limits.** An AI never does to someone what the person asking couldn't do
+  (nobody at or above their power level), can't be asked to find out which accounts are
+  yours, mentions nobody (no `@room`), answers each person at most 30 times an hour by
+  default, and talks to the AI service through the AI account's proxy when it has one.
 - **Deleted means forgotten.** When a message is deleted (or a room cleared), the AI drops
   it from its memory, along with the summary it went into and its hidden state; edits
   replace the remembered text.

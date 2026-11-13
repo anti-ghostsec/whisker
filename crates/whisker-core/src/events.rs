@@ -38,8 +38,10 @@ pub enum ClientEvent {
     Receipts { account: AccountId, room_id: OwnedRoomId },
     /// Keys arrived that may unlock messages shown as undecryptable.
     RoomKeys { account: AccountId, rooms: Vec<OwnedRoomId> },
-    /// A message was edited; `body` is its new text.
-    Edited { account: AccountId, room_id: OwnedRoomId, target: OwnedEventId, body: String },
+    /// A message was edited; `body` is its new text. `sender` sent the
+    /// edit: only apply it to a message `sender` wrote (anyone can send an
+    /// edit pointing at anyone's message).
+    Edited { account: AccountId, room_id: OwnedRoomId, target: OwnedEventId, sender: OwnedUserId, body: String },
     /// Someone reacted to a message with an emoji.
     Reaction { account: AccountId, room_id: OwnedRoomId, reaction: crate::timeline::Reaction },
     /// Who is typing in a room changed (never includes ourselves).

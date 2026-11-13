@@ -514,19 +514,21 @@ async fn read_space_children_via(space: &Room) -> Vec<(OwnedRoomId, Vec<matrix_s
 /// The room's name; uses the name cached by the last sync when there is one
 /// (computing it from members is slow on big accounts).
 pub async fn room_name(room: &Room) -> String {
-    if let Some(n) = room.cached_display_name() {
-        return n.to_string();
-    }
-    match room.display_name().await {
-        Ok(n) => n.to_string(),
-        Err(_) => room.room_id().to_string(),
-    }
+    let name = match room.cached_display_name() {
+        Some(n) => n.to_string(),
+        None => match room.display_name().await {
+            Ok(n) => n.to_string(),
+            Err(_) => return room.room_id().to_string(),
+        },
+    };
+    plain_name(&name)
 }
 
 /// Display name and avatar of a room member, from the local store.
 pub async fn member_profile(room: &Room, user: &UserId) -> (Option<String>, Option<OwnedMxcUri>) {
     match room.get_member_no_sync(user).await {
-        Ok(Some(m)) => (m.display_name().map(str::to_owned), m.avatar_url().map(ToOwned::to_owned)),
+        // Names are free text: no direction overrides or invisible characters.
+        Ok(Some(m)) => (m.display_name().map(plain_name).filter(|n| !n.trim().is_empty()), m.avatar_url().map(ToOwned::to_owned)),
         _ => (None, None),
     }
 }
@@ -673,7 +675,7 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     opts.from = from;
     let msgs = room.messages(opts).await?;
     let mut out = Vec::new();
-    let mut edits: HashMap<OwnedEventId, String> = HashMap::new();
+    let mut edits: HashMap<(OwnedEventId, OwnedUserId), String> = HashMap::new();
     let mut profiles: HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)> = HashMap::new();
     // No `end` token, or a page with nothing on it, means the server has
     // nothing older: either the start of the room or the start of what we're
@@ -718,8 +720,9 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             _ => continue,
         };
         let (body, reply_to, media, thread, pills) = match parsed {
+            // Keyed by who sent the edit: only the message's own sender's counts.
             Parsed::Edit { target, body } => {
-                edits.entry(target).or_insert(body);
+                edits.entry((target, sender)).or_insert(body);
                 continue;
             }
             Parsed::New { body, reply_to, media, thread, pills, .. } => (body, reply_to, media, thread, pills),
@@ -728,7 +731,7 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             profiles.insert(sender.clone(), member_profile(room, &sender).await);
         }
         let (sender_name, sender_avatar) = profiles[&sender].clone();
-        let edited = edits.remove(&event_id);
+        let edited = edits.remove(&(event_id.clone(), sender.clone()));
         out.push(HistoryItem {
             edited: edited.is_some(),
             body: edited.unwrap_or(body),
@@ -949,7 +952,20 @@ fn link_user(tag: &str) -> Option<String> {
     } else {
         format!("@{}", href.strip_prefix("matrix:u/")?.split('?').next()?)
     };
-    (id.starts_with('@') && id.contains(':')).then_some(id)
+    // A real user id only: a pill's text is free, so its target must be checked.
+    matrix_sdk::ruma::UserId::parse(&id).is_ok().then_some(id)
+}
+
+/// `name` without characters that make text read differently than it
+/// is: right-to-left overrides and isolates (`photo\u{202E}gnp.exe` shows as
+/// `photoexe.png`), zero-width ones, and control characters.
+pub fn plain_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{061C}')
+        })
+        .collect()
 }
 
 /// Posts `text` as a reply in the thread started by `root`; `latest` is
@@ -1207,11 +1223,68 @@ fn subtitle_kind(codec: &str) -> Option<Subtitles> {
     }
 }
 
+/// Demuxers ffmpeg and ffprobe may use on media someone sent: real audio and
+/// video containers only. Playlists (HLS, DASH), concat lists, SDP and the
+/// like are left out: they make ffmpeg open other addresses itself, past
+/// the account's proxy (to the sender's server, or this device's network).
+pub const SAFE_FORMATS: &str = "mov,mp4,m4a,3gp,matroska,webm,avi,mpegts,ogg,mp3,flac,wav,aac,amr,flv,asf,mpeg";
+
+/// Input options that hold ffmpeg to `input` itself: through the relay
+/// (an `http://127.0.0.1` address) only http over tcp, else only local
+/// files, and only [`SAFE_FORMATS`]. Goes before `-i`.
+pub fn ffmpeg_guard(input: &std::ffi::OsStr) -> [&'static str; 4] {
+    let remote = input.to_string_lossy().starts_with("http://");
+    ["-protocol_whitelist", if remote { "http,tcp" } else { "file" }, "-format_whitelist", SAFE_FORMATS]
+}
+
+/// What kind of audio or video `bytes` really are, by their first bytes,
+/// as a file extension. `None` for anything else, whatever the sender
+/// called it: such a file is never handed to a player or the system.
+pub fn sniff_media(bytes: &[u8]) -> Option<&'static str> {
+    let at = |i: usize, m: &[u8]| bytes.get(i..i + m.len()) == Some(m);
+    if at(4, b"ftyp") {
+        return Some(if at(8, b"M4A ") || at(8, b"M4B ") { "m4a" } else if at(8, b"qt  ") { "mov" } else { "mp4" });
+    }
+    if at(0, &[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Some(if bytes.len() > 64 && bytes[..64].windows(4).any(|w| w == b"webm") { "webm" } else { "mkv" });
+    }
+    if at(0, b"OggS") {
+        return Some("ogg");
+    }
+    if at(0, b"fLaC") {
+        return Some("flac");
+    }
+    if at(0, b"RIFF") && at(8, b"WAVE") {
+        return Some("wav");
+    }
+    if at(0, b"RIFF") && at(8, b"AVI ") {
+        return Some("avi");
+    }
+    if at(0, b"#!AMR") {
+        return Some("amr");
+    }
+    if at(0, b"ID3") {
+        return Some("mp3");
+    }
+    if bytes.len() > 376 && bytes[0] == 0x47 && bytes[188] == 0x47 && bytes[376] == 0x47 {
+        return Some("ts");
+    }
+    if bytes.len() > 1 && bytes[0] == 0xff {
+        return match bytes[1] & 0xf6 {
+            0xf0 => Some("aac"),
+            _ if bytes[1] & 0xe0 == 0xe0 => Some("mp3"),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// Size, length, sound and subtitles, via ffprobe (when installed). `input`
 /// is a file, or an address ffprobe can read.
 pub fn probe_video(input: impl AsRef<std::ffi::OsStr>) -> Option<VideoInfo> {
     use std::process::{Command, Stdio};
     let probe = Command::new("ffprobe")
+        .args(ffmpeg_guard(input.as_ref()))
         .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:stream_side_data=rotation:stream_tags=rotate:format=duration", "-of", "default=nw=1"])
         .arg(input)
         .stdin(Stdio::null())
@@ -1255,7 +1328,9 @@ pub fn video_poster(path: impl AsRef<std::ffi::OsStr>) -> Option<Poster> {
     // A second in skips black fade-ins; short clips use their first frame.
     for seek in ["1", "0"] {
         let out = Command::new("ffmpeg")
-            .args(["-v", "error", "-ss", seek, "-i"])
+            .args(["-v", "error", "-nostdin"])
+            .args(ffmpeg_guard(path))
+            .args(["-ss", seek, "-i"])
             .arg(path)
             .args(["-frames:v", "1", "-vf", &format!("scale={pw}:{ph}"), "-f", "image2", "-c:v", "mjpeg", "-q:v", "4", "pipe:1"])
             .stdin(Stdio::null())
@@ -1411,4 +1486,30 @@ pub async fn join_patiently(client: &Client, target: &matrix_sdk::ruma::RoomOrAl
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
     Err(anyhow!("{err} (your server may still finish joining; the room shows up if it does)"))
+}
+
+#[cfg(test)]
+mod media_safety_tests {
+    use super::*;
+
+    #[test]
+    fn only_real_media_plays() {
+        let mut mp4 = vec![0, 0, 0, 0x18];
+        mp4.extend_from_slice(b"ftypisom");
+        assert_eq!(sniff_media(&mp4), Some("mp4"));
+        assert_eq!(sniff_media(b"OggS\0\x02"), Some("ogg"));
+        assert_eq!(sniff_media(b"ID3\x04\0"), Some("mp3"));
+        // A program, a playlist or a web page, whatever it's called: no.
+        assert_eq!(sniff_media(b"MZ\x90\0\x03"), None);
+        assert_eq!(sniff_media(b"#EXTM3U\n#EXTINF:1,\nhttp://x/a.ts"), None);
+        assert_eq!(sniff_media(b"<!doctype html>"), None);
+        assert_eq!(ffmpeg_guard(std::ffi::OsStr::new("/tmp/a.mp4"))[1], "file");
+        assert_eq!(ffmpeg_guard(std::ffi::OsStr::new("http://127.0.0.1:5/x"))[1], "http,tcp");
+    }
+
+    #[test]
+    fn names_read_as_they_are() {
+        assert_eq!(plain_name("photo\u{202E}gnp.exe"), "photognp.exe");
+        assert_eq!(plain_name("Ad\u{200B}min\n"), "Admin");
+    }
 }

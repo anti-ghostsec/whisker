@@ -229,6 +229,7 @@ fn ffmpeg(path: &Path, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtit
     if subtitles == Some(Subtitles::Text) {
         cmd.arg("-copyts");
     }
+    cmd.args(whisker_core::timeline::ffmpeg_guard(path.as_os_str()));
     cmd.args(["-re", "-i"]).arg(path);
     match subtitles {
         Some(Subtitles::Text) => cmd.args(["-map", "0:v:0", "-vf", &format!("{fit},subtitles=filename={}:si=0", filter_path(path))]),

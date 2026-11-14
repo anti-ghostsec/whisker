@@ -50,6 +50,9 @@ export global Prefs {
     in-out property <int> notify-level: 2;
     // Room keys: 0 every device, 1 devices signed by their owner, 2 verified only.
     in-out property <int> key-sharing: 1;
+    // Media cache: its limit (MB) and what it holds now ("89 MB").
+    in-out property <int> media-cache-mb: 400;
+    in-out property <string> media-cache-used;
     in-out property <bool> send-typing: false;
     in-out property <bool> autocorrect: true;
     in-out property <bool> spell-check: true;

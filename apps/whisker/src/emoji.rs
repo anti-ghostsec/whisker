@@ -516,6 +516,24 @@ pub fn name_of(emoji: &str) -> &'static str {
         .unwrap_or_default()
 }
 
+/// What an emoji is, in words, for showing on hover: its name and a few
+/// more of its words ("joy (tears, laugh, lol)"). Empty for unknown ones.
+pub fn describe(emoji: &str) -> String {
+    let name = name_of(emoji);
+    let more: Vec<&str> = ALL
+        .iter()
+        .find(|(e, _)| *e == emoji)
+        .map(|(_, k)| k.split(' ').filter(|w| *w != name && !w.is_empty()).take(3).collect())
+        .unwrap_or_default();
+    let name = name.replace('_', " ");
+    match (name.is_empty(), more.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => more.join(", "),
+        (false, true) => name,
+        (false, false) => format!("{name} ({})", more.join(", ")),
+    }
+}
+
 /// Emoji for a half-typed shortcode: the exact name first, then names
 /// starting with it, then other search matches.
 pub fn suggest(q: &str) -> Vec<&'static str> {
@@ -630,6 +648,8 @@ mod tests {
         assert_eq!(shortcode("nonsense"), None);
         assert_eq!(suggest("smi")[0], "😄");
         assert_eq!(name_of("😄"), "smile");
+        assert_eq!(describe("😂"), "joy (tears, laugh, lol)");
+        assert_eq!(describe("zz"), "");
         assert_eq!(replace_shortcodes("hi :smile: and :tada:!"), "hi 😄 and 🎉!");
         assert_eq!(replace_shortcodes("time 10:30:00 :nope: a:b"), "time 10:30:00 :nope: a:b");
         assert_eq!(replace_shortcodes("```\n:smile:\n```\n:smile:"), "```\n:smile:\n```\n😄");

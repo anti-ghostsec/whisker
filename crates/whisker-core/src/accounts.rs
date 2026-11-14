@@ -121,6 +121,9 @@ pub struct AccountManager {
     /// Who gets the keys to read messages sent from here: see
     /// [`AccountManager::set_key_sharing`].
     key_sharing: Arc<std::sync::atomic::AtomicU8>,
+    /// Most bytes each account's media cache may hold; see
+    /// [`AccountManager::set_media_cache_limit`].
+    media_cache: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub struct LoginRequest<'a> {
@@ -162,11 +165,12 @@ impl AccountManager {
             _runtime_lock: runtime_lock,
             snapshotter: Arc::default(),
             key_sharing: Arc::new(std::sync::atomic::AtomicU8::new(1)),
+            media_cache: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_MEDIA_CACHE)),
             data_dir,
             inner: Arc::default(),
             latest: Arc::default(),
             events,
-            device_name: "Whisker".into(),
+            device_name: crate::devices::SESSION_NAME.into(),
         }
     }
 
@@ -180,6 +184,55 @@ impl AccountManager {
     /// default), 2 only devices you have verified.
     pub fn set_key_sharing(&self, mode: u8) {
         self.key_sharing.store(mode.min(2), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The most each account's media cache (pictures and videos already
+    /// downloaded, kept with the running stores: in memory, gone on lock)
+    /// may hold. The oldest go first when it's full. Accounts opened from
+    /// now on get it; [`Self::apply_media_cache_limit`] gives it to open ones.
+    pub fn set_media_cache_limit(&self, bytes: u64) {
+        self.media_cache.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Gives the open accounts the limit last set.
+    pub async fn apply_media_cache_limit(&self) {
+        let bytes = self.media_cache.load(std::sync::atomic::Ordering::Relaxed);
+        for c in self.live_clients().await {
+            apply_media_cache(&c, bytes).await;
+        }
+    }
+
+    /// How many bytes the open accounts' media caches use now.
+    pub async fn media_cache_used(&self) -> u64 {
+        use matrix_sdk_base::media::store::MediaStore;
+        let mut total = 0u64;
+        for c in self.live_clients().await {
+            if let Ok(store) = c.media_store().lock().await
+                && let Ok(Some(n)) = store.get_size().await
+            {
+                total += n as u64;
+            }
+        }
+        total
+    }
+
+    /// Empties the open accounts' media caches.
+    pub async fn clear_media_cache(&self) {
+        use matrix_sdk_base::media::store::MediaStore;
+        let limit = self.media_cache.load(std::sync::atomic::Ordering::Relaxed);
+        for c in self.live_clients().await {
+            // A limit of nothing drops everything; then the real one again.
+            apply_media_cache(&c, 0).await;
+            if let Ok(store) = c.media_store().lock().await {
+                // Gives the freed space back (the file shrinks).
+                let _ = store.optimize().await;
+            }
+            apply_media_cache(&c, limit).await;
+        }
+    }
+
+    async fn live_clients(&self) -> Vec<Client> {
+        self.inner.read().await.live.values().map(|a| a.client.clone()).collect()
     }
 
     /// For code that reports progress into the shared event stream.
@@ -602,6 +655,7 @@ impl AccountManager {
             _ => CollectStrategy::IdentityBasedStrategy,
         });
         let client = b.build().await?;
+        apply_media_cache(&client, self.media_cache.load(std::sync::atomic::Ordering::Relaxed)).await;
         client
             .set_media_fetcher(std::sync::Arc::new(
                 crate::media_fetch::WithFallback::default(),
@@ -1412,6 +1466,23 @@ async fn resolve_homeserver(typed: &str, proxy: Option<&str>) -> String {
     let typed = typed.trim().trim_end_matches('/');
     let origin = if typed.contains("://") { typed.to_owned() } else { format!("{}://{typed}", crate::rooms::scheme_for(typed)) };
     well_known(&origin, proxy).await.unwrap_or(origin)
+}
+
+/// What each account's media cache may hold unless set otherwise: 400 MB.
+pub const DEFAULT_MEDIA_CACHE: u64 = 400 * 1024 * 1024;
+
+/// Holds `client`'s media cache to `bytes` (files over a fifth of it, or
+/// over 50 MB, aren't kept), dropping the oldest at once if it's over.
+async fn apply_media_cache(client: &Client, bytes: u64) {
+    use matrix_sdk_base::media::store::MediaRetentionPolicy;
+    let policy = MediaRetentionPolicy::new().with_max_cache_size(Some(bytes)).with_max_file_size(Some((bytes / 5).min(50 * 1024 * 1024)));
+    if let Err(e) = client.media().set_media_retention_policy(policy).await {
+        tracing::warn!("couldn't set the media cache limit: {e}");
+        return;
+    }
+    if let Err(e) = client.media().clean().await {
+        tracing::debug!("couldn't trim the media cache: {e}");
+    }
 }
 
 fn random_byte() -> u8 {

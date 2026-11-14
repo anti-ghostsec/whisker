@@ -168,7 +168,7 @@ async fn watch_sas(sas: SasVerification, flow: String, tx: broadcast::Sender<Cli
 }
 
 /// The server's "confirm it's you" answer, with the account password.
-fn password_auth(client: &Client, password: &str, session: Option<String>) -> Result<matrix_sdk::ruma::api::client::uiaa::AuthData> {
+pub(crate) fn password_auth(client: &Client, password: &str, session: Option<String>) -> Result<matrix_sdk::ruma::api::client::uiaa::AuthData> {
     use matrix_sdk::ruma::api::client::uiaa::{AuthData, Password};
     let user = client.user_id().ok_or_else(|| anyhow!("not signed in"))?.to_owned();
     let mut p = Password::new((&user).into(), password.to_owned());

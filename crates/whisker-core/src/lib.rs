@@ -4,6 +4,7 @@
 
 pub mod accounts;
 pub mod anoncat;
+pub mod devices;
 pub mod events;
 pub mod files;
 pub mod media_fetch;

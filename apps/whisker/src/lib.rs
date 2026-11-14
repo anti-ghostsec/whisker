@@ -215,6 +215,16 @@ fn day_label(ts: MilliSecondsSinceUnixEpoch) -> String {
     }
 }
 
+/// When a session was last seen: "Today 14:02", "Yesterday 09:15", "3 March 2026".
+fn seen_label(ts: MilliSecondsSinceUnixEpoch) -> String {
+    let Some(t) = local(ts) else { return String::new() };
+    match (chrono::Local::now().date_naive() - t.date_naive()).num_days() {
+        0 => t.format("today %H:%M").to_string(),
+        1 => t.format("yesterday %H:%M").to_string(),
+        _ => t.format("%-d %B %Y").to_string(),
+    }
+}
+
 fn split_tags(t: &str) -> Vec<String> {
     t.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned).collect()
 }
@@ -2044,6 +2054,19 @@ impl Ctl {
                 }
                 return;
             }
+            "rename-device" | "remove-device" => {
+                let Some((device, v)) = value.split_once('\n') else { return };
+                let rename = action == "rename-device";
+                self.ui(move |u| u.set_devices_status(s(if rename { "Renaming…" } else { "Removing…" })));
+                let r = if rename { whisker_core::devices::rename(&client, device, v).await } else { whisker_core::devices::remove(&client, device, v).await };
+                self.load_devices(aid);
+                match r {
+                    Ok(()) => self.settings_msg(if rename { "Session renamed." } else { "Session signed out." }),
+                    Err(e) if rename => self.settings_msg(format!("Couldn't rename the session: {e:#}")),
+                    Err(e) => self.settings_msg(format!("Couldn't remove the session (is the password right?): {e:#}")),
+                }
+                return;
+            }
             "name" => whisker_core::rooms::set_display_name(&client, &value).await,
             "remove-avatar" => whisker_core::rooms::set_avatar(&client, None).await,
             "export-keys" => {
@@ -2161,6 +2184,42 @@ impl Ctl {
             }
             Err(e) => self.settings_msg(format!("Couldn't update your profile: {e:#}")),
         }
+    }
+
+    /// Lists `aid`'s sessions on its account page (asks the server, so it
+    /// fills in after the page opens).
+    fn load_devices(&self, aid: AccountId) {
+        self.ui(|u| {
+            u.set_devices(ModelRc::default());
+            u.set_devices_status(s("Loading sessions…"));
+        });
+        let c = self.clone();
+        self.spawn(async move {
+            let Some(client) = c.mgr.client(aid).await else { return };
+            let r = whisker_core::devices::list(&client).await;
+            c.ui(move |u| {
+                // The page moved on to another account meanwhile.
+                if u.get_account_form().id != aid.to_string().as_str() {
+                    return;
+                }
+                match r {
+                    Ok(list) => {
+                        let rows: Vec<DeviceRow> = list
+                            .iter()
+                            .map(|d| DeviceRow {
+                                id: s(&d.id),
+                                name: s(&d.name),
+                                seen: s(d.last_seen.and_then(|ms| UInt::new(ms)).map(|ms| seen_label(MilliSecondsSinceUnixEpoch(ms))).unwrap_or_default()),
+                                current: d.current,
+                            })
+                            .collect();
+                        u.set_devices(ModelRc::new(VecModel::from(rows)));
+                        u.set_devices_status(s(""));
+                    }
+                    Err(e) => u.set_devices_status(s(format!("Couldn't load the sessions: {e:#}"))),
+                }
+            });
+        });
     }
 
     /// Shows a just-made recovery key on the account page.
@@ -3108,7 +3167,10 @@ impl Ctl {
                     self.status("Copied. The file is encrypted, so the link works for people in this room.");
                 }
             }
-            "profile" => self.open_profile(&key, m.sender.clone()).await,
+            // Whisker's own notes (where history starts) are nobody's.
+            "profile" if m.notice && m.event_id.as_str().starts_with("$whisker-") => {}
+            // A join, leave, kick…: the person it's about, not who did it.
+            "profile" => self.open_profile(&key, m.member.as_ref().map_or_else(|| m.sender.clone(), |c| c.user.clone())).await,
             "save" => self.save_media(&key, m).await,
             "save-sticker" => {
                 let Some(media) = m.media.clone() else { return };
@@ -3995,9 +4057,46 @@ impl Ctl {
         }
     }
 
+    /// A new media cache limit (MB), for open accounts too.
+    fn set_media_cache(&self, mb: i32) {
+        let mb = mb.clamp(20, 4000);
+        {
+            let mut st = self.settings.lock().unwrap();
+            st.media_cache_mb = mb;
+            let _ = st.save(self.mgr.data_dir());
+        }
+        self.mgr.set_media_cache_limit(mb as u64 * 1024 * 1024);
+        self.ui(move |u| u.global::<Prefs>().set_media_cache_mb(mb));
+        let c = self.clone();
+        self.spawn(async move {
+            c.mgr.apply_media_cache_limit().await;
+            c.show_media_cache_used().await;
+        });
+    }
+
+    /// Shows how much the media caches hold now, on the Settings page.
+    async fn show_media_cache_used(&self) {
+        let used = self.mgr.media_cache_used().await;
+        let text = if used >= 1024 * 1024 { format!("{} MB", used / (1024 * 1024)) } else { format!("{} KB", used / 1024) };
+        self.ui(move |u| u.global::<Prefs>().set_media_cache_used(s(text)));
+    }
+
     /// One upload setting changed (`key` as the Settings page names it).
     fn set_upload(&self, key: &str, v: i32) {
         use whisker_core::upload::{Convert, ThumbFormat};
+        // Not upload settings, but they come the same way.
+        match key {
+            "media-cache-mb" => return self.set_media_cache(v),
+            "media-cache-clear" => {
+                let c = self.clone();
+                self.ui(|u| u.global::<Prefs>().set_media_cache_used(s("clearing…")));
+                return self.spawn(async move {
+                    c.mgr.clear_media_cache().await;
+                    c.show_media_cache_used().await;
+                });
+            }
+            _ => {}
+        }
         let mut st = self.settings.lock().unwrap();
         let u = &mut st.upload;
         let on = v != 0;
@@ -4689,6 +4788,7 @@ impl Ctl {
             }
         }
         let px = self.avatars.clone();
+        let general = id == "general";
         self.ui(move |u| {
             let nav: Vec<NavItem> = ui::with(|m| {
                 nav.iter()
@@ -4744,6 +4844,12 @@ impl Ctl {
             u.set_settings_message(s(""));
             u.set_screen(2);
         });
+        if let Some((a, _, _)) = &account_data {
+            self.load_devices(a.id);
+        }
+        if general {
+            self.show_media_cache_used().await;
+        }
     }
 
     /// (account id, nickname, tags, proxy) from the account page.
@@ -5494,6 +5600,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_key_sharing(prefs.key_sharing.clamp(0, 2));
     mgr.set_key_sharing(prefs.key_sharing.clamp(0, 2) as u8);
+    ui.global::<Prefs>().set_media_cache_mb(prefs.media_cache_mb.clamp(20, 4000));
+    mgr.set_media_cache_limit(prefs.media_cache_mb.clamp(20, 4000) as u64 * 1024 * 1024);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
     ui.global::<Prefs>().set_spell_check(prefs.spell_check);

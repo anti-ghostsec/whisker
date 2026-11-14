@@ -35,6 +35,16 @@ export struct AccountForm {
     recovery-key: string,
 }
 
+// One of an account's sessions (logins), for the account page.
+export struct DeviceRow {
+    id: string,
+    name: string,
+    // "Today 14:02", or empty when the server doesn't say.
+    seen: string,
+    // The session Whisker uses here.
+    current: bool,
+}
+
 export struct AgentForm {
     account: string,
     exists: bool,
@@ -467,6 +477,21 @@ component GeneralPage inherits VerticalLayout {
         }
     }
     Card {
+        title: "Media cache";
+        subtitle: "Pictures and videos you've already opened are kept so they show again without downloading. Whisker keeps them in memory (encrypted) while it's unlocked and throws them away when it locks: nothing is written to disk. A bigger cache uses more memory.";
+        Text { text: "Used: " + (Prefs.media-cache-used == "" ? "…" : Prefs.media-cache-used) + " / " + Prefs.media-cache-mb + " MB"; color: Theme.text; font-size: 13px; }
+        Field {
+            label: "Maximum size per account (MB)";
+            HorizontalLayout {
+                alignment: start;
+                spacing: 8px;
+                cache-mb := SpinBox { width: 130px; value: Prefs.media-cache-mb; minimum: 20; maximum: 4000; step-size: 50; }
+                Btn { text: "Save"; enabled: cache-mb.value != Prefs.media-cache-mb; clicked => { root.set-upload("media-cache-mb", cache-mb.value); } }
+                Btn { text: "Clear media cache"; danger: true; clicked => { root.set-upload("media-cache-clear", 0); } }
+            }
+        }
+    }
+    Card {
         title: "Commands";
         subtitle: "Typed on its own in the message box. Only you see it: it isn't sent.";
         Field {
@@ -562,7 +587,60 @@ component GeneralPage inherits VerticalLayout {
     }
 }
 
+component DeviceView inherits VerticalLayout {
+    in property <DeviceRow> item;
+    in property <string> account;
+    callback profile-edit(string, string, string);
+    property <bool> renaming;
+    property <bool> removing;
+    spacing: 6px;
+    Text {
+        text: (root.item.name == "" ? "(no name)" : root.item.name) + (root.item.current ? "  ·  this session" : "");
+        color: Theme.text; font-weight: 600; wrap: word-wrap;
+    }
+    Text {
+        text: root.item.id + (root.item.seen != "" ? "  ·  last seen " + root.item.seen : "");
+        color: Theme.muted; font-size: 11px; wrap: char-wrap;
+    }
+    if !root.renaming && !root.removing: HorizontalLayout {
+        alignment: start;
+        spacing: 8px;
+        Btn { text: "Rename"; clicked => { root.renaming = true; } }
+        if root.item.current && root.item.name != "Unnamed session": Btn {
+            text: "Name it \"Unnamed session\"";
+            clicked => { root.profile-edit("rename-device", root.account, root.item.id + "\n" + "Unnamed session"); }
+        }
+        if !root.item.current: Btn { text: "Remove"; danger: true; clicked => { root.removing = true; } }
+    }
+    if root.renaming: HorizontalLayout {
+        spacing: 8px;
+        nm := Input {
+            text: root.item.name;
+            placeholder: "Session name";
+            accepted => { root.profile-edit("rename-device", root.account, root.item.id + "\n" + nm.text); root.renaming = false; }
+        }
+        Btn { text: "Save"; primary: true; clicked => { root.profile-edit("rename-device", root.account, root.item.id + "\n" + nm.text); root.renaming = false; } }
+        Btn { text: "Cancel"; clicked => { root.renaming = false; } }
+    }
+    if root.removing: VerticalLayout {
+        spacing: 6px;
+        Text { text: "Signs that session out on the server. Your account password:"; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+        HorizontalLayout {
+            spacing: 8px;
+            pw := Input {
+                password: true;
+                placeholder: "Account password";
+                accepted => { if pw.text != "" { root.profile-edit("remove-device", root.account, root.item.id + "\n" + pw.text); root.removing = false; } }
+            }
+            Btn { text: "Remove"; danger: true; enabled: pw.text != ""; clicked => { root.profile-edit("remove-device", root.account, root.item.id + "\n" + pw.text); root.removing = false; } }
+            Btn { text: "Cancel"; clicked => { root.removing = false; } }
+        }
+    }
+}
+
 component AccountPage inherits VerticalLayout {
+    in property <[DeviceRow]> devices;
+    in property <string> devices-status;
     in property <AccountForm> account;
     callback save-account(AccountForm);
     callback profile-edit(string, string, string);
@@ -664,6 +742,16 @@ component AccountPage inherits VerticalLayout {
         subtitle: "Start over with new verification keys made here. Your other sessions and anyone who verified you will need to verify again, and the key backup on your server is deleted, so older messages you have no keys for stay unreadable.";
         rpw := Input { password: true; placeholder: "Account password"; }
         HorizontalLayout { alignment: start; Btn { text: "Reset verification"; enabled: rpw.text != ""; clicked => { root.profile-edit("reset-identity", root.account.id, rpw.text); rpw.text = ""; } } }
+    }
+    Card {
+        title: "Sessions";
+        subtitle: "Every place this account is signed in. A session's name can be seen by your server and by people you share rooms with, so Whisker names its own \"Unnamed session\", which many apps' sessions are called, and doesn't give away which app you use.";
+        if root.devices-status != "": Text { text: root.devices-status; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+        for d[i] in root.devices: VerticalLayout {
+            spacing: 10px;
+            if i > 0: Rectangle { height: 1px; background: Theme.border; }
+            DeviceView { item: d; account: root.account.id; profile-edit(a, id, v) => { root.profile-edit(a, id, v); } }
+        }
     }
     Card {
         title: "Read older encrypted messages";
@@ -1176,6 +1264,8 @@ export component SettingsPage inherits Rectangle {
     callback profile-edit(string, string, string);
     callback recover(string);
     callback logout(string);
+    in property <[DeviceRow]> devices;
+    in property <string> devices-status;
     callback new-ai();
     callback detect-api(string, string);
     callback save-agent(AgentForm);
@@ -1279,6 +1369,8 @@ export component SettingsPage inherits Rectangle {
                         }
                         if root.selected != "" && root.account.id != "" && root.selected == "account:" + root.account.id: AccountPage {
                             account: root.account;
+                            devices: root.devices;
+                            devices-status: root.devices-status;
                             save-account(f) => { root.save-account(f); }
                             profile-edit(a, id, v) => { root.profile-edit(a, id, v); }
                             recover(k) => { root.recover(k); }

@@ -55,6 +55,10 @@ pub struct AppSettings {
     /// `AccountManager::set_key_sharing`).
     #[serde(default = "one")]
     pub key_sharing: i32,
+    /// Most megabytes each account's media cache holds (in memory while
+    /// unlocked; see `AccountManager::set_media_cache_limit`).
+    #[serde(default = "media_cache_mb")]
+    pub media_cache_mb: i32,
     /// Tell others when you're typing (off: it's metadata the server sees).
     #[serde(default)]
     pub send_typing: bool,
@@ -95,6 +99,10 @@ fn clear_command() -> String {
 
 fn yes() -> bool {
     true
+}
+
+fn media_cache_mb() -> i32 {
+    400
 }
 
 fn one() -> i32 {

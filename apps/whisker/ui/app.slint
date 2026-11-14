@@ -1,6 +1,6 @@
 import { ListView, ScrollView, Palette, TextEdit, Switch, ComboBox } from "std-widgets.slint";
 import { Theme, Prefs, TextTools, Avatar, AiBadge, Btn, IconBtn, Input, Pill } from "theme.slint";
-import { SettingsPage, AccountForm, AgentForm, NavItem, ModelInfo } from "settings.slint";
+import { SettingsPage, AccountForm, AgentForm, NavItem, ModelInfo, DeviceRow } from "settings.slint";
 // Colour emoji for all text (a trimmed Noto Color Emoji: no letters, digits
 // or spaces, so text still comes from the normal fonts). See assets/fonts.
 import "../assets/fonts/WhiskerEmoji.ttf";
@@ -84,6 +84,8 @@ export struct ReactionChip {
     count: int,
     mine: bool,
     who: string,
+    // What the emoji is, in words ("joy (tears, laugh, lol)"); may be empty.
+    name: string,
     // The emoji as a colour picture (empty: draw the key as text).
     picture: image,
 }
@@ -608,7 +610,11 @@ component MessageRow inherits Rectangle {
                     padding-bottom: 3px;
                     spacing: 8px;
                     // A set width, so wrapped lines count in the row's height.
-                    Text { text: root.item.body; font-size: 12px; color: Theme.muted; wrap: word-wrap; width: max(40px, root.width - 64px - 16px - 52px); }
+                    // Click for the person's profile (their full address, server…).
+                    Text {
+                        text: root.item.body; font-size: 12px; color: notice-ta.has-hover ? Theme.text : Theme.muted; wrap: word-wrap; width: max(40px, root.width - 64px - 16px - 52px);
+                        notice-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
+                    }
                     if area.has-hover: Text { text: root.item.time; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
                 }
                 if !root.item.notice: HorizontalLayout {
@@ -796,16 +802,28 @@ component MessageRow inherits Rectangle {
                                     Text { text: r.count; font-size: 11px; font-weight: 700; color: r.mine ? Theme.accent : Theme.muted; vertical-alignment: center; }
                                 }
                                 chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("react:" + r.key, root.item.id); } }
-                                // Who reacted, on hover.
+                                // On hover: the emoji large (small ones are hard to make
+                                // out), what it is, and who reacted.
                                 if chip-ta.has-hover: Rectangle {
-                                    y: -28px;
-                                    height: 22px;
-                                    width: min(260px, tip.preferred-width + 14px);
-                                    border-radius: 6px;
+                                    y: -50px;
+                                    height: 44px;
+                                    width: min(300px, tip.preferred-width + 16px);
+                                    border-radius: 8px;
                                     background: Theme.panel;
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    tip := Text { text: r.who; font-size: 11px; color: Theme.text; overflow: elide; width: parent.width - 14px; }
+                                    tip := HorizontalLayout {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        spacing: 8px;
+                                        if r.picture.width > 0: Image { source: r.picture; width: 32px; height: 32px; y: (parent.height - self.height) / 2; }
+                                        if r.picture.width == 0: Text { text: r.key; font-size: 24px; vertical-alignment: center; }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            if r.name != "": Text { text: r.name; font-size: 12px; font-weight: 700; color: Theme.text; overflow: elide; }
+                                            Text { text: r.who; font-size: 11px; color: Theme.muted; overflow: elide; }
+                                        }
+                                    }
                                 }
                             }
                             Rectangle {
@@ -1244,7 +1262,18 @@ export component AppWindow inherits Window {
     in-out property <string> draft;
     // The spell check looks again once typing pauses.
     changed draft => { root.spell-refresh(); }
-    changed safe-area-insets => { Safe.top = self.safe-area-insets.top; Safe.bottom = self.safe-area-insets.bottom; }
+    // The screen's edges (status and navigation bars), and on phones the
+    // on-screen keyboard: what it covers is kept clear, so the message box
+    // sits above it while you type.
+    function fit-insets() {
+        Safe.top = self.safe-area-insets.top;
+        Safe.bottom = max(self.safe-area-insets.bottom,
+            self.virtual-keyboard-size.height > 0 ? max(0px, self.height - self.virtual-keyboard-position.y) : 0px);
+    }
+    changed safe-area-insets => { root.fit-insets(); }
+    changed virtual-keyboard-size => { root.fit-insets(); }
+    changed virtual-keyboard-position => { root.fit-insets(); }
+    changed height => { root.fit-insets(); }
     in-out property <string> reply-to;
     in property <string> reply-label;
     in-out property <string> editing;
@@ -1372,6 +1401,9 @@ export component AppWindow inherits Window {
     in property <[NavItem]> nav;
     in-out property <string> nav-selected;
     in property <AccountForm> account-form;
+    // The open account's sessions, and how loading them went.
+    in property <[DeviceRow]> devices;
+    in property <string> devices-status;
     in property <AgentForm> agent-form;
     in property <[string]> models;
     in property <[string]> image-models;
@@ -1493,7 +1525,7 @@ export component AppWindow inherits Window {
         Palette.color-scheme = root.theme == 0 ? ColorScheme.dark : root.theme == 1 ? ColorScheme.light : ColorScheme.unknown;
         Theme.dark = root.theme == 0 || (root.theme == 2 && Palette.color-scheme == ColorScheme.dark);
     }
-    init => { root.apply-theme(); Safe.top = self.safe-area-insets.top; Safe.bottom = self.safe-area-insets.bottom; }
+    init => { root.apply-theme(); root.fit-insets(); }
     changed theme => { root.apply-theme(); }
 
     // Copies to the system clipboard through a hidden text field.
@@ -1938,7 +1970,9 @@ export component AppWindow inherits Window {
                                 show-readers(list) => { root.readers-list = list; root.readers-open = true; }
                                 action(a, id) => {
                                     root.activity();
-                                    if a == "profile" {
+                                    // Room events (joins, kicks…) ask the app: the profile is
+                                    // the person it's about, who may not be who did it.
+                                    if a == "profile" && !m.notice {
                                         root.show-profile(m.sender, m.name, m.initial, m.hue, m.avatar);
                                     } else {
                                         root.message-action(a, id);
@@ -2416,7 +2450,9 @@ export component AppWindow inherits Window {
                                 show-readers(list) => { root.readers-list = list; root.readers-open = true; }
                                 action(a, id) => {
                                     root.activity();
-                                    if a == "profile" {
+                                    // Room events (joins, kicks…) ask the app: the profile is
+                                    // the person it's about, who may not be who did it.
+                                    if a == "profile" && !m.notice {
                                         root.show-profile(m.sender, m.name, m.initial, m.hue, m.avatar);
                                     } else if a != "thread" {
                                         root.message-action(a, id);
@@ -2589,6 +2625,8 @@ export component AppWindow inherits Window {
         nav: root.nav;
         selected <=> root.nav-selected;
         account: root.account-form;
+        devices: root.devices;
+        devices-status: root.devices-status;
         agent: root.agent-form;
         models: root.models;
         image-models: root.image-models;

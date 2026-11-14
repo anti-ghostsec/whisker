@@ -359,7 +359,7 @@ impl Models {
             thread_replies: r.thread.as_ref().map_or(0, |t| t.0 as i32),
             thread_last: s(r.thread.as_ref().map(|t| t.1.as_str()).unwrap_or_default()),
             reactions: ModelRc::new(VecModel::from(
-                r.reactions.iter().map(|(key, n, mine, who)| ReactionChip { key: s(key), count: *n as i32, mine: *mine, who: s(who), picture: emoji_image(key) }).collect::<Vec<_>>(),
+                r.reactions.iter().map(|(key, n, mine, who)| ReactionChip { key: s(key), count: *n as i32, mine: *mine, who: s(who), name: s(crate::emoji::describe(key)), picture: emoji_image(key) }).collect::<Vec<_>>(),
             )),
             mine: r.mine,
             trust: match r.trust {

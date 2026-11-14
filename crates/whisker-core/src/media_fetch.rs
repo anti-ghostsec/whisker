@@ -38,12 +38,17 @@ use std::time::{Duration, Instant};
 
 /// Longest wait for a server to start answering.
 const ANSWER: Duration = Duration::from_secs(30);
+/// The same for a download someone asked for and is watching (saving or
+/// playing a file, see [`with_progress`]). A server with a big file from
+/// another server first fetches all of it, and only then starts answering:
+/// minutes, for hundreds of MB.
+const ANSWER_ASKED: Duration = Duration::from_secs(20 * 60);
 /// Longest wait between two pieces of a file.
 const STALL: Duration = Duration::from_secs(30);
 /// Longest a whole download may take.
 const WHOLE: Duration = Duration::from_secs(2 * 60 * 60);
 /// Biggest file taken in memory.
-const MAX_BYTES: usize = 512 * 1024 * 1024;
+const MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 static ASK_FILE_SERVERS: AtomicBool = AtomicBool::new(false);
 static ASK_ROOM_SERVERS: AtomicBool = AtomicBool::new(false);
@@ -393,7 +398,8 @@ async fn get_once(
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let mut res = match tokio::time::timeout(ANSWER, req.send()).await {
+    let answer = if PROGRESS.try_with(|_| ()).is_ok() { ANSWER_ASKED } else { ANSWER };
+    let mut res = match tokio::time::timeout(answer, req.send()).await {
         Err(_) => {
             return Err(Failed::Unreachable(
                 "the server took too long to answer".into(),
@@ -489,7 +495,7 @@ async fn get_once(
         if let Some(t) = token {
             again = again.bearer_auth(t);
         }
-        let rest = match tokio::time::timeout(ANSWER, again.send()).await {
+        let rest = match tokio::time::timeout(answer, again.send()).await {
             Ok(Ok(r)) => r,
             _ => return Err(Failed::Unreachable(broke)),
         };

@@ -6,7 +6,12 @@ mod agent_form;
 mod autocorrect;
 mod emoji;
 mod notify;
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "android")]
+mod droid;
+#[cfg(target_os = "android")]
+mod picker;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg_attr(target_os = "android", path = "android_player.rs")]
 mod player;
 #[cfg(not(target_os = "android"))]
 #[doc(hidden)]
@@ -1526,7 +1531,7 @@ impl Ctl {
         self.end_preview();
         self.st.lock().unwrap().row_limit = None;
         // A video playing in the room being left stops.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         player::stop(&self.ui);
         let Some(account) = self.st.lock().unwrap().account else { return };
         let Some(client) = self.mgr.client(account).await else { return };
@@ -1901,7 +1906,7 @@ impl Ctl {
         if joined(&p.room_id) {
             return show_room(p.room_id).await;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         player::stop(&self.ui);
         self.end_preview();
         let key = (account, p.room_id.clone());
@@ -2079,7 +2084,7 @@ impl Ctl {
                 }
                 let Some(path) = save_file_as("Export room keys", "whisker-keys.txt".into()).await else {
                     #[cfg(target_os = "android")]
-                    self.settings_msg("Exporting keys isn't available on Android yet.");
+                    self.settings_msg("Couldn't export keys: the phone's Download folder can't be written to (Android 10 and older need it allowed).");
                     return;
                 };
                 self.settings_msg("Exporting keys…");
@@ -2097,8 +2102,6 @@ impl Ctl {
                     return self.settings_msg("Enter the passphrase the key file was exported with.");
                 }
                 let Some(path) = pick_path("Import room keys").await else {
-                    #[cfg(target_os = "android")]
-                    self.settings_msg("Importing key files isn't available on Android yet.");
                     return;
                 };
                 self.settings_msg("Importing keys…");
@@ -2163,20 +2166,9 @@ impl Ctl {
                 return;
             }
             "avatar" => {
-                #[cfg(not(target_os = "android"))]
-                {
-                    let picked = tokio::task::spawn_blocking(|| {
-                        rfd::FileDialog::new().set_title("Choose a profile picture").add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"]).pick_file()
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-                    let Some(path) = picked else { return };
-                    self.settings_msg("Uploading picture…");
-                    whisker_core::rooms::set_avatar(&client, Some(&path)).await
-                }
-                #[cfg(target_os = "android")]
-                Err(anyhow::anyhow!("changing your picture isn't available on Android yet"))
+                let Some(path) = pick_paths("Choose a profile picture", IMAGE_EXTS, false).await.into_iter().next() else { return };
+                self.settings_msg("Uploading picture…");
+                whisker_core::rooms::set_avatar(&client, Some(&path)).await
             }
             _ => return,
         };
@@ -2421,20 +2413,11 @@ impl Ctl {
         let Some((_, room)) = self.current_room().await else { return };
         let r = match action.as_str() {
             "remove" => whisker_core::rooms::set_room_avatar(&room, None).await,
-            #[cfg(not(target_os = "android"))]
             "change" => {
-                let picked = tokio::task::spawn_blocking(|| {
-                    rfd::FileDialog::new().set_title("Choose a room picture").add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"]).pick_file()
-                })
-                .await
-                .ok()
-                .flatten();
-                let Some(path) = picked else { return };
+                let Some(path) = pick_paths("Choose a room picture", IMAGE_EXTS, false).await.into_iter().next() else { return };
                 self.ui(|u| u.set_room_info_status(s("Uploading picture…")));
                 whisker_core::rooms::set_room_avatar(&room, Some(&path)).await
             }
-            #[cfg(target_os = "android")]
-            "change" => Err(anyhow::anyhow!("changing room pictures isn't available on Android yet")),
             _ => return,
         };
         match r {
@@ -2778,27 +2761,16 @@ impl Ctl {
     /// Picks files to send. They wait above the message box, so a caption
     /// can be typed (and a reply picked) first; Enter sends them.
     async fn attach(&self) {
-        #[cfg(not(target_os = "android"))]
-        {
-            if self.current_room().await.is_none() {
-                return;
-            }
-            let picked = tokio::task::spawn_blocking(|| {
-                rfd::FileDialog::new().set_title("Send files").pick_files()
-            })
-            .await
-            .ok()
-            .flatten();
-            let paths = picked.unwrap_or_default();
-            if paths.is_empty() {
-                return;
-            }
-            self.st.lock().unwrap().pending_files.extend(paths);
-            self.show_pending_files();
-            self.ui(|u| u.set_focus_request(u.get_focus_request() + 1));
+        if self.current_room().await.is_none() {
+            return;
         }
-        #[cfg(target_os = "android")]
-        self.status("Uploading isn't available on Android yet.");
+        let paths = pick_paths("Send files", &[], true).await;
+        if paths.is_empty() {
+            return;
+        }
+        self.st.lock().unwrap().pending_files.extend(paths);
+        self.show_pending_files();
+        self.ui(|u| u.set_focus_request(u.get_focus_request() + 1));
     }
 
     /// Opens the room's whole description in a window of its own, with
@@ -3629,27 +3601,29 @@ impl Ctl {
         });
     }
 
-    /// Opens a video or audio file in the system's player. The file goes
-    /// to the RAM folder (wiped when you lock), not the disk.
+    /// Plays a video or audio file: in the window where Whisker can (videos
+    /// on Linux, and videos and sound on Android), else in the system's
+    /// player. The file goes to the RAM folder (wiped when you lock), not
+    /// the disk.
     async fn play_media(&self, key: &RoomKey, m: HistoryItem) {
         let Some(media) = m.media else { return };
-        // Whisker plays videos with ffmpeg or mpv, which phones don't have:
-        // say so instead of downloading for nothing.
-        #[cfg(target_os = "android")]
-        {
-            let _ = (key, media);
-            return self.status("Videos and audio can't play inside Whisker on Android yet. Hold it and choose Save: it goes to your Download folder, where your phone's player opens it.");
+        // Already loaded (a sound playing, say): pause or carry on.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if player::is_loaded(m.event_id.as_str()) {
+            return player::toggle(&self.ui);
         }
-        #[cfg(not(target_os = "android"))]
         self.play_media_here(key, m.event_id.clone(), media).await;
     }
 
-    #[cfg(not(target_os = "android"))]
     async fn play_media_here(&self, key: &RoomKey, event_id: OwnedEventId, media: timeline::Media) {
         let Some(client) = self.mgr.client(key.0).await else { return };
         self.status("Loading…");
-        #[cfg(target_os = "linux")]
-        if media.kind == MediaKind::Video && player::available() {
+        // Played in the window: videos, and on phones sound too.
+        let in_window = media.kind == MediaKind::Video || (cfg!(target_os = "android") && media.kind == MediaKind::Audio);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = in_window;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if in_window && player::available() {
             player::stop(&self.ui);
             let id = event_id.to_string();
             self.ui(move |u| {
@@ -3685,20 +3659,26 @@ impl Ctl {
         match r {
             Ok(()) => {
                 self.status("");
-                // Videos play in the message itself where ffmpeg can show them.
-                #[cfg(target_os = "linux")]
-                if media.kind == MediaKind::Video && player::available() {
+                // Videos play in the message itself where Whisker can show them.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if in_window && player::available() {
                     let (ui, id, path) = (self.ui.clone(), event_id.to_string(), path.clone());
                     let played = tokio::task::spawn_blocking(move || player::play(ui, id, path)).await.unwrap_or(false);
                     if played {
+                        if media.kind == MediaKind::Audio {
+                            self.status("Playing. Tap it again to pause.");
+                        }
                         return;
                     }
                     self.ui(|u| u.global::<Player>().set_loading(false));
                 }
+                #[cfg(not(target_os = "android"))]
                 play_file(&path, media.kind == MediaKind::Video);
+                #[cfg(target_os = "android")]
+                self.status("This phone can't play that file's format. Hold it and choose Save to open it in another app.");
             }
             Err(e) => {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 self.ui(|u| u.global::<Player>().set_loading(false));
                 self.status(if e.to_string() == "cancelled" { "Download cancelled.".to_owned() } else { format!("Couldn't open it: {e:#}") });
             }
@@ -5108,7 +5088,7 @@ impl Ctl {
         };
         match action.as_str() {
             "import" => {
-                let Some(bytes) = pick_file("Import a character card", &[("Character cards", &["png", "json"])]).await else { return };
+                let Some(bytes) = pick_file("Import a character card", &["png", "json"]).await else { return };
                 match whisker_agent::card::import(&bytes) {
                     Ok(imp) => {
                         let msg = format!(
@@ -5144,7 +5124,7 @@ impl Ctl {
                     let picture = match png {
                         Some(p) => p,
                         None => {
-                            let Some(raw) = pick_file("Choose a picture for the card", &[("Images", &["png", "jpg", "jpeg", "webp", "gif"])]).await else { return };
+                            let Some(raw) = pick_file("Choose a picture for the card", IMAGE_EXTS).await else { return };
                             match to_png(&raw) {
                                 Some(p) => p,
                                 None => return self.settings_msg("Couldn't read that picture."),
@@ -5482,40 +5462,40 @@ fn sender_of_me(client: &matrix_sdk::Client) -> String {
     client.user_id().map(|u| u.localpart().to_owned()).unwrap_or_default()
 }
 
-/// Reads a file the user picks (desktop only).
-async fn pick_file(title: &'static str, filters: &'static [(&'static str, &'static [&'static str])]) -> Option<Vec<u8>> {
+/// Picture files offered when choosing a picture.
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+/// Asks which files to open (with `multi`, any number; else one), showing
+/// files with these extensions (any, when empty). Empty when cancelled. On
+/// Android it's Whisker's own list (see `picker`).
+async fn pick_paths(title: &'static str, exts: &'static [&'static str], multi: bool) -> Vec<PathBuf> {
     #[cfg(not(target_os = "android"))]
     {
-        let path = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut d = rfd::FileDialog::new().set_title(title);
-            for (name, ext) in filters {
-                d = d.add_filter(*name, ext);
+            if !exts.is_empty() {
+                d = d.add_filter("Files", exts);
             }
-            d.pick_file()
+            if multi { d.pick_files().unwrap_or_default() } else { d.pick_file().into_iter().collect() }
         })
         .await
-        .ok()
-        .flatten()?;
-        tokio::fs::read(path).await.ok()
+        .unwrap_or_default()
     }
     #[cfg(target_os = "android")]
     {
-        let _ = (title, filters);
-        None
+        picker::pick(title, exts, multi).await
     }
 }
 
-/// Asks which file to open (desktop only).
+/// Reads a file the user picks.
+async fn pick_file(title: &'static str, exts: &'static [&'static str]) -> Option<Vec<u8>> {
+    let path = pick_paths(title, exts, false).await.into_iter().next()?;
+    tokio::fs::read(path).await.ok()
+}
+
+/// Asks which file to open.
 async fn pick_path(title: &'static str) -> Option<PathBuf> {
-    #[cfg(not(target_os = "android"))]
-    {
-        tokio::task::spawn_blocking(move || rfd::FileDialog::new().set_title(title).pick_file()).await.ok().flatten()
-    }
-    #[cfg(target_os = "android")]
-    {
-        let _ = title;
-        None
-    }
+    pick_paths(title, &[], false).await.into_iter().next()
 }
 
 /// Asks where to save a file (desktop only).
@@ -5658,6 +5638,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     let ui = AppWindow::new()?;
     #[cfg(not(target_os = "android"))]
     select::install(&ui);
+    #[cfg(target_os = "android")]
+    picker::install(&ui);
     ui::install(&ui);
     let mgr = AccountManager::new(data_dir);
     ui.set_first_run(mgr.is_empty());
@@ -5786,7 +5768,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         let c = ctl.clone();
         ui.on_cancel_downloads(move || c.cancel.notify_waiters());
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let c = ctl.clone();
         ui.global::<Player>().on_toggle(move |id| {
@@ -5808,7 +5790,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         let c = ctl.clone();
         ui.global::<Player>().on_set_large(move |on| player::set_large(&c.ui, on));
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let c = ctl.clone();
         ui.global::<Player>().on_toggle(move |id| {
@@ -6088,6 +6070,7 @@ fn no_backup_dir(files: &std::path::Path) -> PathBuf {
 #[unsafe(no_mangle)]
 fn android_main(app: slint::android::AndroidApp) {
     use std::sync::atomic::{AtomicI32, Ordering};
+    droid::set_app(&app);
     // The task Whisker's window is in (0 until it's running).
     static TASK: AtomicI32 = AtomicI32::new(0);
     let shares = share::android::intent_shares(&app);
@@ -6119,6 +6102,8 @@ fn android_main(app: slint::android::AndroidApp) {
         return;
     };
     let dir = no_backup_dir(&files);
+    // Certificate authorities the user added to the phone are trusted too.
+    whisker_core::tls::add_roots(droid::user_certificates());
     slint::android::init(app).expect("Slint Android backend");
     if let Err(e) = run(dir) {
         eprintln!("whisker: {e:#}");

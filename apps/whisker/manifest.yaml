@@ -7,6 +7,14 @@ android:
       - name: android.permission.INTERNET
       # Bringing the open Whisker to the front when something is shared to it.
       - name: android.permission.REORDER_TASKS
+      # Choosing files to send, pictures and key files (Whisker's own file
+      # list, see picker.rs): photos, videos and music (Android 13 and later),
+      # all of them (older Android), or every file when the user allows it.
+      - name: android.permission.READ_MEDIA_IMAGES
+      - name: android.permission.READ_MEDIA_VIDEO
+      - name: android.permission.READ_MEDIA_AUDIO
+      - name: android.permission.READ_EXTERNAL_STORAGE
+      - name: android.permission.MANAGE_EXTERNAL_STORAGE
     application:
       label: Whisker
       activities:

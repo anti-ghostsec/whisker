@@ -78,6 +78,15 @@ export struct Block {
     mention: bool,
 }
 
+// A folder or file in Whisker's own file list (Android, see picker.rs).
+export struct PickEntry {
+    name: string,
+    // Size and date, for files.
+    info: string,
+    dir: bool,
+    picked: bool,
+}
+
 // An emoji reaction under a message: how many, and whether one is ours.
 export struct ReactionChip {
     key: string,
@@ -1253,6 +1262,21 @@ export component AppWindow inherits Window {
     // A download someone asked for is going on (the ✕ by the status stops it).
     in-out property <bool> downloading;
     callback cancel-downloads();
+    // Choosing files on Android, in Whisker's own list (see picker.rs).
+    in-out property <bool> picker-open;
+    in property <string> picker-title;
+    in property <string> picker-dir;
+    in property <[PickEntry]> picker-entries;
+    in property <[string]> picker-places;
+    in property <bool> picker-multi;
+    in property <int> picker-count;
+    // What Android lets Whisker see: 0 nothing yet, 1 photos, videos and music, 2 every file.
+    in property <int> picker-access;
+    callback picker-tap(int);
+    callback picker-place(int);
+    callback picker-refresh();
+    callback picker-finish(bool);
+    callback picker-all-files();
 
     in property <[AccountItem]> accounts;
     in property <[string]> tags;
@@ -3012,6 +3036,70 @@ export component AppWindow inherits Window {
             background: big-close.has-hover ? #ffffff30 : #ffffff14;
             Text { text: "✕"; color: white; font-size: 18px; }
             big-close := TouchArea { mouse-cursor: pointer; clicked => { Player.set-large(false); } }
+        }
+    }
+
+    // Choosing files on Android.
+    Timer {
+        interval: 1500ms;
+        // Listed again now and then: access may have just been allowed.
+        running: root.picker-open;
+        triggered => { root.picker-refresh(); }
+    }
+    if root.picker-open: Overlay {
+        card-width: 520px;
+        dismiss => { root.picker-finish(false); }
+        Text { text: root.picker-title; font-size: 18px; font-weight: 800; color: Theme.text; }
+        Text { text: root.picker-dir; font-size: 11px; color: Theme.muted; overflow: elide; }
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: "Go to"; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+            ComboBox { model: root.picker-places; selected => { root.picker-place(self.current-index); } }
+        }
+        if root.picker-access == 0: Text {
+            text: "Whisker needs your permission to see the phone's files: allow it in the box Android shows (or in Settings → Apps → Whisker → Permissions).";
+            color: Theme.danger; font-size: 12px; wrap: word-wrap;
+        }
+        if root.picker-access < 2: HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Only photos, videos and music show. To see key files and other documents, let Whisker see all files.";
+                color: Theme.muted; font-size: 11px; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center;
+            }
+            VerticalLayout { alignment: center; Btn { text: "All files…"; clicked => { root.picker-all-files(); } } }
+        }
+        ListView {
+            height: min(440px, max(160px, root.height - Safe.top - Safe.bottom - 330px));
+            for e[i] in root.picker-entries: Rectangle {
+                height: 52px;
+                border-radius: 8px;
+                background: e.picked ? Theme.accent-soft : pick-ta.has-hover ? Theme.hover : transparent;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Text { text: e.name; color: Theme.text; overflow: elide; font-weight: e.dir ? 700 : 400; }
+                        if e.info != "": Text { text: e.info; color: Theme.muted; font-size: 11px; overflow: elide; }
+                    }
+                    if e.picked: Text { text: "✓"; color: Theme.accent; font-weight: 800; vertical-alignment: center; }
+                }
+                pick-ta := TouchArea { mouse-cursor: pointer; clicked => { root.picker-tap(i); } }
+            }
+        }
+        if root.picker-entries.length == 0: Text { text: "Nothing here."; color: Theme.muted; font-size: 12px; horizontal-alignment: center; }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Btn { text: "Cancel"; clicked => { root.picker-finish(false); } }
+            if root.picker-multi: Btn {
+                text: root.picker-count > 0 ? "Add " + root.picker-count : "Add";
+                primary: true;
+                enabled: root.picker-count > 0;
+                clicked => { root.picker-finish(true); }
+            }
         }
     }
 

@@ -8445,6 +8445,8 @@ dependencies = [
  "image",
  "jni 0.21.1",
  "matrix-sdk",
+ "ndk 0.9.0",
+ "ndk-sys 0.6.0+11769913",
  "rfd",
  "serde",
  "serde_json",

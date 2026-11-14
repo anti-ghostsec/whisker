@@ -1,6 +1,6 @@
 //! What Whisker asks of Android itself, through its Java side (JNI): access
-//! to the phone's files, handing a video to the phone's player, and the
-//! certificate authorities the user added to the phone.
+//! to the phone's files, and the certificate authorities the user added to
+//! the phone.
 //!
 //! Whisker has no Java code of its own, so it can't get answers back from
 //! other screens (Android's file picker hands its choice to Java code). It
@@ -9,7 +9,7 @@
 
 use jni::JNIEnv;
 use jni::objects::{JObject, JObjectArray, JString, JValue};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 type R<T> = jni::errors::Result<T>;
 
@@ -101,85 +101,6 @@ pub fn ask_all_files() {
         let action = env.new_string("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION")?;
         let intent = env.new_object("android/content/Intent", "(Ljava/lang/String;Landroid/net/Uri;)V", &[JValue::Object(&action), JValue::Object(&uri)])?;
         env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
-        Ok(())
-    });
-}
-
-/// Videos handed to the phone's player (their MediaStore addresses), to
-/// delete when Whisker locks.
-static HANDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// Puts `bytes` in the phone's Download/Whisker folder (as `name`, of type
-/// `mime`) and opens it in the phone's player. Android 10 and later.
-pub fn play_externally(name: &str, mime: &str, bytes: &[u8]) -> Result<(), String> {
-    if sdk() < 29 {
-        return Err("this needs Android 10 or later; save it instead".into());
-    }
-    let r = with_env(|env, activity| {
-        let resolver = env.call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?.l()?;
-        let values = env.new_object("android/content/ContentValues", "()V", &[])?;
-        for (k, v) in [("_display_name", name), ("mime_type", mime), ("relative_path", "Download/Whisker/")] {
-            let (k, v) = (env.new_string(k)?, env.new_string(v)?);
-            env.call_method(&values, "put", "(Ljava/lang/String;Ljava/lang/String;)V", &[JValue::Object(&k), JValue::Object(&v)])?;
-        }
-        let downloads = env.get_static_field("android/provider/MediaStore$Downloads", "EXTERNAL_CONTENT_URI", "Landroid/net/Uri;")?.l()?;
-        let uri = env
-            .call_method(&resolver, "insert", "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;", &[JValue::Object(&downloads), JValue::Object(&values)])?
-            .l()?;
-        if uri.is_null() {
-            return Ok(None);
-        }
-        let mode = env.new_string("w")?;
-        let pfd = env
-            .call_method(&resolver, "openFileDescriptor", "(Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;", &[JValue::Object(&uri), JValue::Object(&mode)])?
-            .l()?;
-        let fd = env.call_method(&pfd, "detachFd", "()I", &[])?.i()?;
-        {
-            use std::io::Write;
-            use std::os::fd::FromRawFd;
-            // SAFETY: detachFd hands the descriptor over to us; File closes it.
-            let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
-            if f.write_all(bytes).is_err() {
-                return Ok(None);
-            }
-        }
-        let text = env.call_method(&uri, "toString", "()Ljava/lang/String;", &[])?.l()?;
-        let text = string(env, text)?.unwrap_or_default();
-        let action = env.new_string("android.intent.action.VIEW")?;
-        let intent = env.new_object("android/content/Intent", "(Ljava/lang/String;)V", &[JValue::Object(&action)])?;
-        let mime_s = env.new_string(mime)?;
-        env.call_method(&intent, "setDataAndType", "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;", &[JValue::Object(&uri), JValue::Object(&mime_s)])?;
-        // Let the player read it.
-        env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(1)])?;
-        env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
-        Ok(Some(text))
-    });
-    match r {
-        Some(Some(uri)) => {
-            HANDED.lock().unwrap().push(uri);
-            Ok(())
-        }
-        _ => Err("the phone didn't take it (is there a video player?)".into()),
-    }
-}
-
-/// Deletes the videos handed to the phone's player (on lock).
-pub fn forget_handed() {
-    let uris = std::mem::take(&mut *HANDED.lock().unwrap());
-    if uris.is_empty() {
-        return;
-    }
-    with_env(|env, activity| {
-        let resolver = env.call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?.l()?;
-        let null = JObject::null();
-        for u in &uris {
-            let text = env.new_string(u)?;
-            let uri = env.call_static_method("android/net/Uri", "parse", "(Ljava/lang/String;)Landroid/net/Uri;", &[JValue::Object(&text)])?.l()?;
-            let _ = env.call_method(&resolver, "delete", "(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I", &[JValue::Object(&uri), JValue::Object(&null), JValue::Object(&null)]);
-            if env.exception_check().unwrap_or(false) {
-                let _ = env.exception_clear();
-            }
-        }
         Ok(())
     });
 }

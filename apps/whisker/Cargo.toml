@@ -43,6 +43,10 @@ zbus = "5"
 slint = { version = "1.18.1", features = ["backend-android-activity-06"] }
 # Reading share intents (already in the tree through Slint's Android backend).
 jni = "0.21"
+# Playing videos and sound with the phone's own decoders (android_player.rs);
+# already in the tree through Slint's Android backend.
+ndk = { version = "0.9", features = ["media", "audio", "api-level-26"] }
+ndk-sys = { version = "0.6", features = ["media"] }
 
 [build-dependencies]
 slint-build = "1.18.1"

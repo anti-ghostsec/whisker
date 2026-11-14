@@ -615,7 +615,7 @@ component MessageRow inherits Rectangle {
                         text: root.item.body; font-size: 12px; color: notice-ta.has-hover ? Theme.text : Theme.muted; wrap: word-wrap; width: max(40px, root.width - 64px - 16px - 52px);
                         notice-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
                     }
-                    if area.has-hover: Text { text: root.item.time; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
+                    Text { text: root.item.time; visible: area.has-hover; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
                 }
                 if !root.item.notice: HorizontalLayout {
                     padding-left: 16px;
@@ -630,7 +630,9 @@ component MessageRow inherits Rectangle {
                             initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; size: 36px;
                             TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
                         }
-                        if !root.item.first && area.has-hover: Text { text: root.item.time; font-size: 9px; color: Theme.muted; horizontal-alignment: right; height: 20px; vertical-alignment: center; }
+                        // Always there (shown on hover), so hovering or touching
+                        // a message doesn't change its height.
+                        if !root.item.first: Text { text: root.item.time; visible: area.has-hover; font-size: 9px; color: Theme.muted; horizontal-alignment: right; height: 18px; vertical-alignment: center; }
                     }
                     VerticalLayout {
                         spacing: 3px;
@@ -758,13 +760,36 @@ component MessageRow inherits Rectangle {
                         }
                         if (root.item.media == 0 || root.item.caption) && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } selected(t) => { root.selection = t; } }
                         if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
-                        // Who really sent it: the warning always, the reason on hover.
-                        if root.item.shield > 0: Text {
-                            text: area.has-hover ? "⚠ " + root.item.shield-text : "⚠";
-                            font-size: 10px;
-                            color: root.item.shield == 2 ? Theme.danger : Theme.muted;
-                            wrap: word-wrap;
-                            width: max(40px, root.width - 80px);
+                        // Who really sent it: the warning always, the reason on
+                        // hover (or a tap) over it, laid over the messages so
+                        // nothing moves.
+                        if root.item.shield > 0: Rectangle {
+                            height: 14px;
+                            Text {
+                                x: 0;
+                                text: "⚠";
+                                font-size: 10px;
+                                color: root.item.shield == 2 ? Theme.danger : Theme.muted;
+                                shield-ta := TouchArea { mouse-cursor: pointer; }
+                            }
+                            if shield-ta.has-hover: Rectangle {
+                                x: 16px;
+                                y: -6px;
+                                width: min(360px, root.width - 100px);
+                                height: shield-tip.preferred-height + 12px;
+                                border-radius: 6px;
+                                background: Theme.panel;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                shield-tip := Text {
+                                    x: 6px;
+                                    width: parent.width - 12px;
+                                    text: root.item.shield-text;
+                                    font-size: 11px;
+                                    color: root.item.shield == 2 ? Theme.danger : Theme.text;
+                                    wrap: word-wrap;
+                                }
+                            }
                         }
                         if root.item.thread-replies > 0: Rectangle {
                             height: 26px;
@@ -1939,12 +1964,24 @@ export component AppWindow inherits Window {
                         // added above and pictures growing as they arrive don't
                         // move what you're reading. At the end, it stays at the end.
                         property <length> from-bottom: 0px;
-                        changed content-height => {
+                        // The sizes the last time it was put in place.
+                        property <length> seen-height: 0px;
+                        property <length> seen-visible: 0px;
+                        // Keeps your place when the content or the view changes
+                        // size. Where you are is read from the scroll position
+                        // now (with the sizes it was at), not from the last drag:
+                        // a fling or wheel keeps moving after that, and going by
+                        // the old place made the view leap.
+                        function settle() {
+                            if !root.stick-bottom && self.seen-height > 0px {
+                                self.from-bottom = max(0px, self.seen-height + self.content-y - self.seen-visible);
+                            }
                             self.content-y = min(0px, self.visible-height - self.content-height + (root.stick-bottom ? 0px : self.from-bottom));
+                            self.seen-height = self.content-height;
+                            self.seen-visible = self.visible-height;
                         }
-                        changed visible-height => {
-                            self.content-y = min(0px, self.visible-height - self.content-height + (root.stick-bottom ? 0px : self.from-bottom));
-                        }
+                        changed content-height => { self.settle(); }
+                        changed visible-height => { self.settle(); }
                         scrolled => {
                             root.stick-bottom = self.content-y <= self.visible-height - self.content-height + 40px;
                             self.from-bottom = max(0px, self.content-height + self.content-y - self.visible-height);

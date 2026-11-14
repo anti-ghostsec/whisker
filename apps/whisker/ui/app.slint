@@ -700,6 +700,20 @@ component MessageRow inherits Rectangle {
                                 background: #000000a0;
                                 Text { text: Player.progress > 0 ? Player.progress + "%" : "…"; color: white; font-size: Player.progress > 0 ? 13px : 20px; }
                             }
+                            // Touch screens: held still for half a second, it opens the
+                            // message's menu (the picture takes the touch, so the row's
+                            // own press-and-hold never sees it), and the tap is dropped.
+                            property <bool> held;
+                            Timer {
+                                interval: 500ms;
+                                running: Prefs.touch && pic-area.pressed && !pic.held;
+                                triggered => {
+                                    if abs(pic-area.mouse-x - pic-area.pressed-x) < 12px && abs(pic-area.mouse-y - pic-area.pressed-y) < 12px {
+                                        pic.held = true;
+                                        cm.show({ x: pic-area.absolute-position.x - root.absolute-position.x + pic-area.mouse-x, y: pic-area.absolute-position.y - root.absolute-position.y + pic-area.mouse-y });
+                                    }
+                                }
+                            }
                             // Takes every button, so it opens the menu itself on right-click.
                             pic-area := TouchArea {
                                 mouse-cursor: pointer;
@@ -707,9 +721,11 @@ component MessageRow inherits Rectangle {
                                     if pic.here { Player.set-large(true); }
                                 }
                                 clicked => {
+                                    if pic.held { pic.held = false; return; }
                                     if root.item.media == 2 { Player.toggle(root.item.id); } else if root.item.picture-failed { root.action("retry-media", root.item.id); } else { root.action("view", root.item.id); }
                                 }
                                 pointer-event(e) => {
+                                    if e.kind == PointerEventKind.down { pic.held = false; }
                                     if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
                                 }
                                 // Controls, while it plays (on hover) or is paused.

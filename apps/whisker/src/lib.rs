@@ -3599,43 +3599,53 @@ impl Ctl {
     }
 
     async fn save_media(&self, key: &RoomKey, m: HistoryItem) {
-        #[cfg(not(target_os = "android"))]
-        {
-            let Some(media) = m.media else { return };
-            let name = timeline::plain_name(&media.name).replace(['/', '\\'], "_");
-            let Some(path) = tokio::task::spawn_blocking(move || rfd::FileDialog::new().set_file_name(name).save_file()).await.ok().flatten() else {
-                return;
-            };
-            let Some(client) = self.mgr.client(key.0).await else { return };
-            self.status("Downloading…");
-            let r = async {
-                let bytes = timeline::download_in(&client, &key.1, &media.source, None).await?;
-                tokio::fs::write(&path, bytes).await?;
-                anyhow::Ok(())
-            }
-            .await;
-            self.status(match r {
-                Ok(()) => format!("Saved to {}", path.display()),
-                Err(e) => format!("Couldn't save: {e:#}"),
-            });
+        let Some(media) = m.media else { return };
+        let name = timeline::plain_name(&media.name).replace(['/', '\\'], "_");
+        let Some(path) = save_file_as("Save file", name).await else {
+            #[cfg(target_os = "android")]
+            self.status("Couldn't save: the phone's Download folder can't be written to (Android 10 and older need it allowed).");
+            return;
+        };
+        let Some(client) = self.mgr.client(key.0).await else { return };
+        let progress = Arc::new(whisker_core::media_fetch::Progress::default());
+        let watching = self.watch_progress(progress.clone(), |c, pct| c.status(format!("Downloading… {pct}%")));
+        self.status("Downloading…");
+        let r = async {
+            let bytes = whisker_core::media_fetch::with_progress(progress, timeline::download_in(&client, &key.1, &media.source, None)).await?;
+            tokio::fs::write(&path, bytes).await?;
+            anyhow::Ok(())
         }
-        #[cfg(target_os = "android")]
-        {
-            let _ = (key, m);
-            self.status("Saving files isn't available on Android yet.");
-        }
+        .await;
+        watching.abort();
+        self.status(match r {
+            Ok(()) => format!("Saved to {}", path.display()),
+            Err(e) => format!("Couldn't save: {e:#}"),
+        });
     }
 
     /// Opens a video or audio file in the system's player. The file goes
     /// to the RAM folder (wiped when you lock), not the disk.
     async fn play_media(&self, key: &RoomKey, m: HistoryItem) {
         let Some(media) = m.media else { return };
+        // Whisker plays videos with ffmpeg or mpv, which phones don't have:
+        // say so instead of downloading for nothing.
+        #[cfg(target_os = "android")]
+        {
+            let _ = (key, media);
+            return self.status("Videos and audio can't play inside Whisker on Android yet. Hold it and choose Save: it goes to your Download folder, where your phone's player opens it.");
+        }
+        #[cfg(not(target_os = "android"))]
+        self.play_media_here(key, m.event_id.clone(), media).await;
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn play_media_here(&self, key: &RoomKey, event_id: OwnedEventId, media: timeline::Media) {
         let Some(client) = self.mgr.client(key.0).await else { return };
         self.status("Loading…");
         #[cfg(target_os = "linux")]
         if media.kind == MediaKind::Video && player::available() {
             player::stop(&self.ui);
-            let id = m.event_id.to_string();
+            let id = event_id.to_string();
             self.ui(move |u| {
                 let p = u.global::<Player>();
                 p.set_id(s(id));
@@ -3672,7 +3682,7 @@ impl Ctl {
                 // Videos play in the message itself where ffmpeg can show them.
                 #[cfg(target_os = "linux")]
                 if media.kind == MediaKind::Video && player::available() {
-                    let (ui, id, path) = (self.ui.clone(), m.event_id.to_string(), path.clone());
+                    let (ui, id, path) = (self.ui.clone(), event_id.to_string(), path.clone());
                     let played = tokio::task::spawn_blocking(move || player::play(ui, id, path)).await.unwrap_or(false);
                     if played {
                         return;
@@ -5490,11 +5500,29 @@ async fn save_file_as(title: &'static str, name: String) -> Option<PathBuf> {
     {
         tokio::task::spawn_blocking(move || rfd::FileDialog::new().set_title(title).set_file_name(name).save_file()).await.ok().flatten()
     }
+    // No save dialog on Android (it needs Java): files go to the phone's
+    // Download folder, in Whisker, where the Files app and other apps see
+    // them. Android 11 and later let apps write there without asking.
     #[cfg(target_os = "android")]
     {
-        let _ = (title, name);
-        None
+        let _ = title;
+        android_download_path(&name)
     }
+}
+
+/// A free name for `name` in the phone's Download/Whisker folder ("a.mp4",
+/// else "a (2).mp4"…), or `None` when that folder can't be made.
+#[cfg(target_os = "android")]
+fn android_download_path(name: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from("/storage/emulated/0/Download/Whisker");
+    std::fs::create_dir_all(&dir).ok()?;
+    let name = name.replace(['/', '\\'], "_");
+    let name = if name.trim().is_empty() { "file".to_owned() } else { name };
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((a, b)) if !a.is_empty() => (a.to_owned(), format!(".{b}")),
+        _ => (name.clone(), String::new()),
+    };
+    (1..1000).map(|n| if n == 1 { dir.join(&name) } else { dir.join(format!("{stem} ({n}){ext}")) }).find(|p| !p.exists())
 }
 
 /// Any picture, as PNG bytes.

@@ -2154,17 +2154,22 @@ export component AppWindow inherits Window {
                     }
                 }
                 // Composer
+                // (On phones the box gets the whole width; its buttons go in a row under it.)
                 if (!root.current-space || root.current-room == "") && !root.current-preview: HorizontalLayout {
                     padding: 12px;
+                    padding-bottom: root.narrow ? 4px : 12px;
                     spacing: 8px;
                     alignment: stretch;
-                    VerticalLayout {
+                    if !root.narrow: VerticalLayout {
                         alignment: end;
                         IconBtn { icon: "+"; size: 38px; clicked => { root.activity(); root.attach(); } }
                     }
                     Rectangle {
                         horizontal-stretch: 1;
-                        height: min(160px, max(40px, compose.preferred-height + 20px));
+                        // Grows with what's typed (on phones up to 40% of the
+                        // screen), then scrolls.
+                        property <length> tallest: root.narrow ? max(160px, (root.height - Safe.top - Safe.bottom) * 0.4) : 160px;
+                        height: min(self.tallest, max(40px, compose.preferred-height + 20px));
                         border-radius: 12px;
                         background: Theme.raised;
                         border-width: compose.has-focus ? 1px : 0px;
@@ -2174,7 +2179,15 @@ export component AppWindow inherits Window {
                             padding-right: 14px;
                             padding-top: 10px;
                             padding-bottom: 10px;
+                          compose-flick := Flickable {
+                            // Scrolled by keeping the cursor in view (below), and by dragging on phones;
+                            // a mouse drag selects text instead.
+                            mouse-drag-pan-enabled: false;
+                            content-width: self.width;
+                            content-height: max(self.height, compose.preferred-height);
                             ContextMenuArea {
+                                width: compose-flick.width;
+                                height: compose-flick.content-height;
                                 Menu {
                                     for w in root.spell-suggestions: MenuItem { title: w; activated => { root.spell-replace(w); } }
                                     if root.spell-word != "" && root.spell-suggestions.length == 0: MenuItem { title: "No suggestions"; enabled: false; }
@@ -2187,6 +2200,8 @@ export component AppWindow inherits Window {
                                     MenuItem { title: "Select all"; activated => { compose.focus(); compose.select-all(); } }
                                 }
                                 compose := TextInput {
+                                    width: 100%;
+                                    height: 100%;
                                     // Found by the spell check (see spell_marks.rs).
                                     accessible-description: "composer";
                                     changed width => { root.spell-refresh(); }
@@ -2198,6 +2213,14 @@ export component AppWindow inherits Window {
                                     enabled: root.current-room != "";
                                     selection-background-color: Theme.accent-soft;
                                     edited => { root.draft-edited(self.text); }
+                                    // Long messages: what you're typing stays in view.
+                                    cursor-position-changed(p) => {
+                                        if p.y + compose-flick.content-y < 0px {
+                                            compose-flick.content-y = -p.y;
+                                        } else if p.y + 20px + compose-flick.content-y > compose-flick.height {
+                                            compose-flick.content-y = min(0px, compose-flick.height - p.y - 20px);
+                                        }
+                                    }
                                     property <int> cursor-wanted: root.cursor-request;
                                     changed cursor-wanted => {
                                         self.set-selection-offsets(root.cursor-at, root.cursor-at);
@@ -2232,12 +2255,15 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                          }
                         }
                         // Red lines under misspelled words; places are in the
-                        // text box's coordinates, which start at the padding.
+                        // text box's coordinates, which start at the padding
+                        // (and move as it scrolls).
                         for m in root.spell-marks: Rectangle {
+                            visible: m.y + compose-flick.content-y >= 0px && m.y + compose-flick.content-y < compose-flick.height;
                             x: 14px + m.x;
-                            y: 10px + m.y;
+                            y: 10px + m.y + compose-flick.content-y;
                             width: m.w;
                             height: 2px;
                             border-radius: 1px;
@@ -2253,7 +2279,7 @@ export component AppWindow inherits Window {
                             font-size: 14px;
                         }
                     }
-                    VerticalLayout {
+                    if !root.narrow: VerticalLayout {
                         alignment: end;
                         IconBtn {
                             icon: "🖼";
@@ -2262,7 +2288,7 @@ export component AppWindow inherits Window {
                             clicked => { root.activity(); root.open-stickers(); }
                         }
                     }
-                    VerticalLayout {
+                    if !root.narrow: VerticalLayout {
                         alignment: end;
                         IconBtn {
                             icon: "☺";
@@ -2271,10 +2297,27 @@ export component AppWindow inherits Window {
                             clicked => { root.activity(); root.emoji-for = ""; root.emoji-search(""); root.emoji-open = !root.emoji-open; }
                         }
                     }
-                    VerticalLayout {
+                    if !root.narrow: VerticalLayout {
                         alignment: end;
                         Btn { text: root.editing != "" ? "Save" : "Send"; primary: true; height: 40px; enabled: root.current-room != "" && (root.draft != "" || root.pending-files.length > 0); clicked => { root.do-send(); } }
                     }
+                }
+                // Phones: the message box's buttons, under it.
+                if root.narrow && (!root.current-space || root.current-room == "") && !root.current-preview: HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-bottom: 10px;
+                    spacing: 6px;
+                    IconBtn { icon: "+"; size: 38px; clicked => { root.activity(); root.attach(); } }
+                    IconBtn { icon: "🖼"; size: 38px; active: root.stickers-open; clicked => { root.activity(); root.open-stickers(); } }
+                    IconBtn {
+                        icon: "☺";
+                        size: 38px;
+                        active: root.emoji-open && root.emoji-for == "";
+                        clicked => { root.activity(); root.emoji-for = ""; root.emoji-search(""); root.emoji-open = !root.emoji-open; }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Btn { text: root.editing != "" ? "Save" : "Send"; primary: true; height: 38px; enabled: root.current-room != "" && (root.draft != "" || root.pending-files.length > 0); clicked => { root.do-send(); } }
                 }
                 if root.status != "": HorizontalLayout {
                     padding-left: 16px;
@@ -2955,9 +2998,10 @@ export component AppWindow inherits Window {
         TouchArea { clicked => { root.emoji-open = false; } }
         Rectangle {
             width: min(root.width - 24px, 340px);
-            height: min(root.height - 140px, 380px);
-            x: root.width - self.width - 16px;
-            y: root.height - self.height - 76px;
+            // Clear of the screen's edges and the on-screen keyboard.
+            height: min(root.height - Safe.top - Safe.bottom - (root.narrow ? 130px : 140px), 380px);
+            x: root.width - self.width - (root.narrow ? 12px : 16px);
+            y: root.height - Safe.bottom - self.height - (root.narrow ? 112px : 76px);
             border-radius: 12px;
             background: Theme.panel;
             border-width: 1px;
@@ -2976,7 +3020,8 @@ export component AppWindow inherits Window {
                 }
                 esearch := Input {
                     placeholder: "Search emoji, e.g. cat, heart, thumbs";
-                    init => { self.take-focus(); }
+                    // Not on phones: that would open the keyboard over the emoji.
+                    init => { if !Prefs.touch { self.take-focus(); } }
                     edited(t) => { root.emoji-search(t); }
                     // Arrows move the highlight, Enter takes it, Escape closes.
                     special-key(e) => {

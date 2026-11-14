@@ -4087,6 +4087,26 @@ impl Ctl {
         // Not upload settings, but they come the same way.
         match key {
             "media-cache-mb" => return self.set_media_cache(v),
+            "media-in-vault" => {
+                let on = v != 0;
+                {
+                    let mut st = self.settings.lock().unwrap();
+                    st.media_in_vault = on;
+                    let _ = st.save(self.mgr.data_dir());
+                }
+                self.mgr.set_media_in_vault(on);
+                self.ui(move |u| u.global::<Prefs>().set_media_in_vault(on));
+                // Off: the copy already in the vault goes now.
+                if !on {
+                    let mgr = self.mgr.clone();
+                    return self.spawn(async move {
+                        for v in mgr.open_vaults().await {
+                            let _ = mgr.persist(&v).await;
+                        }
+                    });
+                }
+                return;
+            }
             "media-cache-clear" => {
                 let c = self.clone();
                 self.ui(|u| u.global::<Prefs>().set_media_cache_used(s("clearing…")));
@@ -5603,6 +5623,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     mgr.set_key_sharing(prefs.key_sharing.clamp(0, 2) as u8);
     ui.global::<Prefs>().set_media_cache_mb(prefs.media_cache_mb.clamp(20, 4000));
     mgr.set_media_cache_limit(prefs.media_cache_mb.clamp(20, 4000) as u64 * 1024 * 1024);
+    ui.global::<Prefs>().set_media_in_vault(prefs.media_in_vault);
+    mgr.set_media_in_vault(prefs.media_in_vault);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
     ui.global::<Prefs>().set_spell_check(prefs.spell_check);

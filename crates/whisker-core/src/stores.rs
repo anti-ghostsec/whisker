@@ -202,6 +202,35 @@ pub fn unpack(packed: &[u8], store: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The media cache's database, in an account's cache folder.
+pub const MEDIA_DB: &str = "matrix-sdk-media.sqlite3";
+
+/// A consistent copy of the media cache in `cache` (its values are already
+/// encrypted with the store passphrase, so it isn't compressed), or `None`
+/// when there's none.
+pub fn snapshot_media(cache: &Path) -> Result<Option<Vec<u8>>> {
+    let db = cache.join(MEDIA_DB);
+    if !db.exists() {
+        return Ok(None);
+    }
+    let copy = cache.join(format!("{MEDIA_DB}.snapshot"));
+    let _ = std::fs::remove_file(&copy);
+    let conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).context("opening the media cache")?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    conn.execute("VACUUM INTO ?1", [copy.to_string_lossy()]).context("copying the media cache")?;
+    drop(conn);
+    let bytes = std::fs::read(&copy)?;
+    std::fs::remove_file(&copy)?;
+    Ok(Some(bytes))
+}
+
+/// Puts a [`snapshot_media`] back as the media cache in `cache`.
+pub fn unpack_media(bytes: &[u8], cache: &Path) -> Result<()> {
+    make_private_dir(cache)?;
+    write_private(&cache.join(MEDIA_DB), bytes)?;
+    Ok(())
+}
+
 /// Copies the kept databases (with their write-ahead logs) from a store
 /// folder made by an older version.
 pub fn copy_legacy(legacy: &Path, store: &Path) -> Result<()> {
@@ -237,6 +266,26 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A media cache packed for the vault comes back as it was; no cache,
+    /// nothing packed.
+    #[test]
+    fn media_cache_round_trip() {
+        let dir = std::env::temp_dir().join(format!("whisker-media-{}", crate::vault::random_secret()));
+        make_private_dir(&dir).unwrap();
+        assert!(snapshot_media(&dir).unwrap().is_none());
+        let conn = rusqlite::Connection::open(dir.join(MEDIA_DB)).unwrap();
+        conn.execute_batch("CREATE TABLE media (uri TEXT, data BLOB); INSERT INTO media VALUES ('mxc://a/b', x'0102');").unwrap();
+        drop(conn);
+        let packed = snapshot_media(&dir).unwrap().unwrap();
+        let back = dir.join("back");
+        unpack_media(&packed, &back).unwrap();
+        let conn = rusqlite::Connection::open(back.join(MEDIA_DB)).unwrap();
+        let uri: String = conn.query_row("SELECT uri FROM media", [], |r| r.get(0)).unwrap();
+        assert_eq!(uri, "mxc://a/b");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Our own private folder passes; a link to it, or one others can
     /// enter, doesn't.

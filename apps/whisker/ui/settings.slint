@@ -478,7 +478,7 @@ component GeneralPage inherits VerticalLayout {
     }
     Card {
         title: "Media cache";
-        subtitle: "Pictures and videos you've already opened are kept so they show again without downloading. Whisker keeps them in memory (encrypted) while it's unlocked and throws them away when it locks: nothing is written to disk. A bigger cache uses more memory.";
+        subtitle: "Pictures and videos you've already opened are kept so they show again without downloading. By default Whisker keeps them in memory (encrypted) while it's unlocked and throws them away when it locks: nothing is written to disk. A bigger cache uses more memory.";
         Text { text: "Used: " + (Prefs.media-cache-used == "" ? "…" : Prefs.media-cache-used) + " / " + Prefs.media-cache-mb + " MB"; color: Theme.text; font-size: 13px; }
         Field {
             label: "Maximum size per account (MB)";
@@ -488,6 +488,37 @@ component GeneralPage inherits VerticalLayout {
                 cache-mb := SpinBox { width: 130px; value: Prefs.media-cache-mb; minimum: 20; maximum: 4000; step-size: 50; }
                 Btn { text: "Save"; enabled: cache-mb.value != Prefs.media-cache-mb; clicked => { root.set-upload("media-cache-mb", cache-mb.value); } }
                 Btn { text: "Clear media cache"; danger: true; clicked => { root.set-upload("media-cache-clear", 0); } }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Keep it in the vault"; color: Theme.text; }
+                Text {
+                    text: "Saves the cache, encrypted, inside your vault when it locks, so pictures show at once after you unlock instead of downloading again.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.media-in-vault;
+                toggled => { root.set-upload("media-in-vault", self.checked ? 1 : 0); }
+            }
+        }
+        if Prefs.media-in-vault: Rectangle {
+            background: Theme.danger.transparentize(0.88);
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.danger.transparentize(0.5);
+            VerticalLayout {
+                padding: 10px;
+                spacing: 4px;
+                Text { text: "⚠ What this gives away"; color: Theme.danger; font-weight: 700; font-size: 12px; }
+                Text {
+                    text: "• Your vault file grows by up to the cache size per account. Decoy vaults are never bigger than 16 MB, so someone with your device could tell a vault that big is a real one, and roughly how much you've viewed.\n• Anyone with your passphrase can see the pictures and videos you've opened, which may include ones later deleted from the room.\n• Locking, and saving while unlocked, take longer and use more memory (the copy is held in memory too).\n• Turning this off removes the copy at the vault's next save.";
+                    color: Theme.text; font-size: 11px; wrap: word-wrap;
+                }
             }
         }
     }

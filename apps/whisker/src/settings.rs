@@ -59,6 +59,9 @@ pub struct AppSettings {
     /// unlocked; see `AccountManager::set_media_cache_limit`).
     #[serde(default = "media_cache_mb")]
     pub media_cache_mb: i32,
+    /// Keep the media cache in the vault between unlocks (off: memory only).
+    #[serde(default)]
+    pub media_in_vault: bool,
     /// Tell others when you're typing (off: it's metadata the server sees).
     #[serde(default)]
     pub send_typing: bool,

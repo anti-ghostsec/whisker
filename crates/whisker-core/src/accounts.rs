@@ -43,6 +43,11 @@ fn store_key(id: AccountId) -> String {
     format!("store/{id}")
 }
 
+/// An account's media cache, when it's kept in the vault.
+fn media_key(id: AccountId) -> String {
+    format!("media/{id}")
+}
+
 /// How often running stores are packed into their vault.
 const SNAPSHOT_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// How often the encryption-key database is checked for changes. New keys
@@ -124,6 +129,9 @@ pub struct AccountManager {
     /// Most bytes each account's media cache may hold; see
     /// [`AccountManager::set_media_cache_limit`].
     media_cache: Arc<std::sync::atomic::AtomicU64>,
+    /// Keep the media cache in the vault (packed in on lock, back at
+    /// unlock) instead of only in memory.
+    media_in_vault: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct LoginRequest<'a> {
@@ -166,6 +174,7 @@ impl AccountManager {
             snapshotter: Arc::default(),
             key_sharing: Arc::new(std::sync::atomic::AtomicU8::new(1)),
             media_cache: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_MEDIA_CACHE)),
+            media_in_vault: Arc::default(),
             data_dir,
             inner: Arc::default(),
             latest: Arc::default(),
@@ -192,6 +201,18 @@ impl AccountManager {
     /// now on get it; [`Self::apply_media_cache_limit`] gives it to open ones.
     pub fn set_media_cache_limit(&self, bytes: u64) {
         self.media_cache.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the media cache is kept in the vault: packed into it when the
+    /// vault locks, and back in place at the next unlock, so pictures show
+    /// at once. Off (the default), it lives in memory only and is gone on
+    /// lock. Turned off, the copy in the vault goes at its next save.
+    pub fn set_media_in_vault(&self, on: bool) {
+        self.media_in_vault.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn keeps_media(&self) -> bool {
+        self.media_in_vault.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Gives the open accounts the limit last set.
@@ -268,7 +289,7 @@ impl AccountManager {
     /// Readies `record`'s running store: one already there stays (another
     /// Whisker is running it), else the vault's snapshot, else an old on-disk
     /// store, which is copied. Returns true when it copied an old store.
-    fn prepare_store(&self, record: &AccountRecord, packed: Option<&[u8]>) -> Result<bool> {
+    fn prepare_store(&self, record: &AccountRecord, packed: Option<&[u8]>, media: Option<&[u8]>) -> Result<bool> {
         let store = self.store_dir(record.id);
         if stores::has_store(&store) {
             return Ok(false);
@@ -277,6 +298,11 @@ impl AccountManager {
         stores::make_private_dir(&self.run_dir(record.id))?;
         if let Some(packed) = packed {
             stores::unpack(packed, &store)?;
+            if let Some(media) = media.filter(|_| self.keeps_media())
+                && let Err(e) = stores::unpack_media(media, &self.cache_dir(record.id))
+            {
+                tracing::warn!("could not restore the media cache: {e:#}");
+            }
             return Ok(false);
         }
         let legacy = self.legacy_store_dir(record.id);
@@ -291,23 +317,37 @@ impl AccountManager {
     /// if anything changed. Old on-disk stores of those accounts are then
     /// deleted, now that the vault holds them.
     pub async fn persist(&self, vault: &str) -> Result<()> {
+        self.persist_with(vault, false).await
+    }
+
+    /// [`Self::persist`]; with `media`, also packs the media caches in (when
+    /// they're kept in the vault). That's a big copy, so it's done on lock
+    /// only: other saves keep the copy from the last lock.
+    async fn persist_with(&self, vault: &str, media: bool) -> Result<()> {
         let ids: Vec<AccountId> = {
             let inner = self.inner.read().await;
             let Some(ov) = inner.vaults.get(vault) else { return Ok(()) };
             ov.profile.accounts.iter().map(|a| a.id).collect()
         };
-        let dirs: Vec<(AccountId, PathBuf)> = ids.iter().map(|id| (*id, self.store_dir(*id))).collect();
-        let packed = tokio::task::spawn_blocking(move || {
-            dirs.into_iter()
-                .filter(|(_, d)| stores::has_store(d))
-                .filter_map(|(id, d)| match stores::snapshot(&d) {
-                    Ok(p) => Some((id, p)),
-                    Err(e) => {
-                        tracing::warn!("could not snapshot store of {id}: {e:#}");
-                        None
+        let keeps_media = self.keeps_media();
+        let dirs: Vec<(AccountId, PathBuf, PathBuf)> = ids.iter().map(|id| (*id, self.store_dir(*id), self.cache_dir(*id))).collect();
+        let (packed, medias) = tokio::task::spawn_blocking(move || {
+            let mut packed = Vec::new();
+            let mut medias = Vec::new();
+            for (id, d, cache) in dirs.into_iter().filter(|(_, d, _)| stores::has_store(d)) {
+                match stores::snapshot(&d) {
+                    Ok(p) => packed.push((id, p)),
+                    Err(e) => tracing::warn!("could not snapshot store of {id}: {e:#}"),
+                }
+                if media && keeps_media {
+                    match stores::snapshot_media(&cache) {
+                        Ok(Some(m)) => medias.push((id, m)),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("could not snapshot the media cache of {id}: {e:#}"),
                     }
-                })
-                .collect::<Vec<_>>()
+                }
+            }
+            (packed, medias)
         })
         .await?;
         {
@@ -320,7 +360,20 @@ impl AccountManager {
                     changed = true;
                 }
             }
-            let keep: BTreeSet<String> = ov.profile.accounts.iter().map(|a| store_key(a.id)).collect();
+            for (id, m) in medias {
+                if ov.attachments.get(&media_key(id)) != Some(&m) {
+                    ov.attachments.insert(media_key(id), m);
+                    changed = true;
+                }
+            }
+            // Media copies stay only while the setting is on.
+            let keep: BTreeSet<String> = ov
+                .profile
+                .accounts
+                .iter()
+                .flat_map(|a| [Some(store_key(a.id)), keeps_media.then(|| media_key(a.id))])
+                .flatten()
+                .collect();
             let before = ov.attachments.len();
             ov.attachments.retain(|k, _| keep.contains(k));
             changed |= ov.attachments.len() != before;
@@ -540,7 +593,7 @@ impl AccountManager {
             let records = profile.accounts.clone();
             let mut migrated = false;
             for rec in &records {
-                match self.prepare_store(rec, attachments.get(&store_key(rec.id)).map(Vec::as_slice)) {
+                match self.prepare_store(rec, attachments.get(&store_key(rec.id)).map(Vec::as_slice), attachments.get(&media_key(rec.id)).map(Vec::as_slice)) {
                     Ok(m) => migrated |= m,
                     Err(e) => tracing::warn!("could not prepare store of {}: {e:#}", rec.user_id),
                 }
@@ -607,7 +660,7 @@ impl AccountManager {
         };
         drop(stopped);
         for v in &vaults {
-            if let Err(e) = self.persist(v).await {
+            if let Err(e) = self.persist_with(v, true).await {
                 tracing::warn!("could not save stores of vault: {e:#}");
             }
         }
@@ -1070,6 +1123,7 @@ impl AccountManager {
             let removed = match self.inner.write().await.vaults.get_mut(&vault) {
                 Some(ov) => {
                     let gone = ov.attachments.remove(&store_key(id)).is_some();
+                    ov.attachments.remove(&media_key(id));
                     if gone {
                         ov.version += 1;
                     }

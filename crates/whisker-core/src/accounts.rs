@@ -204,7 +204,6 @@ impl AccountManager {
 
     /// How many bytes the open accounts' media caches use now.
     pub async fn media_cache_used(&self) -> u64 {
-        use matrix_sdk_base::media::store::MediaStore;
         let mut total = 0u64;
         for c in self.live_clients().await {
             if let Ok(store) = c.media_store().lock().await
@@ -218,7 +217,6 @@ impl AccountManager {
 
     /// Empties the open accounts' media caches.
     pub async fn clear_media_cache(&self) {
-        use matrix_sdk_base::media::store::MediaStore;
         let limit = self.media_cache.load(std::sync::atomic::Ordering::Relaxed);
         for c in self.live_clients().await {
             // A limit of nothing drops everything; then the real one again.

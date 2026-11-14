@@ -4789,6 +4789,7 @@ impl Ctl {
         }
         let px = self.avatars.clone();
         let general = id == "general";
+        let shown_account = account_data.as_ref().map(|(a, _, _)| a.id);
         self.ui(move |u| {
             let nav: Vec<NavItem> = ui::with(|m| {
                 nav.iter()
@@ -4844,8 +4845,8 @@ impl Ctl {
             u.set_settings_message(s(""));
             u.set_screen(2);
         });
-        if let Some((a, _, _)) = &account_data {
-            self.load_devices(a.id);
+        if let Some(aid) = shown_account {
+            self.load_devices(aid);
         }
         if general {
             self.show_media_cache_used().await;

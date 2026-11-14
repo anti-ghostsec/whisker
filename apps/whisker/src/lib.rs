@@ -184,6 +184,10 @@ struct Ctl {
     /// How many times the app has been locked: work started before a lock
     /// compares it, and drops what it fetched if it has changed.
     locks: Arc<std::sync::atomic::AtomicU64>,
+    /// Woken by the ✕ next to "Downloading…": the downloads going on stop.
+    cancel: Arc<tokio::sync::Notify>,
+    /// Downloads going on that the ✕ can stop.
+    downloading: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn local(ts: MilliSecondsSinceUnixEpoch) -> Option<chrono::DateTime<chrono::Local>> {
@@ -3610,15 +3614,17 @@ impl Ctl {
         let progress = Arc::new(whisker_core::media_fetch::Progress::default());
         let watching = self.watch_progress(progress.clone(), |c, pct| c.status(format!("Downloading… {pct}%")));
         self.status("Downloading…");
-        let r = async {
-            let bytes = whisker_core::media_fetch::with_progress(progress, timeline::download_in(&client, &key.1, &media.source, None)).await?;
-            tokio::fs::write(&path, bytes).await?;
-            anyhow::Ok(())
-        }
-        .await;
+        let r = self
+            .cancellable(async {
+                let bytes = whisker_core::media_fetch::with_progress(progress, timeline::download_in(&client, &key.1, &media.source, None)).await?;
+                tokio::fs::write(&path, bytes).await?;
+                anyhow::Ok(())
+            })
+            .await;
         watching.abort();
         self.status(match r {
             Ok(()) => format!("Saved to {}", path.display()),
+            Err(e) if e.to_string() == "cancelled" => "Download cancelled.".to_owned(),
             Err(e) => format!("Couldn't save: {e:#}"),
         });
     }
@@ -3662,7 +3668,7 @@ impl Ctl {
             c.status(format!("Loading… {pct}%"));
             c.ui(move |u| u.global::<Player>().set_progress(pct));
         });
-        let r = async {
+        let r = self.cancellable(async {
             let bytes = whisker_core::media_fetch::with_progress(progress, timeline::download_in(&client, &key.1, &media.source, None)).await?;
             let Some(ext) = timeline::sniff_media(&bytes) else {
                 anyhow::bail!("it isn't a video or audio file Whisker knows (use Save to keep it)");
@@ -3672,7 +3678,7 @@ impl Ctl {
             tokio::fs::write(&path, bytes).await?;
             whisker_core::vault::owner_only(&path, false);
             anyhow::Ok(())
-        }
+        })
         .await;
         watching.abort();
         self.ui(|u| u.global::<Player>().set_progress(0));
@@ -3694,9 +3700,27 @@ impl Ctl {
             Err(e) => {
                 #[cfg(target_os = "linux")]
                 self.ui(|u| u.global::<Player>().set_loading(false));
-                self.status(format!("Couldn't open it: {e:#}"));
+                self.status(if e.to_string() == "cancelled" { "Download cancelled.".to_owned() } else { format!("Couldn't open it: {e:#}") });
             }
         }
+    }
+
+    /// Runs a download someone asked for, which the ✕ next to the status
+    /// line can stop ("cancelled").
+    async fn cancellable<T>(&self, fut: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+        use std::sync::atomic::Ordering;
+        let cancel = self.cancel.clone();
+        let stop = cancel.notified();
+        self.downloading.fetch_add(1, Ordering::SeqCst);
+        self.ui(|u| u.set_downloading(true));
+        let r = tokio::select! {
+            r = fut => r,
+            _ = stop => Err(anyhow::anyhow!("cancelled")),
+        };
+        if self.downloading.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.ui(|u| u.set_downloading(false));
+        }
+        r
     }
 
     /// Calls `show` with a download's percentage as it changes, until the
@@ -5698,6 +5722,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         avatar_tries: Arc::default(),
         loading: Arc::default(),
         locks: Arc::default(),
+        cancel: Arc::default(),
+        downloading: Arc::default(),
     };
 
     // Runs `method` on the tokio runtime with the callback's arguments.
@@ -5756,6 +5782,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_send, |t| send);
     on!(on_message_action, |a, id| message_action);
     on!(on_clear_messages, |n| clear_messages);
+    {
+        let c = ctl.clone();
+        ui.on_cancel_downloads(move || c.cancel.notify_waiters());
+    }
     #[cfg(target_os = "linux")]
     {
         let c = ctl.clone();

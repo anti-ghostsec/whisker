@@ -38,15 +38,15 @@ use std::time::{Duration, Instant};
 
 /// Longest wait for a server to start answering.
 const ANSWER: Duration = Duration::from_secs(30);
-/// The same for a download someone asked for and is watching (saving or
-/// playing a file, see [`with_progress`]). A server with a big file from
-/// another server first fetches all of it, and only then starts answering:
-/// minutes, for hundreds of MB.
-const ANSWER_ASKED: Duration = Duration::from_secs(20 * 60);
+/// A download someone asked for and is watching (saving or playing a file,
+/// see [`with_progress`]) waits as long as it takes: a server with a big
+/// file from another server first fetches all of it, and only then starts
+/// answering (minutes, for hundreds of MB). It can be cancelled instead.
+const ANSWER_ASKED: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// Longest wait between two pieces of a file.
 const STALL: Duration = Duration::from_secs(30);
 /// Longest a whole download may take.
-const WHOLE: Duration = Duration::from_secs(2 * 60 * 60);
+const WHOLE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// Biggest file taken in memory.
 const MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
 

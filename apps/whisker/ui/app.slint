@@ -1250,6 +1250,9 @@ export component AppWindow inherits Window {
     in-out property <string> error;
     in-out property <bool> busy;
     in-out property <string> status;
+    // A download someone asked for is going on (the ✕ by the status stops it).
+    in-out property <bool> downloading;
+    callback cancel-downloads();
 
     in property <[AccountItem]> accounts;
     in property <[string]> tags;
@@ -2339,7 +2342,10 @@ export component AppWindow inherits Window {
                     padding-left: 16px;
                     padding-right: 14px;
                     padding-bottom: 8px;
-                    Text { text: root.status; font-size: 11px; color: Theme.muted; wrap: char-wrap; }
+                    spacing: 6px;
+                    Text { text: root.status; font-size: 11px; color: Theme.muted; wrap: char-wrap; horizontal-stretch: 1; vertical-alignment: center; }
+                    // Stops the downloads going on.
+                    if root.downloading: IconBtn { icon: "✕"; size: 20px; clicked => { root.cancel-downloads(); } }
                 }
             }
         }

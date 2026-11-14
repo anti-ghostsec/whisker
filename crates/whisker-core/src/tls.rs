@@ -5,13 +5,28 @@
 //! kind of app (no Java code) doesn't have, and without them the first
 //! secure connection panicked: signing in hung forever. So on Android the
 //! certificates are checked in the app, against Mozilla's list of trusted
-//! authorities (the one Firefox uses), which is built in. Authorities a
-//! user added to the phone themself aren't trusted there.
+//! authorities (the one Firefox uses), which is built in, plus the ones
+//! the phone's user added themself (the app reads those from Android at
+//! start: see [`add_roots`]).
 
-/// Mozilla's trusted authorities, for [`matrix_sdk::ClientBuilder::add_root_certificates`].
+/// Authorities the user added to the phone themself (DER), trusted too.
+#[cfg(target_os = "android")]
+static EXTRA: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+/// Trusts these authorities as well (the ones added to the phone by its
+/// user), for connections made from now on.
+#[cfg(target_os = "android")]
+pub fn add_roots(der: Vec<Vec<u8>>) {
+    EXTRA.lock().unwrap().extend(der);
+}
+
+/// Mozilla's trusted authorities and the user's own, for
+/// [`matrix_sdk::ClientBuilder::add_root_certificates`].
 #[cfg(target_os = "android")]
 pub fn roots() -> Vec<reqwest::Certificate> {
-    webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().filter_map(|c| reqwest::Certificate::from_der(c.as_ref()).ok()).collect()
+    let mut out: Vec<reqwest::Certificate> = webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().filter_map(|c| reqwest::Certificate::from_der(c.as_ref()).ok()).collect();
+    out.extend(EXTRA.lock().unwrap().iter().filter_map(|c| reqwest::Certificate::from_der(c).ok()));
+    out
 }
 
 /// Starts an HTTP client that checks certificates the way that works here.

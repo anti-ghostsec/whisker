@@ -3,6 +3,10 @@
 android:
   manifest:
     package: io.github.antighostsec.whisker
+    # Android 8.0 and later: playing sound inside Whisker uses AAudio,
+    # which older versions don't have.
+    sdk:
+      min_sdk_version: 26
     uses_permission:
       - name: android.permission.INTERNET
       # Bringing the open Whisker to the front when something is shared to it.

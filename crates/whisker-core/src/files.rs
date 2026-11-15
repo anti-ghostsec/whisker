@@ -352,7 +352,7 @@ pub async fn send_linked(room: &Room, mxc: &MxcUri, file: &LinkedFile, details: 
     if let Some(r) = reply_to {
         content.relates_to = Some(Relation::Reply(Reply::new(InReplyTo::new(r.to_owned()))));
     }
-    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
+    let config = crate::timeline::send_config();
     Ok(room.send(content).with_request_config(config).await?.response.event_id)
 }
 
@@ -372,7 +372,7 @@ pub async fn share_file_of(from: &Room, event: &EventId, to: &Room, reply_to: Op
     if let Some(r) = reply_to {
         content.relates_to = Some(Relation::Reply(Reply::new(InReplyTo::new(r.to_owned()))));
     }
-    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
+    let config = crate::timeline::send_config();
     Ok(Some(to.send(content).with_request_config(config).await?.response.event_id))
 }
 

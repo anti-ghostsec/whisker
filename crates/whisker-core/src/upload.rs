@@ -801,6 +801,7 @@ pub async fn upload(
 /// Posts an uploaded file's message.
 pub async fn post(room: &Room, message: MessageType) -> Result<OwnedEventId> {
     let config = RequestConfig::default()
+        .timeout(Duration::from_secs(90))
         .retry_limit(6)
         .max_retry_time(Duration::from_secs(120));
     Ok(room
@@ -837,6 +838,7 @@ pub async fn post_reply(
         .await
         .map_err(|e| anyhow::anyhow!("couldn't build the reply: {e}"))?;
     let config = RequestConfig::default()
+        .timeout(Duration::from_secs(90))
         .retry_limit(6)
         .max_retry_time(Duration::from_secs(120));
     Ok(room

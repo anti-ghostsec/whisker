@@ -695,6 +695,11 @@ impl AccountManager {
             b = b.disable_built_in_root_certificates().add_root_certificates(crate::tls::roots());
         }
         b = b.homeserver_url(homeserver);
+        // Every request gets longer than the SDK's 30 seconds: in big
+        // encrypted rooms, the keys asked for before a message goes out can
+        // take that long to come on a slow connection, and were cut off
+        // halfway ("error decoding response body").
+        b = b.request_config(matrix_sdk::config::RequestConfig::default().timeout(std::time::Duration::from_secs(90)));
         let mut b = b.sqlite_store_with_cache_path(self.store_dir(id), self.cache_dir(id), Some(store_pass));
         if let Some(p) = proxy {
             b = b.proxy(p);

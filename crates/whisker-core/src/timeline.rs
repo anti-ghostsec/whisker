@@ -894,10 +894,48 @@ pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>, ment
     // The SDK retries failed requests forever by default; give up instead,
     // so the message isn't stuck at "Sending…" (retries reuse the
     // transaction id, so they can't post it twice).
-    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
-    let sent = room.send(content).with_request_config(config).await?;
+    let config = send_config();
+    // A connection that breaks while the server answers ("error decoding
+    // response body") is tried again a few times. The transaction id stays
+    // the same, so the server posts it once however many tries reach it.
+    let txn = matrix_sdk::ruma::TransactionId::new();
+    let mut tries = 0;
+    let sent = loop {
+        match room.send(content.clone()).with_transaction_id(txn.clone()).with_request_config(config).await {
+            Ok(sent) => break sent,
+            Err(e) if tries < 3 && is_network_error(&e) => {
+                tries += 1;
+                tracing::debug!("sending broke off ({e}); trying again");
+                tokio::time::sleep(std::time::Duration::from_secs(2 * tries)).await;
+            }
+            Err(e) => return Err(network_error(e)),
+        }
+    };
     tracing::debug!(room = %room.room_id(), ms = started.elapsed().as_millis() as u64, "message sent (incl. encryption setup)");
     Ok(sent.response.event_id)
+}
+
+/// How messages are sent: given time for a slow server or connection
+/// (the SDK's own 30 seconds cut answers off halfway: "error decoding
+/// response body"), and given up on in the end instead of retried forever
+/// (so a message isn't stuck at "Sending…").
+pub fn send_config() -> matrix_sdk::config::RequestConfig {
+    matrix_sdk::config::RequestConfig::default().timeout(std::time::Duration::from_secs(90)).retry_limit(3).max_retry_time(std::time::Duration::from_secs(60))
+}
+
+/// Whether sending failed on the way (the connection), not by the server
+/// saying no.
+fn is_network_error(e: &matrix_sdk::Error) -> bool {
+    matches!(e, matrix_sdk::Error::Http(h) if matches!(**h, matrix_sdk::HttpError::Reqwest(_)))
+}
+
+/// A connection failure in words people can act on.
+fn network_error(e: matrix_sdk::Error) -> anyhow::Error {
+    if is_network_error(&e) {
+        anyhow!("the connection to the server broke off ({e}); check the connection and send it again")
+    } else {
+        e.into()
+    }
 }
 
 /// `text` with the first use of each mentioned name made a Markdown link to
@@ -974,7 +1012,7 @@ pub async fn send_in_thread(room: &Room, root: &EventId, latest: &EventId, text:
     use matrix_sdk::ruma::events::relation::Thread;
     let mut content = RoomMessageEventContent::text_markdown(text);
     content.relates_to = Some(Relation::Thread(Thread::plain(root.to_owned(), latest.to_owned())));
-    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
+    let config = send_config();
     Ok(room.send(content).with_request_config(config).await?.response.event_id)
 }
 
@@ -1006,7 +1044,7 @@ pub async fn react(room: &Room, target: &EventId, key: &str) -> Result<OwnedEven
     use matrix_sdk::ruma::events::reaction::ReactionEventContent;
     use matrix_sdk::ruma::events::relation::Annotation;
     let content = ReactionEventContent::new(Annotation::new(target.to_owned(), key.to_owned()));
-    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
+    let config = send_config();
     Ok(room.send(content).with_request_config(config).await?.response.event_id)
 }
 
@@ -1035,7 +1073,7 @@ pub async fn forward(from: &Room, event_id: &EventId, to: &Room, edited_body: Op
             content
         }
     };
-    let config = matrix_sdk::config::RequestConfig::default().retry_limit(3).max_retry_time(std::time::Duration::from_secs(20));
+    let config = send_config();
     Ok(to.send(content).with_request_config(config).await?.response.event_id)
 }
 

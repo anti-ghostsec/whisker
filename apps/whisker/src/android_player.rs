@@ -466,12 +466,12 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start:
     let Some(track) = info.video else { return Outcome::Shown(0) };
     let Some(mut format) = ex.format(track) else { return Outcome::NoPictures("no video format".into()) };
     let kind = mime(&mut format);
+    let phones = || MediaCodec::from_decoder_type(&kind).map(|c| (c, format!("the phone's {kind} decoder")));
     let codec = match output {
-        Output::Reader => MediaCodec::from_decoder_type(&kind),
-        Output::Memory => software_decoders(&kind).iter().find_map(|n| MediaCodec::from_codec_name(n)).or_else(|| MediaCodec::from_decoder_type(&kind)),
+        Output::Reader => phones(),
+        Output::Memory => software_decoders(&kind).iter().find_map(|n| MediaCodec::from_codec_name(n).map(|c| (c, (*n).to_owned()))).or_else(phones),
     };
-    let Some(codec) = codec else { return Outcome::NoPictures(format!("no decoder for {kind}")) };
-    let name = codec.name().unwrap_or_else(|_| kind.clone());
+    let Some((codec, name)) = codec else { return Outcome::NoPictures(format!("no decoder for {kind}")) };
     let (w, h) = (info.width.max(2) as i32, info.height.max(2) as i32);
     let reader = match output {
         Output::Reader => match ImageReader::new(w, h, ImageFormat::YUV_420_888, 4) {

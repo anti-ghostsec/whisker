@@ -2128,7 +2128,7 @@ impl Ctl {
                 let r = match client.encryption().export_room_keys(path.clone(), &value, |_| true).await {
                     Ok(()) => {
                         whisker_core::vault::owner_only(&path, false);
-                        saved(&path, "text/plain").await
+                        finish_save(&path, "text/plain").await
                     }
                     Err(e) => Err(format!("{e:#}")),
                 };
@@ -3718,7 +3718,7 @@ impl Ctl {
             };
         }
         let _ = share;
-        self.status(match saved(&path, &mime).await {
+        self.status(match finish_save(&path, &mime).await {
             Ok(shown) => format!("Saved to {shown}"),
             Err(e) => format!("Couldn't save: {e}"),
         });
@@ -5280,7 +5280,7 @@ impl Ctl {
                 let name = format!("{}.{}", safe_file_name(&card.name), if png_out { "png" } else { "json" });
                 let Some(path) = save_file_as("Export character card", name).await else { return };
                 let r = match tokio::fs::write(&path, bytes).await {
-                    Ok(()) => saved(&path, if png_out { "image/png" } else { "application/json" }).await,
+                    Ok(()) => finish_save(&path, if png_out { "image/png" } else { "application/json" }).await,
                     Err(e) => Err(e.to_string()),
                 };
                 self.settings_msg(match r {
@@ -5641,10 +5641,10 @@ async fn pick_path(title: &'static str) -> Option<PathBuf> {
     pick_paths(title, &[], false).await.into_iter().next()
 }
 
-/// Asks where to save a file. Write it there, then call [`saved`].
+/// Asks where to save a file. Write it there, then call [`finish_save`].
 ///
 /// No save dialog on Android (it needs Java): the file is written to
-/// Whisker's own folder first, and [`saved`] moves it to the phone's
+/// Whisker's own folder first, and [`finish_save`] moves it to the phone's
 /// Download/Whisker folder, where the Files app and other apps see it.
 async fn save_file_as(title: &'static str, name: String) -> Option<PathBuf> {
     #[cfg(not(target_os = "android"))]
@@ -5665,12 +5665,12 @@ async fn save_file_as(title: &'static str, name: String) -> Option<PathBuf> {
 /// Finishes saving what was written to [`save_file_as`]'s path: where it
 /// is now, for people. On Android it moves to the Download folder.
 #[cfg(not(target_os = "android"))]
-async fn saved(path: &std::path::Path, _mime: &str) -> Result<String, String> {
+async fn finish_save(path: &std::path::Path, _mime: &str) -> Result<String, String> {
     Ok(path.display().to_string())
 }
 
 #[cfg(target_os = "android")]
-async fn saved(path: &std::path::Path, mime: &str) -> Result<String, String> {
+async fn finish_save(path: &std::path::Path, mime: &str) -> Result<String, String> {
     saved_android(path, mime).await.map(|s| s.shown)
 }
 

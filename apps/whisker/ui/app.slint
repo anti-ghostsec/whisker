@@ -3284,7 +3284,7 @@ export component AppWindow inherits Window {
             if root.forward-accounts.length > 1: Text { text: "Send it as:"; color: Theme.muted; font-size: 12px; }
             if root.forward-accounts.length > 1: Flickable {
                 height: 40px;
-                viewport-width: max(self.width, facc.preferred-width);
+                content-width: max(self.width, facc.preferred-width);
                 facc := HorizontalLayout {
                     spacing: 6px;
                     for a in root.forward-accounts: Rectangle {

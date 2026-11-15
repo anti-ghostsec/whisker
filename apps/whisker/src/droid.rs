@@ -106,6 +106,15 @@ pub fn request_media_access() {
     });
 }
 
+/// Puts Whisker in the background, as Home does (Back with nothing open):
+/// it keeps running and stays unlocked, where closing it would lock it.
+pub fn to_background() {
+    with_env(|env, activity| {
+        env.call_method(activity, "moveTaskToBack", "(Z)Z", &[JValue::Bool(1)])?;
+        Ok(())
+    });
+}
+
 /// Whether the user let Whisker see every file (Android 11 and later):
 /// documents and key files too, not just photos, videos and music.
 pub fn has_all_files() -> bool {

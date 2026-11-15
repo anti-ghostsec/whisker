@@ -5810,6 +5810,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_rich_text(prefs.rich_text);
     #[cfg(target_os = "android")]
     ui.global::<Prefs>().set_touch(true);
+    #[cfg(target_os = "android")]
+    ui.on_to_background(droid::to_background);
     ui.global::<Prefs>().set_show_events(prefs.show_events);
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_key_sharing(prefs.key_sharing.clamp(0, 2));

@@ -18,9 +18,17 @@ android:
       - name: android.permission.READ_MEDIA_VIDEO
       - name: android.permission.READ_MEDIA_AUDIO
       - name: android.permission.READ_EXTERNAL_STORAGE
+      # Saving to Download on Android 8 and 9 (later ones save through the
+      # media store, which needs no permission).
+      - name: android.permission.WRITE_EXTERNAL_STORAGE
+        max_sdk_version: 29
       - name: android.permission.MANAGE_EXTERNAL_STORAGE
     application:
       label: Whisker
+      # Android 10 hides the phone's folders from apps unless they ask for
+      # the older way (later versions show them again). Not in xbuild
+      # itself: the build adds it (see .github/workflows).
+      request_legacy_external_storage: true
       activities:
         # Whisker shows up in other apps' Share menus, for any files or text.
         - intent_filters:

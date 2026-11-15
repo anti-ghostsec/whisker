@@ -146,8 +146,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # xbuild, with one manifest setting it doesn't know yet:
+      # requestLegacyExternalStorage (Android 10 shows the phone's folders
+      # only to apps that ask for it).
       - name: Install xbuild
-        run: cargo install --git https://github.com/rust-mobile/xbuild.git --rev e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1 --locked xbuild
+        run: |
+          git clone --quiet https://github.com/rust-mobile/xbuild.git "$RUNNER_TEMP/xbuild"
+          cd "$RUNNER_TEMP/xbuild"
+          git checkout --quiet e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
+          python3 - <<'EOF'
+          p = "apk/src/manifest.rs"
+          t = open(p).read()
+          old = "    pub app_component_factory: Option<String>,\n"
+          assert t.count(old) == 1
+          t = t.replace(old, old + '    #[serde(rename(serialize = "android:requestLegacyExternalStorage"))]\n    pub request_legacy_external_storage: Option<bool>,\n')
+          open(p, "w").write(t)
+          EOF
+          cargo install --path xbuild --locked
 
       - name: Build
         env:

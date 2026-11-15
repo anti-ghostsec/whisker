@@ -53,7 +53,7 @@ const ROWS_STEP: usize = 15;
 const AVATAR_PX: u32 = 96;
 /// Animated pictures bigger than this show still (playing them means
 /// downloading and decoding every frame).
-const MAX_ANIMATION_BYTES: u64 = 12 * 1024 * 1024;
+const MAX_ANIMATION_BYTES: u64 = 20 * 1024 * 1024;
 /// Biggest linked picture fetched to learn its size before sending.
 const MAX_LINKED_PICTURE_BYTES: u64 = 50 * 1024 * 1024;
 /// Biggest video without a poster frame that's fetched to make one.
@@ -86,6 +86,8 @@ struct State {
     reactions: HashMap<RoomKey, Vec<timeline::Reaction>>,
     /// The message the "Forward to…" dialog is for.
     forwarding: Option<(RoomKey, OwnedEventId)>,
+    /// The account that sends it (any signed-in one).
+    forward_account: Option<AccountId>,
     /// Files and text shared from other apps, not sent yet, and the account
     /// picked to send them.
     sharing: Vec<share::Shared>,
@@ -323,7 +325,11 @@ fn preview_attempts(media: &timeline::Media) -> Vec<Attempt> {
     let mut out = Vec::new();
     match media.kind {
         MediaKind::Image => {
-            let animated = matches!(media.mime.as_deref(), Some("image/gif" | "image/webp")) && fits(MAX_ANIMATION_BYTES);
+            // Some apps send GIFs without saying so (no type, or a general
+            // one): the name tells.
+            let name = media.name.to_lowercase();
+            let maybe_animated = matches!(media.mime.as_deref(), Some("image/gif" | "image/webp")) || name.ends_with(".gif") || name.ends_with(".webp");
+            let animated = maybe_animated && fits(MAX_ANIMATION_BYTES);
             if animated {
                 out.push((media.source.clone(), None, Preview::Animated));
             }
@@ -620,6 +626,9 @@ impl Ctl {
                     // Each way in turn: another server may not make thumbnails,
                     // or send one we can't read.
                     let (mut decoded, mut failed) = ((None, None), false);
+                    // The whole GIF couldn't be fetched (a busy server), so a
+                    // still preview stands in: it's fetched again later.
+                    let mut animation_missed = None;
                     for (src, thumb, what) in attempts {
                         if let (Preview::Remote, MediaSource::Plain(mxc)) = (what, &src) {
                             let poster = files::look_at_video(&client, mxc, true).await.and_then(|(_, p)| p);
@@ -653,6 +662,9 @@ impl Ctl {
                                     "couldn't fetch a preview of {id} ({}): {e:#}",
                                     media_address(&src)
                                 );
+                                if what == Preview::Animated {
+                                    animation_missed = Some(src.clone());
+                                }
                             }
                         }
                     }
@@ -691,8 +703,33 @@ impl Ctl {
                         }
                     }
                     c.loading.lock().unwrap().remove(id.as_str());
-                    c.update_message(&(account, room), &id);
+                    c.update_message(&(account, room.clone()), &id);
+                    if let Some(src) = animation_missed.filter(|_| c.st.lock().unwrap().pictures.get(&id).is_some_and(Option::is_some)) {
+                        c.fetch_animation_later((account, room), id, src);
+                    }
                 });
+            }
+        });
+    }
+
+    /// Fetches a GIF or WebP whose still preview stands in for it, a few
+    /// times with longer waits, and plays it once it's in.
+    fn fetch_animation_later(&self, key: RoomKey, id: OwnedEventId, src: MediaSource) {
+        let c = self.clone();
+        self.spawn(async move {
+            for tries in 0..PREVIEW_TRIES {
+                tokio::time::sleep(Duration::from_secs((10 * 3u64.pow(u32::from(tries))).min(300))).await;
+                let Some(client) = c.mgr.client(key.0).await else { return };
+                let got = {
+                    let _slot = PREVIEW_SLOTS.acquire().await;
+                    timeline::download_in(&client, &key.1, &src, None).await
+                };
+                let Ok(b) = got else { continue };
+                if let Ok(Some(f)) = tokio::task::spawn_blocking(move || ui::decode_frames(&b, 720, 600)).await {
+                    c.st.lock().unwrap().animations.insert(id.clone(), f);
+                    c.update_message(&key, &id);
+                }
+                return;
             }
         });
     }
@@ -2084,16 +2121,20 @@ impl Ctl {
                 }
                 let Some(path) = save_file_as("Export room keys", "whisker-keys.txt".into()).await else {
                     #[cfg(target_os = "android")]
-                    self.settings_msg("Couldn't export keys: the phone's Download folder can't be written to (Android 10 and older need it allowed).");
+                    self.settings_msg("Couldn't export keys: Whisker's own folder can't be written to.");
                     return;
                 };
                 self.settings_msg("Exporting keys…");
-                self.settings_msg(match client.encryption().export_room_keys(path.clone(), &value, |_| true).await {
+                let r = match client.encryption().export_room_keys(path.clone(), &value, |_| true).await {
                     Ok(()) => {
                         whisker_core::vault::owner_only(&path, false);
-                        format!("Keys exported to {}. Keep the file and its passphrase safe: together they unlock your messages.", path.display())
+                        saved(&path, "text/plain").await
                     }
-                    Err(e) => format!("Couldn't export keys: {e:#}"),
+                    Err(e) => Err(format!("{e:#}")),
+                };
+                self.settings_msg(match r {
+                    Ok(shown) => format!("Keys exported to {shown}. Keep the file and its passphrase safe: together they unlock your messages."),
+                    Err(e) => format!("Couldn't export keys: {e}"),
                 });
                 return;
             }
@@ -3147,7 +3188,8 @@ impl Ctl {
             "profile" if m.notice && m.event_id.as_str().starts_with("$whisker-") => {}
             // A join, leave, kick…: the person it's about, not who did it.
             "profile" => self.open_profile(&key, m.member.as_ref().map_or_else(|| m.sender.clone(), |c| c.user.clone())).await,
-            "save" => self.save_media(&key, m).await,
+            "save" => self.save_media(&key, m, false).await,
+            "share" => self.save_media(&key, m, true).await,
             "save-sticker" => {
                 let Some(media) = m.media.clone() else { return };
                 let stem = media.name.rsplit_once('.').map_or(media.name.as_str(), |(a, _)| a).to_owned();
@@ -3214,8 +3256,22 @@ impl Ctl {
 
     /// Opens "Forward to…" for a message, listing the account's rooms.
     async fn open_forward(&self, key: RoomKey, event_id: OwnedEventId) {
-        self.st.lock().unwrap().forwarding = Some((key, event_id));
-        self.ui(|u| {
+        let account = key.0;
+        {
+            let mut st = self.st.lock().unwrap();
+            st.forwarding = Some((key, event_id));
+            st.forward_account = Some(account);
+        }
+        let accounts = self.mgr.accounts().await;
+        for a in &accounts {
+            if let Some(m) = &a.avatar {
+                self.fetch_avatars(a.id, [m.clone()]);
+            }
+        }
+        let px = self.avatars.clone();
+        self.ui(move |u| {
+            u.set_forward_accounts(ModelRc::new(VecModel::from(account_items(&accounts, &px))));
+            u.set_forward_account(s(account.to_string()));
             u.set_forward_query(s(""));
             u.set_forward_status(s(""));
             u.set_forward_open(true);
@@ -3223,11 +3279,49 @@ impl Ctl {
         self.forward_search(String::new()).await;
     }
 
-    async fn forward_search(&self, q: String) {
-        let Some(((account, _), _)) = self.st.lock().unwrap().forwarding.clone() else { return };
-        self.room_choices(account, q).await;
+    /// Forwarding from another of the signed-in accounts.
+    async fn forward_pick_account(&self, id: String) {
+        let Ok(id) = id.parse::<AccountId>() else { return };
+        self.st.lock().unwrap().forward_account = Some(id);
+        self.ui(move |u| {
+            u.set_forward_account(s(id.to_string()));
+            u.set_forward_query(s(""));
+            u.set_forward_status(s(""));
+        });
+        self.forward_search(String::new()).await;
     }
 
+    async fn forward_search(&self, q: String) {
+        let Some(account) = self.st.lock().unwrap().forward_account else { return };
+        self.room_choices(account, q).await;
+    }
+}
+
+/// Accounts as rows for picking one (UI thread only).
+fn account_items(accounts: &[AccountSummary], px: &ui::PixelCache) -> Vec<AccountItem> {
+    ui::with(|m| {
+        accounts
+            .iter()
+            .map(|a| {
+                let (initial, hue) = initial_hue(&a.display_name);
+                AccountItem {
+                    id: s(a.id.to_string()),
+                    name: s(&a.display_name),
+                    user_id: s(&a.user_id),
+                    tags: s(""),
+                    is_agent: a.kind == AccountKind::Agent,
+                    initial,
+                    hue,
+                    avatar: m.avatar(&a.avatar, px),
+                    unread: 0,
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+impl Ctl {
     /// Fills the room list the Forward and Share dialogs pick from: the
     /// account's rooms whose name has `q`. Returns how many there are.
     async fn room_choices(&self, account: AccountId, q: String) -> usize {
@@ -3252,9 +3346,18 @@ impl Ctl {
     }
 
     async fn forward_to(&self, target: String) {
-        let Some(((account, from_id), event_id)) = self.st.lock().unwrap().forwarding.clone() else { return };
+        let (Some(((account, from_id), event_id)), Some(sender)) = ({
+            let st = self.st.lock().unwrap();
+            (st.forwarding.clone(), st.forward_account)
+        }) else {
+            return;
+        };
         let Some(client) = self.mgr.client(account).await else { return };
-        let (Some(from), Some(to)) = (client.get_room(&from_id), OwnedRoomId::try_from(target.as_str()).ok().and_then(|id| client.get_room(&id))) else { return };
+        // Sent by another account: the message is read with its own account
+        // and sent with the other (files keep working: their address, and for
+        // encrypted ones the key, travel in the message).
+        let Some(sending) = self.mgr.client(sender).await else { return };
+        let (Some(from), Some(to)) = (client.get_room(&from_id), OwnedRoomId::try_from(target.as_str()).ok().and_then(|id| sending.get_room(&id))) else { return };
         // An edited text message goes as its newest text.
         let edited = self.find(&(account, from_id.clone()), event_id.as_str()).filter(|m| m.edited && m.media.is_none()).map(|m| m.body);
         let mark = |sent: bool, id: String| {
@@ -3574,12 +3677,15 @@ impl Ctl {
         self.ui(move |u| u.set_emoji_rows(emoji_rows(&found)));
     }
 
-    async fn save_media(&self, key: &RoomKey, m: HistoryItem) {
+    /// Saves a message's file; with `share` (phones) it then goes to the
+    /// Share menu, to send to another app.
+    async fn save_media(&self, key: &RoomKey, m: HistoryItem, share: bool) {
         let Some(media) = m.media else { return };
         let name = timeline::plain_name(&media.name).replace(['/', '\\'], "_");
+        let mime = media.mime.clone().filter(|m| m.contains('/')).unwrap_or_else(|| "application/octet-stream".to_owned());
         let Some(path) = save_file_as("Save file", name).await else {
             #[cfg(target_os = "android")]
-            self.status("Couldn't save: the phone's Download folder can't be written to (Android 10 and older need it allowed).");
+            self.status("Couldn't save: Whisker's own folder can't be written to.");
             return;
         };
         let Some(client) = self.mgr.client(key.0).await else { return };
@@ -3594,10 +3700,27 @@ impl Ctl {
             })
             .await;
         watching.abort();
-        self.status(match r {
-            Ok(()) => format!("Saved to {}", path.display()),
-            Err(e) if e.to_string() == "cancelled" => "Download cancelled.".to_owned(),
-            Err(e) => format!("Couldn't save: {e:#}"),
+        if let Err(e) = r {
+            #[cfg(target_os = "android")]
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return self.status(if e.to_string() == "cancelled" { "Download cancelled.".to_owned() } else { format!("Couldn't save: {e:#}") });
+        }
+        #[cfg(target_os = "android")]
+        if share {
+            return match saved_android(&path, &mime).await {
+                Ok(f) => {
+                    let opened = droid::share(&f, &mime);
+                    self.status(if opened { format!("Saved to {}.", f.shown) } else { format!("Saved to {}, but the Share menu couldn't be opened.", f.shown) });
+                }
+                Err(e) => self.status(format!("Couldn't save: {e}")),
+            };
+        }
+        let _ = share;
+        self.status(match saved(&path, &mime).await {
+            Ok(shown) => format!("Saved to {shown}"),
+            Err(e) => format!("Couldn't save: {e}"),
         });
     }
 
@@ -3756,7 +3879,23 @@ impl Ctl {
         watching.abort();
         self.ui(|u| u.set_viewer_percent(0));
         let decoded = match got {
-            Ok(b) => tokio::task::spawn_blocking(move || (decode(&b, 2560, 2560, false), ui::decode_frames(&b, 1600, 1200))).await.unwrap_or((None, None)),
+            Ok(b) => {
+                // A GIF whose message shows it still (it couldn't be fetched
+                // before): the message plays it too from now on.
+                let small = !self.st.lock().unwrap().animations.contains_key(&m.event_id);
+                let r = tokio::task::spawn_blocking(move || {
+                    let big = ui::decode_frames(&b, 1600, 1200);
+                    let small = if small && big.is_some() { ui::decode_frames(&b, 720, 600) } else { None };
+                    (decode(&b, 2560, 2560, false), big, small)
+                })
+                .await
+                .unwrap_or((None, None, None));
+                if let Some(f) = r.2 {
+                    self.st.lock().unwrap().animations.insert(m.event_id.clone(), f);
+                    self.update_message(key, &m.event_id);
+                }
+                (r.0, r.1)
+            }
             Err(_) => (None, None),
         };
         match decoded.0 {
@@ -5140,8 +5279,12 @@ impl Ctl {
                 };
                 let name = format!("{}.{}", safe_file_name(&card.name), if png_out { "png" } else { "json" });
                 let Some(path) = save_file_as("Export character card", name).await else { return };
-                self.settings_msg(match tokio::fs::write(&path, bytes).await {
-                    Ok(()) => format!("Exported to {}", path.display()),
+                let r = match tokio::fs::write(&path, bytes).await {
+                    Ok(()) => saved(&path, if png_out { "image/png" } else { "application/json" }).await,
+                    Err(e) => Err(e.to_string()),
+                };
+                self.settings_msg(match r {
+                    Ok(shown) => format!("Exported to {shown}"),
                     Err(e) => format!("Couldn't export: {e}"),
                 });
             }
@@ -5498,35 +5641,51 @@ async fn pick_path(title: &'static str) -> Option<PathBuf> {
     pick_paths(title, &[], false).await.into_iter().next()
 }
 
-/// Asks where to save a file (desktop only).
+/// Asks where to save a file. Write it there, then call [`saved`].
+///
+/// No save dialog on Android (it needs Java): the file is written to
+/// Whisker's own folder first, and [`saved`] moves it to the phone's
+/// Download/Whisker folder, where the Files app and other apps see it.
 async fn save_file_as(title: &'static str, name: String) -> Option<PathBuf> {
     #[cfg(not(target_os = "android"))]
     {
         tokio::task::spawn_blocking(move || rfd::FileDialog::new().set_title(title).set_file_name(name).save_file()).await.ok().flatten()
     }
-    // No save dialog on Android (it needs Java): files go to the phone's
-    // Download folder, in Whisker, where the Files app and other apps see
-    // them. Android 11 and later let apps write there without asking.
     #[cfg(target_os = "android")]
     {
         let _ = title;
-        android_download_path(&name)
+        let name = name.replace(['/', '\\'], "_");
+        let name = if name.trim().is_empty() { "file".to_owned() } else { name };
+        let dir = droid::staging_dir()?.join(&whisker_core::vault::random_secret()[..12]);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(name))
     }
 }
 
-/// A free name for `name` in the phone's Download/Whisker folder ("a.mp4",
-/// else "a (2).mp4"…), or `None` when that folder can't be made.
+/// Finishes saving what was written to [`save_file_as`]'s path: where it
+/// is now, for people. On Android it moves to the Download folder.
+#[cfg(not(target_os = "android"))]
+async fn saved(path: &std::path::Path, _mime: &str) -> Result<String, String> {
+    Ok(path.display().to_string())
+}
+
 #[cfg(target_os = "android")]
-fn android_download_path(name: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from("/storage/emulated/0/Download/Whisker");
-    std::fs::create_dir_all(&dir).ok()?;
-    let name = name.replace(['/', '\\'], "_");
-    let name = if name.trim().is_empty() { "file".to_owned() } else { name };
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((a, b)) if !a.is_empty() => (a.to_owned(), format!(".{b}")),
-        _ => (name.clone(), String::new()),
-    };
-    (1..1000).map(|n| if n == 1 { dir.join(&name) } else { dir.join(format!("{stem} ({n}){ext}")) }).find(|p| !p.exists())
+async fn saved(path: &std::path::Path, mime: &str) -> Result<String, String> {
+    saved_android(path, mime).await.map(|s| s.shown)
+}
+
+#[cfg(target_os = "android")]
+async fn saved_android(path: &std::path::Path, mime: &str) -> Result<droid::Saved, String> {
+    let (path, mime) = (path.to_owned(), mime.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let r = droid::publish(&path, &mime);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+        r
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 /// Any picture, as PNG bytes.
@@ -5808,6 +5967,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_room_avatar, |a| room_avatar);
     on!(on_forward_search, |q| forward_search);
     on!(on_forward_to, |id| forward_to);
+    on!(on_forward_pick_account, |id| forward_pick_account);
     {
         let c = ctl.clone();
         ui.on_emoji_search(move |q| c.emoji_search(q.to_string()));

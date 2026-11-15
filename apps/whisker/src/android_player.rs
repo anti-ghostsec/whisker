@@ -360,29 +360,160 @@ fn wait_until(start: Instant, due: f64, generation: u64) -> bool {
     }
 }
 
+/// How long a decoder drawing to the image reader may go without a
+/// picture before the software decoder (into memory) is tried instead.
+const NO_PICTURE_GIVE_UP: Duration = Duration::from_secs(4);
+
+/// Where the decoder puts its pictures.
+#[derive(Clone, Copy, PartialEq)]
+enum Output {
+    /// The phone's decoder (in hardware where it can) drawing into an image
+    /// reader: the usual way, and quick.
+    Reader,
+    /// A software decoder writing into memory, which Whisker reads itself:
+    /// for phones whose decoder never hands the reader a picture.
+    Memory,
+}
+
+enum Outcome {
+    Shown(u64),
+    /// Nothing came out to show (see [`Output::Memory`]).
+    NoPictures(String),
+}
+
 /// Decodes the picture from `at` and draws it, paced to real time from
 /// `start`. Returns how many frames it showed.
 fn play_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start: Instant, max: (u32, u32), generation: u64) -> u64 {
-    let Some(ex) = Extractor::open(path) else { return 0 };
-    let Some(track) = info.video else { return 0 };
-    let Some(mut format) = ex.format(track) else { return 0 };
-    let Some(codec) = MediaCodec::from_decoder_type(&mime(&mut format)) else { return 0 };
-    let (w, h) = (info.width.max(2) as i32, info.height.max(2) as i32);
-    let Ok(reader) = ImageReader::new(w, h, ImageFormat::YUV_420_888, 4) else { return 0 };
-    let Ok(window) = reader.window() else { return 0 };
-    if codec.configure(&format, Some(&window), MediaCodecDirection::Decoder).is_err() || codec.start().is_err() {
+    let why = match decode_picture(ui, path, info, at, start, max, generation, Output::Reader) {
+        Outcome::Shown(n) => return n,
+        Outcome::NoPictures(why) => why,
+    };
+    if !current(generation) {
         return 0;
+    }
+    tracing::warn!("no pictures from the phone's video decoder ({why}); trying the software one");
+    // Started late: it catches up from where it is now.
+    let start = Instant::now() + Duration::from_millis(100);
+    match decode_picture(ui, path, info, at, start, max, generation, Output::Memory) {
+        Outcome::Shown(n) => n,
+        Outcome::NoPictures(why2) => {
+            if current(generation) {
+                let msg = format!("This phone couldn't show that video ({why}; {why2}). Hold it and choose Share to open it in another app.");
+                let _ = ui.upgrade_in_event_loop(move |u| u.set_status(msg.into()));
+            }
+            0
+        }
+    }
+}
+
+/// Software decoders Android itself carries, by format (newer names first).
+fn software_decoders(mime: &str) -> &'static [&'static str] {
+    match mime {
+        "video/avc" => &["c2.android.avc.decoder", "OMX.google.h264.decoder"],
+        "video/hevc" => &["c2.android.hevc.decoder", "OMX.google.hevc.decoder"],
+        "video/x-vnd.on2.vp8" => &["c2.android.vp8.decoder", "OMX.google.vp8.decoder"],
+        "video/x-vnd.on2.vp9" => &["c2.android.vp9.decoder", "OMX.google.vp9.decoder"],
+        "video/av01" => &["c2.android.av1.decoder"],
+        "video/mp4v-es" => &["c2.android.mpeg4.decoder", "OMX.google.mpeg4.decoder"],
+        "video/3gpp" => &["c2.android.h263.decoder", "OMX.google.h263.decoder"],
+        _ => &[],
+    }
+}
+
+/// How a decoder lays a picture out in memory ([`Output::Memory`]).
+#[derive(Clone, Copy)]
+struct Layout {
+    stride: usize,
+    slice: usize,
+    /// U and V interleaved (NV12), not one after the other (I420).
+    interleaved: bool,
+    crop: (u32, u32, u32, u32),
+}
+
+impl Layout {
+    fn of(f: &mut MediaFormat, w: u32, h: u32) -> Self {
+        let w2 = f.i32("width").filter(|v| *v > 0).map_or(w, |v| v as u32);
+        let h2 = f.i32("height").filter(|v| *v > 0).map_or(h, |v| v as u32);
+        let stride = f.i32("stride").filter(|v| *v as u32 >= w2).map_or(w2, |v| v as u32) as usize;
+        let slice = f.i32("slice-height").filter(|v| *v as u32 >= h2).map_or(h2, |v| v as u32) as usize;
+        // 21: NV12, 39: packed NV12, and vendors' own (0x7FA3…) are NV12-like;
+        // 19 and 0x7F420888 (flexible) come as I420 from software decoders.
+        let color = f.i32("color-format").unwrap_or(19);
+        let interleaved = matches!(color, 21 | 39) || (color as u32 & 0xFFFF_0000) == 0x7FA3_0000;
+        let left = f.i32("crop-left").unwrap_or(0).max(0) as u32;
+        let top = f.i32("crop-top").unwrap_or(0).max(0) as u32;
+        let right = f.i32("crop-right").map_or(w2, |v| (v + 1).max(0) as u32).min(w2);
+        let bottom = f.i32("crop-bottom").map_or(h2, |v| (v + 1).max(0) as u32).min(h2);
+        let crop = if right > left && bottom > top { (left, top, right, bottom) } else { (0, 0, w2, h2) };
+        Self { stride, slice, interleaved, crop }
+    }
+
+    fn planes<'a>(&self, data: &'a [u8]) -> Planes<'a> {
+        let at = |n: usize| data.get(n..).unwrap_or_default();
+        let luma = self.stride * self.slice;
+        if self.interleaved {
+            Planes { y: data, u: at(luma), v: at(luma + 1), y_row: self.stride, uv_row: self.stride, uv_pixel: 2 }
+        } else {
+            let half = self.stride.div_ceil(2);
+            Planes { y: data, u: at(luma), v: at(luma + half * self.slice.div_ceil(2)), y_row: self.stride, uv_row: half, uv_pixel: 1 }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start: Instant, max: (u32, u32), generation: u64, output: Output) -> Outcome {
+    let Some(ex) = Extractor::open(path) else { return Outcome::NoPictures("the file can't be read".into()) };
+    let Some(track) = info.video else { return Outcome::Shown(0) };
+    let Some(mut format) = ex.format(track) else { return Outcome::NoPictures("no video format".into()) };
+    let kind = mime(&mut format);
+    let codec = match output {
+        Output::Reader => MediaCodec::from_decoder_type(&kind),
+        Output::Memory => software_decoders(&kind).iter().find_map(|n| MediaCodec::from_codec_name(n)).or_else(|| MediaCodec::from_decoder_type(&kind)),
+    };
+    let Some(codec) = codec else { return Outcome::NoPictures(format!("no decoder for {kind}")) };
+    let name = codec.name().unwrap_or_else(|_| kind.clone());
+    let (w, h) = (info.width.max(2) as i32, info.height.max(2) as i32);
+    let reader = match output {
+        Output::Reader => match ImageReader::new(w, h, ImageFormat::YUV_420_888, 4) {
+            Ok(r) => Some(r),
+            Err(e) => return Outcome::NoPictures(format!("image reader: {e:?}")),
+        },
+        Output::Memory => None,
+    };
+    let window = match &reader {
+        Some(r) => match r.window() {
+            Ok(win) => Some(win),
+            Err(e) => return Outcome::NoPictures(format!("image reader window: {e:?}")),
+        },
+        None => None,
+    };
+    if let Err(e) = codec.configure(&format, window.as_ref(), MediaCodecDirection::Decoder) {
+        return Outcome::NoPictures(format!("{name} wouldn't take it: {e:?}"));
+    }
+    if let Err(e) = codec.start() {
+        return Outcome::NoPictures(format!("{name} wouldn't start: {e:?}"));
     }
     ex.select(track);
     let at_us = (at * 1e6) as i64;
     ex.seek(at_us);
     let size = frame_size(info, max);
+    let mut layout = Layout::of(&mut format, info.width, info.height);
     let mut buf = Vec::new();
     let mut more = true;
     let mut shown = 0u64;
+    let mut rendered = 0u64;
+    let mut outputs = 0u64;
     let mut last_drawn = f64::NEG_INFINITY;
+    let began = Instant::now();
+    let mut outcome = None;
     loop {
         if !current(generation) {
+            break;
+        }
+        // Nothing out of the decoder, or pictures that can't be read: give
+        // up on this way. (Frames before a seek point are only skipped.)
+        if shown == 0 && (rendered > 0 || outputs == 0) && began.elapsed() > NO_PICTURE_GIVE_UP {
+            outcome = Some(Outcome::NoPictures(if rendered == 0 { format!("{name} made no pictures") } else { format!("{name} drew {rendered} pictures Whisker couldn't read") }));
             break;
         }
         if more {
@@ -390,9 +521,19 @@ fn play_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start: I
         }
         let out = match codec.dequeue_output_buffer(Duration::from_millis(10)) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(out)) => out,
+            Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
+                layout = Layout::of(&mut codec.output_format(), info.width, info.height);
+                continue;
+            }
             Ok(_) => continue,
-            Err(_) => break,
+            Err(e) => {
+                if shown == 0 {
+                    outcome = Some(Outcome::NoPictures(format!("{name} stopped: {e:?}")));
+                }
+                break;
+            }
         };
+        outputs += 1;
         let pts = out.info().presentation_time_us();
         let end = out.info().flags() & END_OF_STREAM != 0;
         let t = pts as f64 / 1e6;
@@ -400,7 +541,9 @@ fn play_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start: I
         // more than FPS a second, and late ones are skipped (though one is
         // drawn every half second, so a slow phone still shows something).
         let late = start.elapsed().as_secs_f64() > t - at + 0.1;
-        let skip = pts < at_us || (end && out.info().size() == 0) || t - last_drawn < 1.0 / FPS || (late && t - last_drawn < 0.5);
+        // (Drawn to a reader, a picture's buffer may say it holds nothing.)
+        let empty = out.info().size() <= 0 && (end || output == Output::Memory);
+        let skip = pts < at_us || empty || t - last_drawn < 1.0 / FPS || (late && t - last_drawn < 0.5);
         if skip {
             let _ = codec.release_output_buffer(out, false);
         } else {
@@ -408,8 +551,23 @@ fn play_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start: I
                 let _ = codec.release_output_buffer(out, false);
                 break;
             }
-            let _ = codec.release_output_buffer(out, true);
-            if let Some(frame) = latest(&reader).and_then(|img| to_rgba(&img, info.rotation, size)) {
+            let frame = match &reader {
+                Some(reader) => {
+                    let _ = codec.release_output_buffer(out, true);
+                    rendered += 1;
+                    latest(reader).and_then(|img| to_rgba(&img, info.rotation, size))
+                }
+                None => {
+                    let (offset, len) = (out.info().offset().max(0) as usize, out.info().size().max(0) as usize);
+                    let data = out.buffer();
+                    let data = &data[offset.min(data.len())..(offset + len).min(data.len())];
+                    rendered += 1;
+                    let frame = convert(&layout.planes(data), layout.crop, info.rotation, size);
+                    let _ = codec.release_output_buffer(out, false);
+                    Some(frame)
+                }
+            };
+            if let Some(frame) = frame {
                 last_drawn = t;
                 shown += 1;
                 {
@@ -437,8 +595,13 @@ fn play_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start: I
     let _ = codec.stop();
     // The decoder goes before the reader it draws into.
     drop(codec);
+    drop(window);
     drop(reader);
-    shown
+    match outcome {
+        Some(o) => o,
+        None if shown == 0 && current(generation) && rendered > 0 => Outcome::NoPictures(format!("{name}'s pictures couldn't be read")),
+        None => Outcome::Shown(shown),
+    }
 }
 
 /// The picture the decoder just drew (it arrives a moment after).
@@ -478,7 +641,14 @@ fn to_rgba(img: &Image, rotation: i32, size: (u32, u32)) -> Option<SharedPixelBu
         uv_row: img.plane_row_stride(1).ok()? as usize,
         uv_pixel: img.plane_pixel_stride(1).ok()? as usize,
     };
-    let (cw, ch) = ((right - left) as u32, (bottom - top) as u32);
+    Some(convert(&planes, (left as u32, top as u32, right as u32, bottom as u32), rotation, size))
+}
+
+/// The part of a YUV picture inside `crop` (left, top, right, bottom) as
+/// RGBA at `size`, turned by `rotation` degrees.
+fn convert(planes: &Planes, crop: (u32, u32, u32, u32), rotation: i32, size: (u32, u32)) -> SharedPixelBuffer<Rgba8Pixel> {
+    let (left, top, right, bottom) = crop;
+    let (cw, ch) = (right.saturating_sub(left).max(1), bottom.saturating_sub(top).max(1));
     let mut out = SharedPixelBuffer::<Rgba8Pixel>::new(size.0, size.1);
     let (ow, oh) = size;
     let px = out.make_mut_bytes();
@@ -497,7 +667,7 @@ fn to_rgba(img: &Image, rotation: i32, size: (u32, u32)) -> Option<SharedPixelBu
             px[i..i + 4].copy_from_slice(&[rgb.0, rgb.1, rgb.2, 255]);
         }
     }
-    Some(out)
+    out
 }
 
 struct Planes<'a> {

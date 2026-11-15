@@ -114,6 +114,23 @@ export struct SpaceRoomItem {
     busy: bool,
 }
 
+// Three dots that light up in turn: something is loading.
+component Dots inherits HorizontalLayout {
+    in property <color> color: white;
+    alignment: center;
+    spacing: 4px;
+    for i in 3: VerticalLayout {
+        alignment: center;
+        Rectangle {
+            width: 6px;
+            height: 6px;
+            border-radius: 3px;
+            background: root.color;
+            opacity: mod(animation-tick() / 300ms - i, 3) < 1 ? 1.0 : 0.3;
+        }
+    }
+}
+
 export struct ForwardItem {
     id: string,
     name: string,
@@ -568,6 +585,8 @@ component MessageRow inherits Rectangle {
                 if Prefs.menu-open-media && (root.item.media == 2 || root.item.media == 3): MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
                 if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
                 if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
+                // Phones: hand it to another app (it's saved to Download first).
+                if Prefs.touch && root.item.media > 0 && root.item.media < 4: MenuItem { title: "Share…"; activated => { root.action("share", root.item.id); } }
                 if Prefs.menu-open-media && root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
                 if Prefs.menu-copy-file && root.item.media > 0: MenuItem { title: "Copy file link"; activated => { root.action("copy-file", root.item.id); } }
                 if root.item.media > 0 && root.item.media < 4: MenuSeparator {}
@@ -582,6 +601,7 @@ component MessageRow inherits Rectangle {
                 if Prefs.menu-quote: MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
                 if Prefs.menu-copy: MenuItem { title: "Copy whole message"; activated => { root.copy(root.item.body); } }
                 if root.item.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
+                if Prefs.touch && root.item.media > 3: MenuItem { title: "Share…"; activated => { root.action("share", root.item.id); } }
                 if Prefs.menu-open-links: Menu {
                     title: "Open link";
                     enabled: root.item.links.length > 0;
@@ -707,7 +727,8 @@ component MessageRow inherits Rectangle {
                             if pic.here && Player.loading: Rectangle {
                                 width: 48px; height: 48px; border-radius: 24px;
                                 background: #000000a0;
-                                Text { text: Player.progress > 0 ? Player.progress + "%" : "…"; color: white; font-size: Player.progress > 0 ? 13px : 20px; }
+                                if Player.progress > 0: Text { text: Player.progress + "%"; color: white; font-size: 13px; }
+                                if Player.progress == 0: Dots {}
                             }
                             // Touch screens: held still for half a second, it opens the
                             // message's menu (the picture takes the touch, so the row's
@@ -1406,6 +1427,10 @@ export component AppWindow inherits Window {
     in property <[ForwardItem]> forward-rooms;
     callback forward-search(string);
     callback forward-to(string);
+    // Which account sends it (any signed-in one; the message's own at first).
+    in property <[AccountItem]> forward-accounts;
+    in property <string> forward-account;
+    callback forward-pick-account(string);
     // The open room is a space: its page lists the rooms in it.
     in property <bool> current-space;
     in property <[SpaceRoomItem]> space-rooms;
@@ -2331,7 +2356,8 @@ export component AppWindow inherits Window {
                             clicked => { root.activity(); root.open-stickers(); }
                         }
                     }
-                    if !root.narrow: VerticalLayout {
+                    // Phones' keyboards have their own emoji key.
+                    if !root.narrow && !Prefs.touch: VerticalLayout {
                         alignment: end;
                         IconBtn {
                             icon: "☺";
@@ -2353,7 +2379,7 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     IconBtn { icon: "+"; size: 38px; clicked => { root.activity(); root.attach(); } }
                     IconBtn { icon: "🖼"; size: 38px; active: root.stickers-open; clicked => { root.activity(); root.open-stickers(); } }
-                    IconBtn {
+                    if !Prefs.touch: IconBtn {
                         icon: "☺";
                         size: 38px;
                         active: root.emoji-open && root.emoji-for == "";
@@ -2947,6 +2973,7 @@ export component AppWindow inherits Window {
             height: parent.height - 80px;
             Menu {
                 MenuItem { title: "Save image…"; activated => { root.message-action("save", root.viewer-id); } }
+                if Prefs.touch: MenuItem { title: "Share…"; activated => { root.message-action("share", root.viewer-id); } }
                 MenuItem { title: "Forward…"; activated => { root.viewer-open = false; root.message-action("forward", root.viewer-id); } }
                 MenuItem { title: "Copy link to message"; activated => { root.copy-text("https://matrix.to/#/" + root.current-room + "/" + root.viewer-id); } }
                 MenuSeparator {}
@@ -3014,7 +3041,8 @@ export component AppWindow inherits Window {
         if Player.loading: Rectangle {
             width: 56px; height: 56px; border-radius: 28px;
             background: #000000a0;
-            Text { text: "…"; color: white; font-size: 22px; }
+            if Player.progress > 0: Text { text: Player.progress + "%"; color: white; font-size: 14px; }
+            if Player.progress == 0: Dots {}
         }
         if !Player.playing && !Player.loading: Rectangle {
             width: 56px; height: 56px; border-radius: 28px;
@@ -3205,6 +3233,29 @@ export component AppWindow inherits Window {
         card-width: 440px;
         dismiss => { root.forward-open = false; }
         Text { text: "Forward message"; font-size: 18px; font-weight: 800; color: Theme.text; }
+        if root.forward-accounts.length > 1: Text { text: "Send it as:"; color: Theme.muted; font-size: 12px; }
+        if root.forward-accounts.length > 1: Flickable {
+            height: 40px;
+            viewport-width: max(self.width, facc.preferred-width);
+            facc := HorizontalLayout {
+                spacing: 6px;
+                for a in root.forward-accounts: Rectangle {
+                    height: 36px;
+                    border-radius: 18px;
+                    background: a.id == root.forward-account ? Theme.accent-soft : (faca.has-hover ? Theme.hover : transparent);
+                    border-width: 1px;
+                    border-color: a.id == root.forward-account ? Theme.accent : Theme.border;
+                    faca := TouchArea { clicked => { root.forward-pick-account(a.id); } }
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        padding-right: 10px;
+                        spacing: 6px;
+                        VerticalLayout { alignment: center; Avatar { initial: a.initial; hue: a.hue; image: a.avatar; size: 28px; } }
+                        Text { text: a.name; color: Theme.text; vertical-alignment: center; overflow: elide; max-width: 160px; }
+                    }
+                }
+            }
+        }
         Input { text <=> root.forward-query; placeholder: "Search rooms"; edited(t) => { root.forward-search(t); } }
         fsv := ScrollView {
             height: min(360px, root.height - 260px);

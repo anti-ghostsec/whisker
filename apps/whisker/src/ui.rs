@@ -48,7 +48,8 @@ pub fn decode_frames(bytes: &[u8], max_w: u32, max_h: u32) -> Option<Frames> {
     let mut out: Vec<Pixels> = Vec::new();
     let mut ms = 100;
     for f in frames.take(MAX_FRAMES) {
-        let f = f.ok()?;
+        // A broken frame ends it: the ones before it still play.
+        let Ok(f) = f else { break };
         if out.is_empty() {
             let (num, den) = f.delay().numer_denom_ms();
             // Browsers treat very short delays as 100 ms; so do we.

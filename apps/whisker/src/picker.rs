@@ -12,9 +12,11 @@ use slint::{ComponentHandle, ModelRc, VecModel, Weak};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// The phone's shared storage.
-const ROOT: &str = "/storage/emulated/0";
-/// Places offered at the top: (label, folder under [`ROOT`]).
+/// The phone's shared storage (where Android says it is).
+fn root() -> PathBuf {
+    crate::droid::storage_root()
+}
+/// Places offered at the top: (label, folder under [`root`]).
 const PLACES: [(&str, &str); 8] = [
     ("Download", "Download"),
     ("Camera", "DCIM/Camera"),
@@ -55,7 +57,7 @@ pub fn install(ui: &AppWindow) {
     ui.on_picker_place(move |i| {
         let Some((_, sub)) = PLACES.get(i as usize) else { return };
         if let Some(st) = STATE.lock().unwrap().as_mut() {
-            st.dir = Path::new(ROOT).join(sub);
+            st.dir = root().join(sub);
         }
         if let Some(u) = w.upgrade() {
             show(&u, true);
@@ -89,10 +91,10 @@ pub async fn pick(title: &str, exts: &[&str], multi: bool) -> Vec<PathBuf> {
     crate::droid::request_media_access();
     let Some(ui) = UI.get().cloned() else { return Vec::new() };
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let start = Path::new(ROOT).join("Download");
+    let start = root().join("Download");
     // One open at a time: a list still open is cancelled.
     if let Some(mut old) = STATE.lock().unwrap().replace(State {
-        dir: if start.is_dir() { start } else { PathBuf::from(ROOT) },
+        dir: if start.is_dir() { start } else { root() },
         multi,
         exts: exts.iter().map(|e| e.to_lowercase()).collect(),
         picked: Vec::new(),
@@ -151,7 +153,8 @@ fn show(u: &AppWindow, always: bool) {
     }
     let mut rows: Vec<PickEntry> = Vec::new();
     let mut kept: Vec<(PathBuf, bool)> = Vec::new();
-    if st.dir != Path::new(ROOT)
+    let top = root();
+    if st.dir != top
         && let Some(up) = st.dir.parent()
     {
         rows.push(PickEntry { name: "⬆  Up a folder".into(), info: "".into(), dir: true, picked: false });
@@ -163,7 +166,7 @@ fn show(u: &AppWindow, always: bool) {
         kept.push((path, dir));
     }
     st.entries = kept;
-    let shown = st.dir.strip_prefix(ROOT).map(|p| format!("Phone storage/{}", p.display())).unwrap_or_else(|_| st.dir.display().to_string());
+    let shown = st.dir.strip_prefix(&top).map(|p| format!("Phone storage/{}", p.display())).unwrap_or_else(|_| st.dir.display().to_string());
     u.set_picker_dir(shown.trim_end_matches('/').into());
     u.set_picker_count(st.picked.len() as i32);
     u.set_picker_entries(ModelRc::new(VecModel::from(rows)));

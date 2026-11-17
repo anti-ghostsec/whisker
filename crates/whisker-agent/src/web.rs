@@ -26,7 +26,9 @@ use anyhow::{Result, anyhow, bail};
 use reqwest::Url;
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use whisker_core::safe_web;
+#[cfg(test)]
+use whisker_core::safe_web::{check_url, is_public};
 use std::time::Duration;
 
 /// Fetches allowed per reply.
@@ -37,7 +39,6 @@ pub const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TEXT: usize = 24_000;
 /// Links listed from a page (so the model can follow them).
 const MAX_LINKS: usize = 40;
-const MAX_REDIRECTS: usize = 5;
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// Sent instead of anything that could tell who's asking.
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; WhiskerBot/1.0)";
@@ -255,89 +256,32 @@ impl Web {
     }
 
     /// GETs `url` (following safe redirects), as text.
-    async fn get(&self, mut url: Url, accept: Option<&str>) -> Result<Fetched> {
-        for _ in 0..=MAX_REDIRECTS {
-            check_url(&url, self.proxy.is_some())?;
-            let host = url.host_str().unwrap_or_default().to_owned();
-            let mut b = whisker_core::tls::http_builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(TIMEOUT)
-                .connect_timeout(Duration::from_secs(8))
-                .user_agent(USER_AGENT);
-            match &self.proxy {
-                Some(p) => b = b.proxy(reqwest::Proxy::all(p).map_err(|e| anyhow!("bad proxy: {e}"))?),
-                None => {
-                    b = b.no_proxy();
-                    // Check every address now and connect only to those.
-                    if url.host().is_some_and(|h| matches!(h, url::Host::Domain(_))) {
-                        let port = url.port_or_known_default().unwrap_or(443);
-                        let addrs: Vec<SocketAddr> = tokio::time::timeout(Duration::from_secs(8), tokio::net::lookup_host((host.as_str(), port)))
-                            .await
-                            .map_err(|_| anyhow!("looking up {host} timed out"))?
-                            .map_err(|e| anyhow!("couldn't look up {host}: {e}"))?
-                            .collect();
-                        if addrs.is_empty() {
-                            bail!("{host} has no address");
-                        }
-                        if let Some(bad) = addrs.iter().find(|a| !is_public(a.ip())) {
-                            bail!("refusing {host}: it points at a private or local address ({})", bad.ip());
-                        }
-                        b = b.resolve_to_addrs(&host, &addrs);
-                    }
-                }
-            }
-            let http = b.build()?;
-            let mut req = http.get(url.clone());
-            req = req.header(reqwest::header::ACCEPT, accept.unwrap_or("text/html,text/plain,text/markdown,application/json,application/xml;q=0.9,*/*;q=0.5"));
-            if host == "api.github.com" {
-                req = req.header("X-GitHub-Api-Version", "2022-11-28");
-            }
-            let mut resp = req.send().await.map_err(|e| anyhow!("couldn't fetch {url}: {}", short_err(&e)))?;
-            let status = resp.status();
-            if status.is_redirection() {
-                let to = resp.headers().get(reqwest::header::LOCATION).and_then(|l| l.to_str().ok()).ok_or_else(|| anyhow!("redirect without a location"))?;
-                url = url.join(to)?;
-                continue;
-            }
-            if !status.is_success() {
-                bail!("{url} answered {status}");
-            }
-            let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
-            let texty = content_type.is_empty()
-                || content_type.starts_with("text/")
-                || ["json", "xml", "javascript", "x-sh", "yaml", "toml"].iter().any(|t| content_type.contains(t));
-            if !texty {
-                bail!("{url} is {content_type}, not text");
-            }
-            let mut body = Vec::new();
-            let mut truncated = false;
-            while let Some(chunk) = resp.chunk().await.map_err(|e| anyhow!("reading {url}: {}", short_err(&e)))? {
-                let room = MAX_BYTES - body.len();
-                if chunk.len() >= room {
-                    body.extend_from_slice(&chunk[..room]);
-                    truncated = true;
-                    break;
-                }
-                body.extend_from_slice(&chunk);
-            }
-            if content_type.is_empty() && body.iter().take(1024).any(|&b| b == 0) {
-                bail!("{url} isn't text");
-            }
-            let raw = String::from_utf8_lossy(&body).into_owned();
-            let html = content_type.contains("html") || (content_type.is_empty() && raw.trim_start().get(..15).is_some_and(|s| s.to_ascii_lowercase().starts_with("<!doctype html")));
-            return Ok(if html {
-                let page = html_to_text(&raw, &url);
-                Fetched { url, content_type, title: page.title, text: page.text, links: page.links, truncated }
-            } else {
-                Fetched { url, content_type, title: String::new(), text: raw, links: Vec::new(), truncated }
-            });
+    async fn get(&self, url: Url, accept: Option<&str>) -> Result<Fetched> {
+        let accept = accept.unwrap_or("text/html,text/plain,text/markdown,application/json,application/xml;q=0.9,*/*;q=0.5");
+        let mut extra = Vec::new();
+        if url.host_str() == Some("api.github.com") {
+            extra.push(("X-GitHub-Api-Version", "2022-11-28"));
         }
-        bail!("too many redirects")
+        let got = safe_web::get(url, self.proxy.as_deref(), &safe_web::Ask { accept, headers: &extra, max_bytes: MAX_BYTES, user_agent: USER_AGENT, timeout: TIMEOUT }).await?;
+        let (url, content_type, body, truncated) = (got.url, got.content_type, got.body, got.truncated);
+        let texty = content_type.is_empty()
+            || content_type.starts_with("text/")
+            || ["json", "xml", "javascript", "x-sh", "yaml", "toml"].iter().any(|t| content_type.contains(t));
+        if !texty {
+            bail!("{url} is {content_type}, not text");
+        }
+        if content_type.is_empty() && body.iter().take(1024).any(|&b| b == 0) {
+            bail!("{url} isn't text");
+        }
+        let raw = String::from_utf8_lossy(&body).into_owned();
+        let html = content_type.contains("html") || (content_type.is_empty() && raw.trim_start().get(..15).is_some_and(|s| s.to_ascii_lowercase().starts_with("<!doctype html")));
+        Ok(if html {
+            let page = html_to_text(&raw, &url);
+            Fetched { url, content_type, title: page.title, text: page.text, links: page.links, truncated }
+        } else {
+            Fetched { url, content_type, title: String::new(), text: raw, links: Vec::new(), truncated }
+        })
     }
-}
-
-fn short_err(e: &reqwest::Error) -> String {
-    if e.is_timeout() { "timed out".into() } else if e.is_connect() { "couldn't connect".into() } else { e.to_string() }
 }
 
 struct Fetched {
@@ -447,78 +391,6 @@ fn decode_percent(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Refuses addresses that aren't plain public http(s).
-fn check_url(url: &Url, proxied: bool) -> Result<()> {
-    if !matches!(url.scheme(), "http" | "https") {
-        bail!("only http and https addresses");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!("addresses with a user name or password aren't fetched");
-    }
-    if !matches!(url.port(), None | Some(80) | Some(443)) {
-        bail!("only the usual web ports (80, 443)");
-    }
-    match url.host() {
-        None => bail!("no host"),
-        Some(url::Host::Ipv4(ip)) if !is_public(IpAddr::V4(ip)) => bail!("refusing a private or local address"),
-        Some(url::Host::Ipv6(ip)) if !is_public(IpAddr::V6(ip)) => bail!("refusing a private or local address"),
-        Some(url::Host::Domain(d)) => {
-            let d = d.trim_end_matches('.').to_ascii_lowercase();
-            let local = d == "localhost" || !d.contains('.') || [".localhost", ".local", ".internal", ".lan", ".home", ".home.arpa", ".corp", ".intranet"].iter().any(|s| d.ends_with(s));
-            // Onion sites only make sense (and are only reachable) through a Tor proxy.
-            if local || (d.ends_with(".onion") && !proxied) {
-                bail!("refusing local or unreachable host {d}");
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Whether `ip` is on the public internet.
-pub fn is_public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => public_v4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return public_v4(v4);
-            }
-            let s = v6.segments();
-            // NAT64 (64:ff9b::/96) carries an IPv4 address.
-            if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
-                return public_v4(Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8));
-            }
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (s[0] & 0xfe00) == 0xfc00 // unique local
-                || (s[0] & 0xffc0) == 0xfe80 // link local
-                || (s[0] & 0xffc0) == 0xfec0 // site local (old)
-                || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
-                || (s[0] == 0x2002) // 6to4 can carry a private IPv4
-                || (s[0] == 0x2001 && s[1] == 0) // Teredo
-                || s[..6] == [0, 0, 0, 0, 0, 0] // IPv4-compatible and other ::/96
-                || v6 == Ipv6Addr::UNSPECIFIED)
-        }
-    }
-}
-
-fn public_v4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    !(ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || o[0] == 0
-        || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT 100.64/10
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0/24
-        || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking 198.18/15
-        || o[0] >= 240)
 }
 
 /// Cuts `s` to `max` characters.

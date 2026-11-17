@@ -42,6 +42,51 @@ pub fn sdk() -> i32 {
     with_env(|env, _| env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()).unwrap_or(0)
 }
 
+/// A small picture of a photo or video file, made by Android (Android 10
+/// and later): (width, height, RGBA). It reads HEIC and videos too, and
+/// uses the thumbnail a camera stored in the file when there is one.
+pub fn thumbnail(path: &Path, video: bool, px: i32) -> Option<(u32, u32, Vec<u8>)> {
+    if sdk() < 29 {
+        return None;
+    }
+    with_env(|env, _| {
+        let text = env.new_string(path.to_string_lossy())?;
+        let file = env.new_object("java/io/File", "(Ljava/lang/String;)V", &[JValue::Object(&text)])?;
+        let size = env.new_object("android/util/Size", "(II)V", &[JValue::Int(px), JValue::Int(px)])?;
+        let none = JObject::null();
+        let method = if video { "createVideoThumbnail" } else { "createImageThumbnail" };
+        let bitmap = env
+            .call_static_method(
+                "android/media/ThumbnailUtils",
+                method,
+                "(Ljava/io/File;Landroid/util/Size;Landroid/os/CancellationSignal;)Landroid/graphics/Bitmap;",
+                &[JValue::Object(&file), JValue::Object(&size), JValue::Object(&none)],
+            )?
+            .l()?;
+        if bitmap.is_null() {
+            return Ok(None);
+        }
+        let w = env.call_method(&bitmap, "getWidth", "()I", &[])?.i()?;
+        let h = env.call_method(&bitmap, "getHeight", "()I", &[])?.i()?;
+        if w <= 0 || h <= 0 || w > 2048 || h > 2048 {
+            env.call_method(&bitmap, "recycle", "()V", &[])?;
+            return Ok(None);
+        }
+        let pixels = env.new_int_array(w * h)?;
+        env.call_method(&bitmap, "getPixels", "([IIIIIII)V", &[JValue::Object(&pixels), JValue::Int(0), JValue::Int(w), JValue::Int(0), JValue::Int(0), JValue::Int(w), JValue::Int(h)])?;
+        let mut argb = vec![0i32; (w * h) as usize];
+        env.get_int_array_region(&pixels, 0, &mut argb)?;
+        env.call_method(&bitmap, "recycle", "()V", &[])?;
+        // Android's colours are 0xAARRGGBB.
+        let rgba = argb.iter().flat_map(|&v| {
+            let v = v as u32;
+            [(v >> 16) as u8, (v >> 8) as u8, v as u8, (v >> 24) as u8]
+        });
+        Ok(Some((w as u32, h as u32, rgba.collect())))
+    })
+    .flatten()
+}
+
 /// The phone's shared storage, as Android reports it: not always
 /// `/storage/emulated/0` (a work profile or Samsung's Secure Folder is
 /// another user, with its own number).

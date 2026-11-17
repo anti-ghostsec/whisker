@@ -241,6 +241,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-show-events(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
+    callback set-link-previews(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -367,6 +368,15 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.spell-check;
                 toggled => { root.set-spell-check(self.checked); }
+            }
+        }
+        Field {
+            label: "Previews of web links";
+            hint: "A card with the title and picture of a link (YouTube and other sites). Fetched by this device through the account's proxy, if it has one: the site sees a request from you or the proxy, never the server. \"Tap to load\" fetches only the ones you choose.";
+            ComboBox {
+                model: ["Off", "Tap to load", "Load automatically"];
+                current-index: Prefs.link-previews;
+                selected => { root.set-link-previews(self.current-index); }
             }
         }
         HorizontalLayout {
@@ -1281,6 +1291,7 @@ export component SettingsPage inherits Rectangle {
     callback set-show-events(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
+    callback set-link-previews(int);
     callback set-send-typing(bool);
     callback set-clear-command(string);
     callback set-autocorrect(bool);
@@ -1384,6 +1395,7 @@ export component SettingsPage inherits Rectangle {
                             set-show-events(b) => { root.set-show-events(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-key-sharing(i) => { root.set-key-sharing(i); }
+                            set-link-previews(i) => { root.set-link-previews(i); }
                             set-send-typing(b) => { root.set-send-typing(b); }
                             set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }

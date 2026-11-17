@@ -8,9 +8,82 @@
 //! list offers to turn on.
 
 use crate::{AppWindow, PickEntry};
-use slint::{ComponentHandle, ModelRc, VecModel, Weak};
+use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel, Weak};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// Thumbnails' size, in pixels.
+const THUMB_PX: i32 = 256;
+/// Thumbnails made for one folder at most (newest files first).
+const MAX_THUMBS: usize = 400;
+/// Thumbnails kept, by file; `None`: it has none.
+static THUMBS: Mutex<Option<HashMap<PathBuf, Option<SharedPixelBuffer<Rgba8Pixel>>>>> = Mutex::new(None);
+/// Bumped each time the list is shown again, so older thumbnail work stops.
+static SHOWN: AtomicU64 = AtomicU64::new(0);
+
+/// 1 picture, 2 video, 3 sound, 0 anything else (by extension).
+fn kind_of(path: &Path) -> i32 {
+    let ext = path.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "heif" | "avif" | "bmp" | "tif" | "tiff" | "dng" => 1,
+        "mp4" | "m4v" | "mov" | "mkv" | "webm" | "3gp" | "avi" | "ts" => 2,
+        "mp3" | "m4a" | "aac" | "ogg" | "opus" | "flac" | "wav" | "amr" => 3,
+        _ => 0,
+    }
+}
+
+/// A thumbnail of `path`: Android's own (photos, HEIC, videos), or for
+/// pictures on older Androids, decoded here.
+fn make_thumb(path: &Path, kind: i32) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
+    if let Some((w, h, rgba)) = crate::droid::thumbnail(path, kind == 2, THUMB_PX) {
+        return Some(SharedPixelBuffer::clone_from_slice(&rgba, w, h));
+    }
+    if kind != 1 || std::fs::metadata(path).ok()?.len() > 40 << 20 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    crate::decode(&bytes, THUMB_PX as u32, THUMB_PX as u32, false)
+}
+
+/// Makes the thumbnails of what's listed, one at a time in the
+/// background, and puts each in its row as it's ready.
+fn fill_thumbs(ui: Weak<AppWindow>, files: Vec<(usize, PathBuf, i32)>) {
+    let round = SHOWN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        for (row, path, kind) in files.into_iter().take(MAX_THUMBS) {
+            if SHOWN.load(Ordering::SeqCst) != round {
+                return;
+            }
+            let cached = THUMBS.lock().unwrap().get_or_insert_with(HashMap::new).get(&path).cloned();
+            let thumb = match cached {
+                Some(t) => t,
+                None => {
+                    let t = make_thumb(&path, kind);
+                    let mut all = THUMBS.lock().unwrap();
+                    let all = all.get_or_insert_with(HashMap::new);
+                    if all.len() > 1500 {
+                        all.clear();
+                    }
+                    all.insert(path.clone(), t.clone());
+                    t
+                }
+            };
+            let Some(thumb) = thumb else { continue };
+            let _ = ui.upgrade_in_event_loop(move |u| {
+                if SHOWN.load(Ordering::SeqCst) != round {
+                    return;
+                }
+                let model = u.get_picker_entries();
+                if let Some(mut e) = model.row_data(row) {
+                    e.thumb = Image::from_rgba8(thumb);
+                    model.set_row_data(row, e);
+                }
+            });
+        }
+    });
+}
 
 /// The phone's shared storage (where Android says it is).
 fn root() -> PathBuf {
@@ -157,19 +230,38 @@ fn show(u: &AppWindow, always: bool) {
     if st.dir != top
         && let Some(up) = st.dir.parent()
     {
-        rows.push(PickEntry { name: "⬆  Up a folder".into(), info: "".into(), dir: true, picked: false });
+        rows.push(PickEntry { name: "Up a folder".into(), info: "".into(), dir: true, picked: false, up: true, ..Default::default() });
         kept.push((up.to_owned(), true));
     }
+    let mut thumbs = Vec::new();
+    let mut media = 0;
+    let mut files = 0;
     for (path, dir, info) in entries {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        rows.push(PickEntry { name: if dir { format!("📁  {name}") } else { name }.into(), info: info.into(), dir, picked: st.picked.contains(&path) });
+        let kind = if dir { 0 } else { kind_of(&path) };
+        if !dir {
+            files += 1;
+            if kind == 1 || kind == 2 {
+                media += 1;
+                thumbs.push((rows.len(), path.clone(), kind));
+            }
+        }
+        // Shown straight away when it was made before.
+        let thumb = THUMBS.lock().unwrap().as_ref().and_then(|t| t.get(&path).cloned().flatten()).map(Image::from_rgba8).unwrap_or_default();
+        rows.push(PickEntry { name: name.into(), info: info.into(), dir, picked: st.picked.contains(&path), kind, thumb, up: false });
         kept.push((path, dir));
     }
+    // Mostly photos and videos: a grid of pictures, like a gallery.
+    let grid = files > 0 && media * 2 >= files;
     st.entries = kept;
     let shown = st.dir.strip_prefix(&top).map(|p| format!("Phone storage/{}", p.display())).unwrap_or_else(|_| st.dir.display().to_string());
     u.set_picker_dir(shown.trim_end_matches('/').into());
     u.set_picker_count(st.picked.len() as i32);
     u.set_picker_entries(ModelRc::new(VecModel::from(rows)));
+    if always {
+        u.set_picker_grid(grid);
+    }
+    fill_thumbs(u.as_weak(), thumbs);
     u.set_picker_access(if crate::droid::has_all_files() { 2 } else if crate::droid::has_media_access() { 1 } else { 0 });
 }
 

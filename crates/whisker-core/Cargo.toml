@@ -23,6 +23,7 @@ matrix-sdk.workspace = true
 # Its media decryptor, which matrix-sdk doesn't re-export.
 matrix-sdk-base = { version = "0.19.1", default-features = false, features = ["e2e-encryption"] }
 reqwest.workspace = true
+url = "2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

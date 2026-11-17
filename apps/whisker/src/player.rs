@@ -115,6 +115,27 @@ pub fn mute(ui: &Weak<AppWindow>) {
     }
 }
 
+/// A new sound level (0–100): turns the sound on (0 turns it off), and
+/// restarts ffmpeg with it.
+pub fn set_volume(ui: &Weak<AppWindow>, level: i32) {
+    // Down to 0 is "off": the level before stays for turning it back on.
+    if level > 0 {
+        crate::ui::VOLUME.store(level.min(100) as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+    let muted = level <= 0;
+    let changed = restart_with(|p| p.muted = muted).map(|c| c.running);
+    let _ = ui.upgrade_in_event_loop(move |u| {
+        let p = u.global::<Player>();
+        p.set_muted(muted);
+        if level > 0 {
+            p.set_volume(level);
+        }
+    });
+    if changed == Some(true) {
+        resume(ui);
+    }
+}
+
 /// Shows or hides the subtitles.
 pub fn subtitles(ui: &Weak<AppWindow>) {
     let Some((on, running)) = restart_with(|p| p.subtitles = !p.subtitles && p.info.subtitles.is_some()).map(|p| (p.subtitles, p.running)) else { return };
@@ -238,7 +259,12 @@ fn ffmpeg(path: &Path, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtit
     };
     cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"]);
     if let Some(out) = sound {
-        cmd.args(["-map", "0:a:0"]).args(out);
+        cmd.args(["-map", "0:a:0"]);
+        let level = crate::ui::volume();
+        if level < 100 {
+            cmd.args(["-filter:a", &format!("volume={:.2}", f64::from(level) / 100.0)]);
+        }
+        cmd.args(out);
     }
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
 }

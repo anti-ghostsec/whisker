@@ -127,6 +127,38 @@ pub fn mute(ui: &Weak<AppWindow>) {
     }
 }
 
+/// A new sound level (0–100): taken up by the sound as it plays, so
+/// nothing restarts (0 turns the sound off).
+pub fn set_volume(ui: &Weak<AppWindow>, level: i32) {
+    // Down to 0 is "off": the level before stays for turning it back on.
+    if level > 0 {
+        crate::ui::VOLUME.store(level.min(100) as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+    let muted = level <= 0;
+    let restart = {
+        let mut now = NOW.lock().unwrap();
+        match now.as_mut() {
+            // Turning the sound on or off starts or stops its decoder.
+            Some(p) if p.muted != muted => {
+                p.muted = muted;
+                p.generation += 1;
+                p.playing
+            }
+            _ => false,
+        }
+    };
+    let _ = ui.upgrade_in_event_loop(move |u| {
+        let p = u.global::<Player>();
+        p.set_muted(muted);
+        if level > 0 {
+            p.set_volume(level);
+        }
+    });
+    if restart {
+        resume(ui);
+    }
+}
+
 /// No subtitles on phones yet.
 pub fn subtitles(_ui: &Weak<AppWindow>) {}
 
@@ -750,7 +782,19 @@ fn play_sound(path: &Path, info: Info, at: f64, start: Instant, generation: u64,
                 }
             }
             if let Some(s) = &stream {
-                let data = &out.buffer()[offset..(offset + size).min(out.buffer().len())];
+                let raw = &out.buffer()[offset..(offset + size).min(out.buffer().len())];
+                // Below full level, the samples are scaled down here.
+                let level = crate::ui::volume();
+                let scaled: Vec<u8>;
+                let data = if level < 100 {
+                    scaled = raw
+                        .chunks_exact(2)
+                        .flat_map(|b| ((i32::from(i16::from_le_bytes([b[0], b[1]])) * level as i32 / 100) as i16).to_le_bytes())
+                        .collect();
+                    &scaled[..]
+                } else {
+                    raw
+                };
                 let frames = (data.len() / (2 * channels.max(1) as usize)) as i32;
                 let mut done = 0i32;
                 while done < frames && current(generation) {

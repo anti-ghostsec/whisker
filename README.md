@@ -73,9 +73,23 @@ operating system and the **Wisp** browser.
   nothing to install: Whisker carries Noto Emoji pictures (picker, reactions, suggestions,
   big emoji-only messages) and a trimmed copy of the Noto Color Emoji font, listed before
   the system fonts, for emoji inside text (see `apps/whisker/assets`).
+- **Link previews.** A YouTube link shows the video's title, channel and thumbnail; other
+  links show the page's title, description and picture. Settings → *Previews of web links*:
+  off, tap to load (the default) or automatic. Previews are fetched by your device, through
+  the account's proxy when it has one, never by your server, so the site sees a request
+  from you (or the proxy) and nothing else. Local and private addresses are never fetched.
+- **Room list folds away.** The panel button at the top left of a chat hides the room list
+  down to the account rail (and brings it back); it's remembered. On phones a chat gets the
+  whole screen, and the keyboard only comes up when you tap the message box (scrolling or
+  opening a picture puts it away).
+- **Choosing files on Android** shows each photo and video as a picture: folders of mostly
+  photos and videos open as a grid (a tick marks what's picked), others as a list with a
+  small picture beside each file; the button above switches between the two.
 - **Share to Whisker** from other apps: files, pictures, text and links. Whisker asks which
-  account should send it (skipped if you only have one), then which room, sends it, and opens
-  that room. Several files at once are fine. On FerroOS it's in the Share box; elsewhere use
+  account should send it (skipped if you only have one), then which room, and opens that
+  room straight away while the files go in the background: the status line counts them,
+  and its ✕ stops the rest (the same ✕ stops files picked in a chat). Several files at once
+  are fine. On FerroOS it's in the Share box; elsewhere use
   "Open with" or run `whisker FILE…`. If Whisker is already open, the share goes to that
   window; if it's locked, the share waits until you unlock. Starting a different (newer)
   build while an older one is open closes the old one, so the new one takes over. On
@@ -103,13 +117,15 @@ operating system and the **Wisp** browser.
   there ("Unrecognized request"), as some matrix-media-repo setups do, get asked at the older
   address instead.
 - **Images and videos:** right-click the picture or video itself to save it; the full-size
-  viewer has Save / Forward / Close buttons and its own right-click menu. **GIFs and
+  viewer has Save / Forward / Close buttons and its own right-click menu, and zooms with two
+  fingers, a trackpad pinch, the mouse wheel or a double tap (drag to look around). **GIFs and
   animated WebP play and loop**, in the timeline and the viewer. Videos show their preview
   frame (when they were sent without one, and are under 200 MB, Whisker makes one with
   ffmpeg if it's installed, reading only the parts of the video it needs where it can; videos
   you send get one the same way). Click a video to **play it right there in the message**, with
   pause, a seek bar, sound and its subtitles (on Linux, with ffmpeg installed; sound goes through
-  PulseAudio/PipeWire, else ALSA). Videos start muted: click the speaker for sound. Subtitles
+  PulseAudio/PipeWire, else ALSA). Videos start muted: the speaker opens a volume slider
+  (with Mute under it), and the level is kept for next time. Subtitles
   inside the video (SRT, ASS, WebVTT, MP4 text, or picture subtitles from Blu-ray and DVD rips)
   are drawn on it; the CC button hides them. The corners button (or a double-click) shows it
   **large**, over the whole window; Esc, ✕ or the button again brings it back. One plays at a

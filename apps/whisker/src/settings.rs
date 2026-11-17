@@ -83,6 +83,16 @@ pub struct AppSettings {
     /// so other apps show a picture (the video itself isn't uploaded).
     #[serde(default = "yes")]
     pub link_posters: bool,
+    /// Previews of web links in messages: 0 off, 1 a tap loads each one,
+    /// 2 load them all (each site sees a request from you or your proxy).
+    #[serde(default = "one")]
+    pub link_previews: i32,
+    /// Sound level for videos and audio, 1–100.
+    #[serde(default = "hundred")]
+    pub volume: i32,
+    /// The room list folded away (desktop).
+    #[serde(default)]
+    pub rooms_hidden: bool,
     /// When your server can't get a file from another server, ask that
     /// server directly. Off: it would see your IP (unless you use a proxy).
     #[serde(default)]
@@ -106,6 +116,10 @@ fn yes() -> bool {
 
 fn media_cache_mb() -> i32 {
     400
+}
+
+fn hundred() -> i32 {
+    100
 }
 
 fn one() -> i32 {

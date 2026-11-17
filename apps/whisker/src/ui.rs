@@ -68,6 +68,13 @@ pub fn decode_frames(bytes: &[u8], max_w: u32, max_h: u32) -> Option<Frames> {
 
 /// Biggest animation canvas decoded (pixels): 4096 × 4096.
 const MAX_FRAME_AREA: u64 = 4096 * 4096;
+/// Sound level for videos and audio, 0–100 (see `Player.volume`).
+pub static VOLUME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+
+pub fn volume() -> u32 {
+    VOLUME.load(std::sync::atomic::Ordering::Relaxed).min(100)
+}
+
 pub type PixelCache = Arc<Mutex<HashMap<OwnedMxcUri, Option<Pixels>>>>;
 
 pub struct Models {
@@ -260,6 +267,43 @@ pub struct MsgRow {
     /// For a thread's first message: replies, and the newest one ("Bob: hi").
     pub thread: Option<(usize, String)>,
     pub trust: Trust,
+    pub link_card: Option<LinkCard>,
+}
+
+/// A preview of a web link in a message.
+#[derive(Debug, Clone, Default)]
+pub struct LinkCard {
+    pub url: String,
+    pub site: String,
+    pub title: String,
+    pub description: String,
+    pub picture: Option<Pixels>,
+    pub video: bool,
+    pub state: CardState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum CardState {
+    /// Not fetched: a tap on it loads it.
+    #[default]
+    Offer,
+    Loading,
+    Ready,
+    /// Nothing to show (not drawn).
+    Failed,
+}
+
+impl LinkCard {
+    /// Whether a link gets a preview: web pages, not Matrix links (people,
+    /// rooms), which open inside Whisker.
+    pub fn wanted(url: &str) -> bool {
+        let l = url.to_ascii_lowercase();
+        (l.starts_with("https://") || l.starts_with("http://")) && !l.starts_with("https://matrix.to/")
+    }
+
+    fn host(&self) -> String {
+        url::Url::parse(&self.url).ok().and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_owned())).unwrap_or_default()
+    }
 }
 
 /// Whether you've verified someone (their cross-signing identity).
@@ -304,6 +348,7 @@ impl Models {
         r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
         r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
         loaded(&r.item.sender_avatar).hash(&mut h);
+        r.link_card.as_ref().map(|c| (c.state, &c.title, &c.description, c.picture.as_ref().map(|p| (p.width(), p.height())))).hash(&mut h);
         r.readers.iter().map(|x| loaded(&x.2)).collect::<Vec<_>>().hash(&mut h);
         let sig = h.finish();
         let id = r.item.event_id.to_string();
@@ -401,6 +446,18 @@ impl Models {
             )),
             picture_width: pw,
             picture_height: ph,
+            link_card: match r.link_card.as_ref().map(|c| c.state) {
+                None | Some(CardState::Failed) => 0,
+                Some(CardState::Offer) => 1,
+                Some(CardState::Loading) => 2,
+                Some(CardState::Ready) => 3,
+            },
+            link_url: s(r.link_card.as_ref().map(|c| c.url.as_str()).unwrap_or_default()),
+            link_site: s(r.link_card.as_ref().map(|c| if c.site.is_empty() { c.host() } else { c.site.clone() }).unwrap_or_default()),
+            link_title: s(r.link_card.as_ref().map(|c| c.title.as_str()).unwrap_or_default()),
+            link_text: s(r.link_card.as_ref().map(|c| c.description.as_str()).unwrap_or_default()),
+            link_picture: r.link_card.as_ref().and_then(|c| c.picture.as_ref()).map(|p| Image::from_rgba8(p.clone())).unwrap_or_default(),
+            link_video: r.link_card.as_ref().is_some_and(|c| c.video),
         }
     }
 }

@@ -85,6 +85,12 @@ export struct PickEntry {
     info: string,
     dir: bool,
     picked: bool,
+    // "Up a folder".
+    up: bool,
+    // 1 picture, 2 video, 3 sound, 0 other.
+    kind: int,
+    // A small picture of it (photos and videos), once it's made.
+    thumb: image,
 }
 
 // An emoji reaction under a message: how many, and whether one is ours.
@@ -219,6 +225,15 @@ export struct MessageItem {
     // A thread's first message: how many replies, and the newest ("Bob: hi").
     thread-replies: int,
     thread-last: string,
+    // A web link's preview: 0 none, 1 offered (tap to load), 2 loading, 3 shown.
+    link-card: int,
+    link-url: string,
+    link-site: string,
+    link-title: string,
+    link-text: string,
+    link-picture: image,
+    // A video (YouTube…): a play mark over the picture.
+    link-video: bool,
 }
 
 // A red wavy line under a misspelled word, in the composer's coordinates.
@@ -418,6 +433,8 @@ export global Player {
     // Fetching the video or starting up.
     in-out property <bool> loading;
     in-out property <bool> muted;
+    // Sound level, 0–100 (kept between videos).
+    in-out property <int> volume: 100;
     // It has subtitles, and they're drawn.
     in-out property <bool> has-subtitles;
     in-out property <bool> subtitles;
@@ -436,6 +453,8 @@ export global Player {
     // Jump to a fraction (0–1) of the way through.
     callback seek(float);
     callback mute();
+    // A new sound level (0–100), once the slider is let go.
+    callback set-volume(int);
     callback toggle-subtitles();
     callback set-large(bool);
 }
@@ -463,6 +482,55 @@ component SeekTrack inherits Rectangle {
         }
     }
     TouchArea { mouse-cursor: pointer; clicked => { Player.seek(self.mouse-x / max(1px, self.width)); } }
+}
+
+// A vertical sound level slider: drag (or tap) along it; the level is
+// passed on when it's let go.
+component VolumeSlider inherits Rectangle {
+    in-out property <int> value;
+    callback committed(int);
+    width: 36px;
+    height: 130px;
+    property <length> pad: 12px;
+    property <length> track: self.height - 2 * self.pad;
+    function at(y: length) {
+        root.value = round(max(0, min(100, (1 - (y - root.pad) / root.track) * 100)));
+    }
+    Rectangle {
+        x: (parent.width - 4px) / 2;
+        y: root.pad;
+        width: 4px;
+        height: root.track;
+        border-radius: 2px;
+        background: #ffffff40;
+        Rectangle {
+            y: parent.height * (1 - root.value / 100);
+            height: parent.height * root.value / 100;
+            border-radius: 2px;
+            background: Theme.accent;
+        }
+    }
+    Rectangle {
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: white;
+        x: (parent.width - self.width) / 2;
+        y: root.pad + root.track * (1 - root.value / 100) - self.height / 2;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down {
+                root.at(self.mouse-y);
+            } else if e.kind == PointerEventKind.up {
+                root.committed(root.value);
+            }
+        }
+        moved => {
+            if self.pressed { root.at(self.mouse-y); }
+        }
+    }
 }
 
 // Play/pause, time, seek bar, length, repeat, subtitles, sound and size, over a playing video.
@@ -518,7 +586,7 @@ component VideoBar inherits Rectangle {
         }
         Rectangle {
             width: 18px;
-            // A speaker, with sound waves or a cross.
+            // A speaker, with sound waves or a cross: opens the level.
             Path {
                 width: 16px; height: 14px;
                 viewbox-width: 16; viewbox-height: 14;
@@ -532,7 +600,37 @@ component VideoBar inherits Rectangle {
                 stroke-width: 1.5px;
                 commands: Player.muted ? "M 10.5 4.5 L 15 9.5 M 15 4.5 L 10.5 9.5" : "M 10.5 4.5 Q 12.5 7 10.5 9.5 M 12.5 2.5 Q 16 7 12.5 11.5";
             }
-            TouchArea { mouse-cursor: pointer; clicked => { Player.mute(); } }
+            TouchArea { mouse-cursor: pointer; clicked => { volume-popup.show(); } }
+            // The level, with the speaker below it to turn the sound off and on.
+            volume-popup := PopupWindow {
+                x: (parent.width - 44px) / 2;
+                y: -186px;
+                width: 44px;
+                height: 180px;
+                close-policy: close-on-click-outside;
+                Rectangle {
+                    border-radius: 10px;
+                    background: #000000d0;
+                    VerticalLayout {
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        alignment: center;
+                        Text { text: Player.muted ? "off" : Player.volume + "%"; color: white; font-size: 10px; horizontal-alignment: center; }
+                        HorizontalLayout {
+                            alignment: center;
+                            VolumeSlider {
+                                value: Player.muted ? 0 : Player.volume;
+                                committed(v) => { Player.set-volume(v); }
+                            }
+                        }
+                        Rectangle {
+                            height: 22px;
+                            Text { text: Player.muted ? "Unmute" : "Mute"; color: Player.muted ? Theme.accent : white; font-size: 10px; font-weight: 600; }
+                            TouchArea { mouse-cursor: pointer; clicked => { Player.mute(); } }
+                        }
+                    }
+                }
+            }
         }
         Rectangle {
             width: 16px;
@@ -806,6 +904,45 @@ component MessageRow inherits Rectangle {
                         }
                         if (root.item.media == 0 || root.item.caption) && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } selected(t) => { root.selection = t; } }
                         if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
+                        if root.item.link-card > 0: Rectangle {
+                            property <length> card-w: min(400px, root.width - 32px - 36px - 12px);
+                            width: card-w;
+                            height: card-col.preferred-height;
+                            border-radius: 10px;
+                            clip: true;
+                            background: card-ta.has-hover ? Theme.hover : Theme.raised;
+                            Rectangle { x: 0; width: 3px; background: Theme.accent; }
+                            card-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if root.item.link-card == 1 { root.action("link-preview", root.item.id); }
+                                    else if root.item.link-card == 3 { root.link(root.item.link-url); }
+                                }
+                            }
+                            card-col := VerticalLayout {
+                                padding: 10px;
+                                padding-left: 13px;
+                                spacing: 4px;
+                                if root.item.link-card == 1: Text { text: "Show a preview of " + root.item.link-site; font-size: 12px; color: Theme.accent; font-weight: 600; }
+                                if root.item.link-card == 2: Text { text: "Loading a preview of " + root.item.link-site + "…"; font-size: 12px; color: Theme.muted; }
+                                if root.item.link-card == 3: Text { text: root.item.link-site; font-size: 11px; color: Theme.muted; overflow: elide; }
+                                if root.item.link-card == 3 && root.item.link-title != "": Text { text: root.item.link-title; font-size: 13px; font-weight: 700; color: Theme.accent; wrap: word-wrap; }
+                                if root.item.link-card == 3 && root.item.link-text != "": Text { text: root.item.link-text; font-size: 12px; color: Theme.text; wrap: word-wrap; max-height: 48px; overflow: elide; }
+                                if root.item.link-card == 3 && root.item.link-picture.width > 0: Rectangle {
+                                    height: min(225px, (card-w - 23px) * root.item.link-picture.height / max(1, root.item.link-picture.width));
+                                    border-radius: 6px;
+                                    clip: true;
+                                    Image { source: root.item.link-picture; width: parent.width; height: parent.height; image-fit: cover; }
+                                    if root.item.link-video: Rectangle {
+                                        width: 46px;
+                                        height: 46px;
+                                        border-radius: 23px;
+                                        background: #000000aa;
+                                        Text { text: "▶"; color: white; font-size: 20px; x: 16px; }
+                                    }
+                                }
+                            }
+                        }
                         // Who really sent it: the warning always, the reason on
                         // hover (or a tap) over it, laid over the messages so
                         // nothing moves.
@@ -1016,6 +1153,35 @@ component RailAccount inherits Rectangle {
             }
         }
     }
+}
+
+
+// Shows or folds away the room list: a panel with its left part filled
+// while the list shows.
+component RoomsToggle inherits Rectangle {
+    in property <bool> shown;
+    callback clicked;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: ta.has-hover ? Theme.hover : transparent;
+    Path {
+        width: 18px;
+        height: 16px;
+        viewbox-width: 18;
+        viewbox-height: 16;
+        stroke: Theme.muted;
+        stroke-width: 1.5px;
+        commands: "M 1 1 L 17 1 L 17 15 L 1 15 Z M 6 1 L 6 15";
+    }
+    if root.shown: Rectangle {
+        x: (parent.width - 18px) / 2 + 1px;
+        y: (parent.height - 16px) / 2 + 1px;
+        width: 5px;
+        height: 14px;
+        background: Theme.muted;
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
 }
 
 component RoomRow inherits Rectangle {
@@ -1259,6 +1425,29 @@ component LoginDialog inherits Overlay {
     }
 }
 
+// What a file in the chooser is: its picture when there is one, else a sign
+// of its kind (folder, picture, video, sound, file).
+component PickThumb inherits Rectangle {
+    in property <PickEntry> entry;
+    in property <length> size: 48px;
+    width: size;
+    height: size;
+    border-radius: 6px;
+    clip: true;
+    background: entry.thumb.width > 0 ? transparent : Theme.raised;
+    if root.entry.thumb.width > 0: Image { source: root.entry.thumb; width: root.size; height: root.size; image-fit: cover; }
+    if root.entry.thumb.width == 0: Text {
+        text: root.entry.up ? "⬆" : root.entry.dir ? "📁" : root.entry.kind == 1 ? "🖼" : root.entry.kind == 2 ? "▶" : root.entry.kind == 3 ? "♪" : "📄";
+        font-size: root.size * 0.45;
+        color: Theme.muted;
+    }
+    if root.entry.kind == 2 && root.entry.thumb.width > 0: Rectangle {
+        width: root.size * 0.42; height: self.width; border-radius: self.width / 2;
+        background: #000000a0;
+        Text { text: "▶"; color: white; font-size: root.size * 0.2; }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Whisker";
     // Emoji first: otherwise a text font with plain black-and-white emoji
@@ -1283,6 +1472,9 @@ export component AppWindow inherits Window {
     // A download someone asked for is going on (the ✕ by the status stops it).
     in-out property <bool> downloading;
     callback cancel-downloads();
+    // Files being sent (from a chat or shared from another app).
+    in-out property <bool> uploading;
+    callback cancel-uploads();
     // Choosing files on Android, in Whisker's own list (see picker.rs).
     in-out property <bool> picker-open;
     in property <string> picker-title;
@@ -1298,6 +1490,8 @@ export component AppWindow inherits Window {
     callback picker-refresh();
     callback picker-finish(bool);
     callback picker-all-files();
+    // Pictures in a grid (folders of mostly photos and videos) or a list.
+    in-out property <bool> picker-grid;
 
     in property <[AccountItem]> accounts;
     in property <[string]> tags;
@@ -1381,7 +1575,14 @@ export component AppWindow inherits Window {
     in-out property <int> focus-request;
     changed reply-to => { if root.reply-to != "" { root.focus-request += 1; } }
     changed editing => { root.focus-request += 1; }
-    changed current-room => { root.focus-request += 1; }
+    // On a phone the keyboard only comes up when you tap the message box:
+    // opening a chat, scrolling and looking at pictures or videos put it away.
+    changed current-room => { if Prefs.touch { root.blur-request += 1; } else { root.focus-request += 1; } }
+    in-out property <int> blur-request;
+    changed blur-request => { if Prefs.touch { back-keys.focus(); } }
+    changed viewer-open => { if root.viewer-open { root.blur-request += 1; } }
+    property <bool> video-large: Player.large;
+    changed video-large => { if root.video-large { root.blur-request += 1; } }
     changed emoji-open => { if !root.emoji-open { root.focus-request += 1; } }
     // The highlighted @/:emoji: suggestion (arrow keys move it).
     property <int> sug-index;
@@ -1521,6 +1722,9 @@ export component AppWindow inherits Window {
     in-out property <int> pane: 1;
     // The room list is folded away (double-clicking an account toggles it).
     in-out property <bool> rooms-hidden;
+    // Remembered for next time.
+    callback rooms-hidden-changed(bool);
+    changed rooms-hidden => { root.rooms-hidden-changed(root.rooms-hidden); }
     property <bool> narrow: root.width < 760px;
 
     callback unlock(string);
@@ -1619,6 +1823,7 @@ export component AppWindow inherits Window {
     callback set-show-events(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
+    callback set-link-previews(int);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -1699,8 +1904,8 @@ export component AppWindow inherits Window {
         if root.screen == 1: HorizontalLayout {
             y: Safe.top;
             height: root.height - Safe.top - Safe.bottom;
-            // Account rail
-            Rectangle {
+            // Account rail (on phones, only with the room list: a chat gets the whole width)
+            if !root.narrow || (root.pane == 1 && !root.panel-open): Rectangle {
                 width: 64px;
                 background: Theme.rail;
                 VerticalLayout {
@@ -1757,7 +1962,8 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // Rooms (double-click an account to hide or show them)
+            // Rooms (the button at the top left of a chat, or a double-click on an
+            // account, folds them away to just the rail)
             if (!root.narrow && !root.rooms-hidden) || (root.narrow && root.pane == 1): Rectangle {
                 width: root.narrow ? root.width - 64px : 290px;
                 background: Theme.panel;
@@ -1946,6 +2152,7 @@ export component AppWindow inherits Window {
                             padding-right: 12px;
                             spacing: 8px;
                             if root.narrow: VerticalLayout { alignment: center; IconBtn { icon: "‹"; clicked => { root.pane = 1; } } }
+                            if !root.narrow: VerticalLayout { alignment: center; RoomsToggle { shown: !root.rooms-hidden; clicked => { root.rooms-hidden = !root.rooms-hidden; } } }
                             VerticalLayout {
                                 alignment: center;
                                 horizontal-stretch: 1;
@@ -2082,6 +2289,9 @@ export component AppWindow inherits Window {
                             // The sizes the last time it was put in place.
                             property <length> seen-height: 0px;
                             property <length> seen-visible: 0px;
+                            // Where a scroll by hand started (it puts the phone keyboard away
+                            // once it has gone a little way).
+                            property <length> blur-from: 0px;
                             // Keeps your place when the content or the view changes
                             // size. Where you are is read from the scroll position
                             // now (with the sizes it was at), not from the last drag:
@@ -2094,10 +2304,15 @@ export component AppWindow inherits Window {
                                 self.content-y = min(0px, self.visible-height - self.content-height + (root.stick-bottom ? 0px : self.from-bottom));
                                 self.seen-height = self.content-height;
                                 self.seen-visible = self.visible-height;
+                                self.blur-from = self.content-y;
                             }
+                            // The message box got the focus: scrolling from here on puts it away.
+                            property <int> typing: root.focus-request + root.cursor-request;
+                            changed typing => { self.blur-from = self.content-y; }
                             changed content-height => { self.settle(); }
                             changed visible-height => { self.settle(); }
                             scrolled => {
+                                if Prefs.touch && abs(self.content-y - self.blur-from) > 24px { root.blur-request += 1; }
                                 root.stick-bottom = self.content-y <= self.visible-height - self.content-height + 40px;
                                 self.from-bottom = max(0px, self.content-height + self.content-y - self.visible-height);
                             }
@@ -2442,7 +2657,14 @@ export component AppWindow inherits Window {
                         spacing: 6px;
                         Text { text: root.status; font-size: 11px; color: Theme.muted; wrap: char-wrap; horizontal-stretch: 1; vertical-alignment: center; }
                         // Stops the downloads going on.
-                        if root.downloading: IconBtn { icon: "✕"; size: 20px; clicked => { root.cancel-downloads(); } }
+                        if root.downloading || root.uploading: IconBtn {
+                            icon: "✕";
+                            size: Prefs.touch ? 32px : 20px;
+                            clicked => {
+                                if root.downloading { root.cancel-downloads(); }
+                                if root.uploading { root.cancel-uploads(); }
+                            }
+                        }
                     }
                 }
             }
@@ -2843,6 +3065,7 @@ export component AppWindow inherits Window {
             set-show-events(b) => { root.set-show-events(b); }
             set-notify-level(i) => { root.set-notify-level(i); }
             set-key-sharing(i) => { root.set-key-sharing(i); }
+            set-link-previews(i) => { root.set-link-previews(i); }
             set-send-typing(b) => { root.set-send-typing(b); }
             set-autocorrect(b) => { root.set-autocorrect(b); }
             set-spell-check(b) => { root.set-spell-check(b); }
@@ -3031,11 +3254,92 @@ export component AppWindow inherits Window {
                     running: root.viewer-open && root.viewer-frames.length > 1;
                     triggered => { root.viewer-frame = mod(root.viewer-frame + 1, root.viewer-frames.length); }
                 }
-                Image {
-                    source: root.viewer-frames.length > 1 ? root.viewer-frames[min(root.viewer-frame, root.viewer-frames.length - 1)] : root.viewer-image;
-                    width: parent.width;
-                    height: parent.height;
-                    image-fit: contain;
+                // Zoom: pinch (two fingers, or a trackpad), the mouse wheel or a
+                // double tap; one finger or the mouse drags a zoomed picture.
+                Rectangle {
+                    property <float> zoom: 1;
+                    property <length> pan-x;
+                    property <length> pan-y;
+                    property <float> base-zoom: 1;
+                    property <length> base-x;
+                    property <length> base-y;
+                    property <bool> dragged;
+                    // How far the zoomed picture may move before an edge shows.
+                    property <length> room-x: max(0px, (self.width * self.zoom - self.width) / 2);
+                    property <length> room-y: max(0px, (self.height * self.zoom - self.height) / 2);
+                    function fit() {
+                        self.pan-x = max(-self.room-x, min(self.room-x, self.pan-x));
+                        self.pan-y = max(-self.room-y, min(self.room-y, self.pan-y));
+                    }
+                    // Zooms to `z`, keeping the picture's point at (cx, cy) (from the
+                    // middle, where it was at `base-zoom` and `base-x/y`) under (nx, ny).
+                    function zoom-about(z: float, cx: length, cy: length, nx: length, ny: length) {
+                        self.zoom = max(1, min(8, z));
+                        self.pan-x = nx - (cx - self.base-x) / self.base-zoom * self.zoom;
+                        self.pan-y = ny - (cy - self.base-y) / self.base-zoom * self.zoom;
+                        self.fit();
+                    }
+                    clip: true;
+                    Image {
+                        source: root.viewer-frames.length > 1 ? root.viewer-frames[min(root.viewer-frame, root.viewer-frames.length - 1)] : root.viewer-image;
+                        width: parent.width * parent.zoom;
+                        height: parent.height * parent.zoom;
+                        x: (parent.width - self.width) / 2 + parent.pan-x;
+                        y: (parent.height - self.height) / 2 + parent.pan-y;
+                        image-fit: contain;
+                    }
+                    TouchArea {
+                        pointer-event(e) => {
+                            if e.kind == PointerEventKind.down {
+                                parent.base-x = parent.pan-x;
+                                parent.base-y = parent.pan-y;
+                                parent.dragged = false;
+                            }
+                        }
+                        moved => {
+                            if self.pressed && parent.zoom > 1.01 {
+                                parent.pan-x = parent.base-x + (self.mouse-x - self.pressed-x);
+                                parent.pan-y = parent.base-y + (self.mouse-y - self.pressed-y);
+                                parent.fit();
+                            }
+                            if abs(self.mouse-x - self.pressed-x) + abs(self.mouse-y - self.pressed-y) > 8px {
+                                parent.dragged = true;
+                            }
+                        }
+                        // A tap on the unzoomed picture closes it, as around it.
+                        clicked => {
+                            if !parent.dragged && parent.zoom <= 1.01 { root.viewer-open = false; }
+                        }
+                        double-clicked => {
+                            parent.base-zoom = parent.zoom;
+                            parent.base-x = parent.pan-x;
+                            parent.base-y = parent.pan-y;
+                            parent.zoom-about(parent.zoom > 1.01 ? 1 : 2.5, self.mouse-x - parent.width / 2, self.mouse-y - parent.height / 2, self.mouse-x - parent.width / 2, self.mouse-y - parent.height / 2);
+                        }
+                        scroll-event(e) => {
+                            if e.delta-y == 0 { return reject; }
+                            parent.base-zoom = parent.zoom;
+                            parent.base-x = parent.pan-x;
+                            parent.base-y = parent.pan-y;
+                            parent.zoom-about(parent.zoom * (e.delta-y > 0 ? 1.15 : 1 / 1.15), self.mouse-x - parent.width / 2, self.mouse-y - parent.height / 2, self.mouse-x - parent.width / 2, self.mouse-y - parent.height / 2);
+                            return accept;
+                        }
+                    }
+                    pinch := ScaleRotateGestureHandler {
+                        property <length> start-x;
+                        property <length> start-y;
+                        started => {
+                            parent.base-zoom = parent.zoom;
+                            parent.base-x = parent.pan-x;
+                            parent.base-y = parent.pan-y;
+                            parent.dragged = true;
+                            self.start-x = self.center.x - parent.width / 2;
+                            self.start-y = self.center.y - parent.height / 2;
+                        }
+                        updated => {
+                            parent.zoom-about(parent.base-zoom * self.scale, self.start-x, self.start-y, self.center.x - parent.width / 2, self.center.y - parent.height / 2);
+                        }
+                    }
                 }
             }
             // Save / Forward / Close, top right.
@@ -3144,16 +3448,31 @@ export component AppWindow inherits Window {
                 }
                 VerticalLayout { alignment: center; Btn { text: "All files…"; clicked => { root.picker-all-files(); } } }
             }
-            ListView {
-                height: min(440px, max(160px, root.height - Safe.top - Safe.bottom - 330px));
+            HorizontalLayout {
+                alignment: end;
+                Rectangle {
+                    width: grid-label.preferred-width + 16px;
+                    height: 26px;
+                    border-radius: 13px;
+                    background: grid-ta.has-hover ? Theme.hover : Theme.raised;
+                    grid-label := Text { text: root.picker-grid ? "☰  List" : "▦  Grid"; font-size: 12px; color: Theme.text; }
+                    grid-ta := TouchArea { mouse-cursor: pointer; clicked => { root.picker-grid = !root.picker-grid; } }
+                }
+            }
+            if !root.picker-grid: ListView {
+                height: min(440px, max(160px, root.height - Safe.top - Safe.bottom - 360px));
                 for e[i] in root.picker-entries: Rectangle {
-                    height: 52px;
+                    height: 60px;
                     border-radius: 8px;
                     background: e.picked ? Theme.accent-soft : pick-ta.has-hover ? Theme.hover : transparent;
                     HorizontalLayout {
-                        padding-left: 10px;
+                        padding-left: 8px;
                         padding-right: 10px;
-                        spacing: 8px;
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            PickThumb { entry: e; size: 48px; }
+                        }
                         VerticalLayout {
                             alignment: center;
                             horizontal-stretch: 1;
@@ -3163,6 +3482,53 @@ export component AppWindow inherits Window {
                         if e.picked: Text { text: "✓"; color: Theme.accent; font-weight: 800; vertical-alignment: center; }
                     }
                     pick-ta := TouchArea { mouse-cursor: pointer; clicked => { root.picker-tap(i); } }
+                }
+            }
+            // A gallery: three or more squares a row, folders first.
+            if root.picker-grid: Flickable {
+                property <int> cols: max(3, floor(self.width / 120px));
+                property <length> cell: self.width / self.cols;
+                height: min(480px, max(180px, root.height - Safe.top - Safe.bottom - 360px));
+                content-height: ceil(root.picker-entries.length / self.cols) * self.cell;
+                for e[i] in root.picker-entries: Rectangle {
+                    x: mod(i, parent.cols) * parent.cell;
+                    y: floor(i / parent.cols) * parent.cell;
+                    width: parent.cell;
+                    height: parent.cell;
+                    Rectangle {
+                        x: 2px;
+                        y: 2px;
+                        width: parent.width - 4px;
+                        height: parent.height - 4px;
+                        border-radius: 6px;
+                        clip: true;
+                        background: Theme.raised;
+                        if e.thumb.width > 0: Image { source: e.thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                        if e.thumb.width == 0: VerticalLayout {
+                            alignment: center;
+                            padding: 6px;
+                            spacing: 4px;
+                            HorizontalLayout { alignment: center; PickThumb { entry: e; size: 40px; } }
+                            Text { text: e.name; color: Theme.text; font-size: 11px; horizontal-alignment: center; overflow: elide; font-weight: e.dir ? 700 : 400; }
+                        }
+                        if e.kind == 2 && e.thumb.width > 0: Rectangle {
+                            x: 6px; y: parent.height - 26px; width: 20px; height: 20px; border-radius: 10px;
+                            background: #000000a0;
+                            Text { text: "▶"; color: white; font-size: 10px; }
+                        }
+                        if e.picked: Rectangle {
+                            border-width: 3px;
+                            border-color: Theme.accent;
+                            border-radius: 6px;
+                            background: Theme.accent.transparentize(0.75);
+                            Rectangle {
+                                x: parent.width - 28px; y: 6px; width: 22px; height: 22px; border-radius: 11px;
+                                background: Theme.accent;
+                                Text { text: "✓"; color: Theme.on-accent; font-weight: 800; font-size: 12px; }
+                            }
+                        }
+                    }
+                    TouchArea { mouse-cursor: pointer; clicked => { root.picker-tap(i); } }
                 }
             }
             if root.picker-entries.length == 0: Text { text: "Nothing here."; color: Theme.muted; font-size: 12px; horizontal-alignment: center; }

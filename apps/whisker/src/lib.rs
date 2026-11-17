@@ -148,6 +148,8 @@ struct State {
     picture_tries: HashMap<OwnedEventId, u8>,
     /// Decoded image previews, by event.
     pictures: HashMap<OwnedEventId, Option<Pixels>>,
+    /// Previews of web links (YouTube and others), by event.
+    link_cards: HashMap<OwnedEventId, ui::LinkCard>,
     /// Read receipts per room, worked out when they change (it reads every
     /// member's receipt, too slow to redo on every redraw).
     marks: HashMap<RoomKey, Vec<timeline::ReadMark>>,
@@ -195,6 +197,13 @@ struct Ctl {
     cancel: Arc<tokio::sync::Notify>,
     /// Downloads going on that the ✕ can stop.
     downloading: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bumped by the ✕ next to "Uploading…": uploads going on stop, and
+    /// the files still waiting aren't sent.
+    upload_stop: Arc<std::sync::atomic::AtomicU64>,
+    /// Woken by that ✕, to stop an upload part way.
+    upload_cancel: Arc<tokio::sync::Notify>,
+    /// Batches of uploads going on.
+    uploading: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn local(ts: MilliSecondsSinceUnixEpoch) -> Option<chrono::DateTime<chrono::Local>> {
@@ -593,6 +602,7 @@ impl Ctl {
     /// animated GIF/WebP files (so they play). A few at a time, decoded off
     /// the network threads.
     fn fetch_pictures(&self, key: &RoomKey, items: &[HistoryItem]) {
+        self.fetch_link_cards(key, items);
         let items = &self.resolve_links(key, items);
         let wanted: Vec<(OwnedEventId, Vec<Attempt>)> = {
             let st = self.st.lock().unwrap();
@@ -709,6 +719,60 @@ impl Ctl {
                     }
                 });
             }
+        });
+    }
+
+    /// Link previews for messages with a web link: offered (a tap loads
+    /// it) or loaded straight away, as Settings say.
+    fn fetch_link_cards(&self, key: &RoomKey, items: &[HistoryItem]) {
+        let mode = self.settings.lock().unwrap().link_previews;
+        if mode == 0 {
+            return;
+        }
+        let mut load = Vec::new();
+        {
+            let mut st = self.st.lock().unwrap();
+            for m in items {
+                if m.media.is_some() || m.notice || st.link_cards.contains_key(&m.event_id) || timeline::is_undecryptable(&m.body) {
+                    continue;
+                }
+                let Some(url) = format::links(&m.body).into_iter().find(|l| ui::LinkCard::wanted(l)) else { continue };
+                let state = if mode == 2 { ui::CardState::Loading } else { ui::CardState::Offer };
+                st.link_cards.insert(m.event_id.clone(), ui::LinkCard { url: url.clone(), state, ..Default::default() });
+                if mode == 2 {
+                    load.push((m.event_id.clone(), url));
+                }
+            }
+        }
+        for (id, url) in load {
+            self.load_link_card(key, id, url);
+        }
+    }
+
+    /// Fetches one link preview (through the account's proxy).
+    fn load_link_card(&self, key: &RoomKey, id: OwnedEventId, url: String) {
+        let (c, key) = (self.clone(), key.clone());
+        self.spawn(async move {
+            let proxy = c.mgr.details(key.0).await.and_then(|d| d.1);
+            let got = {
+                let _slot = PREVIEW_SLOTS.acquire().await;
+                whisker_core::link_preview::fetch(&url, proxy.as_deref()).await
+            };
+            let card = match got {
+                Ok(p) => {
+                    let picture = match p.image {
+                        Some(b) => tokio::task::spawn_blocking(move || decode(&b, 720, 400, false)).await.ok().flatten(),
+                        None => None,
+                    };
+                    ui::LinkCard { url: p.url, site: p.site, title: p.title, description: p.description, picture, video: p.video, state: ui::CardState::Ready }
+                }
+                Err(e) => {
+                    tracing::debug!("no preview for a link: {e:#}");
+                    ui::LinkCard { url, state: ui::CardState::Failed, ..Default::default() }
+                }
+            };
+            c.st.lock().unwrap().link_cards.insert(id.clone(), card);
+            c.update_message(&key, &id);
         });
     }
 
@@ -1231,6 +1295,7 @@ impl Ctl {
                 MsgRow {
                     picture: st.pictures.get(&m.event_id).cloned().flatten(),
                     picture_failed: matches!(st.pictures.get(&m.event_id), Some(None)),
+                    link_card: st.link_cards.get(&m.event_id).cloned(),
                     frames: st.animations.get(&m.event_id).cloned(),
                     mine: me.as_ref() == Some(&m.sender),
                     first,
@@ -2811,7 +2876,12 @@ impl Ctl {
         }
         self.st.lock().unwrap().pending_files.extend(paths);
         self.show_pending_files();
-        self.ui(|u| u.set_focus_request(u.get_focus_request() + 1));
+        // Not on a phone: the keyboard would cover the files just added.
+        self.ui(|u| {
+            if !u.global::<Prefs>().get_touch() {
+                u.set_focus_request(u.get_focus_request() + 1);
+            }
+        });
     }
 
     /// Opens the room's whole description in a window of its own, with
@@ -3011,6 +3081,7 @@ impl Ctl {
         reply_to: Option<OwnedEventId>,
     ) {
         let opts = self.settings.lock().unwrap().upload.clone();
+        let ticket = self.uploads_start();
         let slots = Arc::new(tokio::sync::Semaphore::new(UPLOADS_AT_ONCE));
         let shown = Arc::new(Mutex::new(Uploads {
             total: paths.len(),
@@ -3046,16 +3117,21 @@ impl Ctl {
                         }
                     };
                     progress(0);
-                    let r = timeline::upload_file(&room, &path, &opts, progress).await;
+                    let r = me.stoppable(ticket, timeline::upload_file(&room, &path, &opts, progress)).await;
                     shown.lock().unwrap().active.remove(&i);
                     r
                 }),
             ));
         }
         let mut failed = Vec::new();
+        let mut stopped = 0;
         for (i, (name, job)) in jobs.into_iter().enumerate() {
             let reply = if i == 0 { reply_to.as_deref() } else { None };
             let r = match job.await {
+                Ok(Err(e)) if e.to_string() == "cancelled" => {
+                    stopped += 1;
+                    continue;
+                }
                 Ok(Ok(message)) => {
                     let message = if i + 1 == count {
                         whisker_core::upload::with_caption(message, &caption)
@@ -3078,6 +3154,10 @@ impl Ctl {
                 Ok(()) => self.status(line),
                 Err(e) => failed.push(format!("{name}: {e:#}")),
             }
+        }
+        self.uploads_end();
+        if stopped > 0 {
+            failed.push(format!("{stopped} not sent (stopped)"));
         }
         match failed.as_slice() {
             [] => self.status(""),
@@ -3176,6 +3256,19 @@ impl Ctl {
                 }
             }
             "retry-media" => self.retry_picture(&key, m),
+            "link-preview" => {
+                let url = {
+                    let mut st = self.st.lock().unwrap();
+                    st.link_cards.get_mut(&m.event_id).filter(|c| c.state == ui::CardState::Offer).map(|c| {
+                        c.state = ui::CardState::Loading;
+                        c.url.clone()
+                    })
+                };
+                if let Some(url) = url {
+                    self.update_message(&key, &m.event_id);
+                    self.load_link_card(&key, m.event_id.clone(), url);
+                }
+            }
             "copy-file" => {
                 let Some(media) = &m.media else { return };
                 let (link, keyed) = files::link_for(&media.source, &room, &m.event_id);
@@ -3585,85 +3678,91 @@ impl Ctl {
         });
     }
 
-    /// Sends everything shared to the room, then opens it.
+    /// Opens the room and sends everything shared to it in the background,
+    /// the way files picked in a chat go: Whisker can be used meanwhile, the
+    /// status line says how far it is, and its ✕ stops it.
     async fn share_to(&self, target: String) {
         let (Some(account), items) = ({
-            let st = self.st.lock().unwrap();
-            (st.share_account, st.sharing.clone())
+            let mut st = self.st.lock().unwrap();
+            (st.share_account, std::mem::take(&mut st.sharing))
         }) else {
             return;
         };
         let Some(client) = self.mgr.client(account).await else { return };
-        let Some(room) = OwnedRoomId::try_from(target.as_str()).ok().and_then(|id| client.get_room(&id)) else { return };
-        let mark = |sending: bool, id: String| {
-            move |u: &AppWindow| {
-                u.set_share_busy(sending);
-                ui::with(|m| {
-                    if let Some(i) = (0..m.forward.row_count()).find(|&i| m.forward.row_data(i).is_some_and(|r| r.id == id.as_str())) {
-                        let mut r = m.forward.row_data(i).unwrap();
-                        r.sent = sending;
-                        m.forward.set_row_data(i, r);
-                    }
-                });
-            }
+        let Some(room) = OwnedRoomId::try_from(target.as_str()).ok().and_then(|id| client.get_room(&id)) else {
+            self.st.lock().unwrap().sharing = items;
+            return;
         };
-        self.ui(mark(true, target.clone()));
-        let total = items.len();
-        let mut too_big = Vec::new();
-        for (i, item) in items.into_iter().enumerate() {
-            if total > 1 {
-                let m = format!("Sending {} of {total}…", i + 1);
-                self.ui(move |u| u.set_share_status(s(m)));
-            }
-            let sent = match item {
-                share::Shared::File { name, data } => {
-                    let opts = self.settings.lock().unwrap().upload.clone();
-                    timeline::send_bytes(&room, &name, data, &opts)
-                        .await
-                        .map_err(|e| (name, e))
-                }
-                share::Shared::Text(t) => timeline::send_text(&room, &t, None, &[])
-                    .await
-                    .map(drop)
-                    .map_err(|e| ("the text".into(), e)),
-                share::Shared::TooBig(name) => {
-                    too_big.push(name);
-                    Ok(())
-                }
-            };
-            if let Err((name, e)) = sent {
-                // What went already is done; a retry sends only the rest.
-                self.st.lock().unwrap().sharing.drain(..i);
-                let m = format!("Couldn't send {name}: {e:#}");
-                self.ui(mark(false, target));
-                self.ui(move |u| u.set_share_status(s(m)));
-                return;
-            }
-        }
-        let more = {
+        {
             let mut st = self.st.lock().unwrap();
-            st.sharing.drain(..total);
             st.share_account = None;
             st.account_chosen = true;
             st.account = Some(account);
             st.room = None;
-            !st.sharing.is_empty()
-        };
+        }
         let room_id = target.clone();
         self.ui(move |u| {
             u.set_share_busy(false);
             u.set_share_open(false);
             u.set_share_what(s(""));
+            u.set_share_status(s(""));
             u.set_exploring(false);
             u.set_pane(2);
             u.set_current_room(s(&room_id));
         });
+        let c = self.clone();
+        self.spawn(async move {
+            let ticket = c.uploads_start();
+            let total = items.iter().filter(|i| !matches!(i, share::Shared::TooBig(_))).count();
+            let mut too_big = Vec::new();
+            let mut failed = Vec::new();
+            let mut sent = 0;
+            let mut stopped = false;
+            for item in items {
+                if c.upload_stopped(ticket) {
+                    stopped = true;
+                    break;
+                }
+                let r = match item {
+                    share::Shared::File { name, data } => {
+                        c.status(if total > 1 { format!("Sending {} of {total}: {name}…", sent + 1) } else { format!("Sending {name}…") });
+                        let opts = c.settings.lock().unwrap().upload.clone();
+                        c.stoppable(ticket, timeline::send_bytes(&room, &name, data, &opts)).await.map_err(|e| (name, e))
+                    }
+                    share::Shared::Text(t) => c.stoppable(ticket, async { timeline::send_text(&room, &t, None, &[]).await.map(drop) }).await.map_err(|e| ("the text".into(), e)),
+                    share::Shared::TooBig(name) => {
+                        too_big.push(name);
+                        continue;
+                    }
+                };
+                match r {
+                    Ok(_) => sent += 1,
+                    Err((_, e)) if e.to_string() == "cancelled" => {
+                        stopped = true;
+                        break;
+                    }
+                    Err((name, e)) => failed.push(format!("{name}: {e:#}")),
+                }
+            }
+            c.uploads_end();
+            let mut notes = Vec::new();
+            if stopped {
+                notes.push(format!("Stopped: sent {sent} of {total}."));
+            }
+            match failed.as_slice() {
+                [] => {}
+                [one] => notes.push(format!("Couldn't send {one}")),
+                many => notes.push(format!("Couldn't send {} files. {}", many.len(), many.join("; "))),
+            }
+            if !too_big.is_empty() {
+                notes.push(format!("Not sent (over 100 MB): {}", too_big.join(", ")));
+            }
+            c.status(notes.join(" "));
+            c.refresh_accounts_only().await;
+        });
         self.select_room(target).await;
-        self.refresh_accounts_only().await;
-        if !too_big.is_empty() {
-            self.status(format!("Not sent (over 100 MB): {}", too_big.join(", ")));
-        }
-        // More came in while this was sending.
+        // More came in while the first lot was being chosen for.
+        let more = !self.st.lock().unwrap().sharing.is_empty();
         if more {
             let what = share::summary(&self.st.lock().unwrap().sharing);
             self.ui(move |u| u.set_share_what(s(what)));
@@ -3808,6 +3907,48 @@ impl Ctl {
         }
     }
 
+    /// Starts a batch of uploads the ✕ next to the status line can stop:
+    /// returns its ticket for [`Ctl::upload_stopped`] and [`Ctl::stoppable`].
+    fn uploads_start(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.uploading.fetch_add(1, Ordering::SeqCst);
+        self.ui(|u| u.set_uploading(true));
+        self.upload_stop.load(Ordering::SeqCst)
+    }
+
+    fn uploads_end(&self) {
+        use std::sync::atomic::Ordering;
+        if self.uploading.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.ui(|u| u.set_uploading(false));
+        }
+    }
+
+    /// Whether the ✕ was pressed since the batch with `ticket` started.
+    fn upload_stopped(&self, ticket: u64) -> bool {
+        self.upload_stop.load(std::sync::atomic::Ordering::SeqCst) != ticket
+    }
+
+    /// Runs one upload, unless the ✕ stops it ("cancelled").
+    async fn stoppable<T>(&self, ticket: u64, fut: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+        let cancel = self.upload_cancel.clone();
+        let stop = cancel.notified();
+        tokio::pin!(stop);
+        stop.as_mut().enable();
+        if self.upload_stopped(ticket) {
+            return Err(anyhow::anyhow!("cancelled"));
+        }
+        tokio::select! {
+            r = fut => r,
+            _ = stop => Err(anyhow::anyhow!("cancelled")),
+        }
+    }
+
+    fn cancel_uploads(&self) {
+        self.upload_stop.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.upload_cancel.notify_waiters();
+        self.status("Stopping the uploads…");
+    }
+
     /// Runs a download someone asked for, which the ✕ next to the status
     /// line can stop ("cancelled").
     async fn cancellable<T>(&self, fut: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
@@ -3860,7 +4001,12 @@ impl Ctl {
             }
         }
         self.show_pending_files();
-        self.ui(|u| u.set_focus_request(u.get_focus_request() + 1));
+        // Not on a phone: the keyboard would cover the files just added.
+        self.ui(|u| {
+            if !u.global::<Prefs>().get_touch() {
+                u.set_focus_request(u.get_focus_request() + 1);
+            }
+        });
     }
 
     async fn view_image(&self, key: &RoomKey, m: HistoryItem) {
@@ -4153,6 +4299,21 @@ impl Ctl {
         let _ = st.save(self.mgr.data_dir());
         if let Some(u) = self.ui.upgrade() {
             u.global::<Prefs>().set_notify_level(st.notify_level);
+        }
+    }
+
+    fn remember_volume(&self, level: i32) {
+        let mut st = self.settings.lock().unwrap();
+        st.volume = level.clamp(1, 100);
+        let _ = st.save(self.mgr.data_dir());
+    }
+
+    fn set_link_previews(&self, mode: i32) {
+        let mut st = self.settings.lock().unwrap();
+        st.link_previews = mode.clamp(0, 2);
+        let _ = st.save(self.mgr.data_dir());
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_link_previews(st.link_previews);
         }
     }
 
@@ -5815,6 +5976,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_show_events(prefs.show_events);
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_key_sharing(prefs.key_sharing.clamp(0, 2));
+    ui.global::<Prefs>().set_link_previews(prefs.link_previews.clamp(0, 2));
+    ui.global::<Player>().set_volume(prefs.volume.clamp(1, 100));
+    ui.set_rooms_hidden(prefs.rooms_hidden);
+    ui::VOLUME.store(prefs.volume.clamp(1, 100) as u32, std::sync::atomic::Ordering::Relaxed);
     mgr.set_key_sharing(prefs.key_sharing.clamp(0, 2) as u8);
     ui.global::<Prefs>().set_media_cache_mb(prefs.media_cache_mb.clamp(20, 4000));
     mgr.set_media_cache_limit(prefs.media_cache_mb.clamp(20, 4000) as u64 * 1024 * 1024);
@@ -5867,6 +6032,9 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         locks: Arc::default(),
         cancel: Arc::default(),
         downloading: Arc::default(),
+        upload_stop: Arc::default(),
+        upload_cancel: Arc::default(),
+        uploading: Arc::default(),
     };
 
     // Runs `method` on the tokio runtime with the callback's arguments.
@@ -5928,6 +6096,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_cancel_downloads(move || c.cancel.notify_waiters());
+        let c = ctl.clone();
+        ui.on_cancel_uploads(move || c.cancel_uploads());
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -5944,6 +6114,13 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.global::<Player>().on_seek(move |f| player::seek(&c.ui, f));
         let c = ctl.clone();
         ui.global::<Player>().on_mute(move || player::mute(&c.ui));
+        let c = ctl.clone();
+        ui.global::<Player>().on_set_volume(move |v| {
+            player::set_volume(&c.ui, v);
+            if v > 0 {
+                c.remember_volume(v);
+            }
+        });
         let c = ctl.clone();
         ui.global::<Player>().on_toggle_loop(move || player::toggle_loop(&c.ui));
         let c = ctl.clone();
@@ -6098,6 +6275,20 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_set_key_sharing(move |i| c.set_key_sharing(i));
+    }
+    {
+        let c = ctl.clone();
+        ui.on_set_link_previews(move |i| c.set_link_previews(i));
+    }
+    {
+        let c = ctl.clone();
+        ui.on_rooms_hidden_changed(move |on| {
+            let mut st = c.settings.lock().unwrap();
+            if st.rooms_hidden != on {
+                st.rooms_hidden = on;
+                let _ = st.save(c.mgr.data_dir());
+            }
+        });
     }
     {
         let c = ctl.clone();

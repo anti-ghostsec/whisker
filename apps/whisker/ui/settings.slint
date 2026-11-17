@@ -1266,10 +1266,54 @@ component AgentPage inherits VerticalLayout {
         border-radius: 10px;
         HorizontalLayout { padding: 12px; Text { text: root.test-status; wrap: word-wrap; color: Theme.text; } }
     }
+    // Fills in settings for a person-like chat partner (not saved until Save).
+    property <bool> preset-done;
+    property <bool> confirm-forget;
+    function human-defaults() {
+        root.a-max-tokens = 1024;
+        root.a-reply-chars = 300;
+        root.a-history = 24;
+        root.a-summarize = true;
+        root.a-context = 3000;
+        root.a-cooldown = 2;
+        root.a-yield = 8;
+        root.a-rapid = 4;
+        root.a-steps = 4;
+        root.a-prompt = "You're a real person hanging out in this chat, not an assistant or a help bot. Text like people actually text: short and casual, usually one or two sentences, sometimes just a few words. No lists, headings or bullet points. Don't offer help, don't ask if there's anything else, don't summarise or lecture, and don't explain yourself unless someone asks. Have your own opinions, moods and sense of humour; it's fine to disagree, tease, change the subject or not know something. Match the other person's tone and how much they write. Don't repeat phrases or the shape of your earlier messages. Only say you're an AI if someone sincerely asks.";
+        // Penalties only where the service is known to take them.
+        root.a-extra = root.agent.service == "Venice"
+            ? "{\n  \"temperature\": 0.9,\n  \"presence_penalty\": 0.4,\n  \"frequency_penalty\": 0.3,\n  \"venice_parameters\": { \"disable_thinking\": true }\n}"
+            : root.agent.service == "OpenAI" || root.agent.service == "OpenRouter"
+            ? "{\n  \"temperature\": 0.9,\n  \"presence_penalty\": 0.4,\n  \"frequency_penalty\": 0.3\n}"
+            : "{\n  \"temperature\": 0.9\n}";
+        root.preset-done = true;
+    }
+    VerticalLayout {
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Btn { text: "Human chat defaults"; clicked => { root.human-defaults(); } }
+            if root.agent.exists: Btn {
+                text: root.confirm-forget ? "Really forget everything?" : "Clear memory";
+                danger: root.confirm-forget;
+                clicked => {
+                    if root.confirm-forget { root.card-action("clear-memory", root.form()); root.confirm-forget = false; } else { root.confirm-forget = true; }
+                }
+            }
+            if root.confirm-forget: Btn { text: "Keep it"; clicked => { root.confirm-forget = false; } }
+        }
+        Text {
+            text: root.preset-done
+                ? "Filled in: short, casual replies like a person in a group chat, room for the model to finish its sentences, a shorter history and a summary of older messages, and less repetition. Your instructions above were replaced. Press Save to keep it."
+                : "Human chat defaults: short, person-like replies instead of a help bot (fills the settings in; nothing changes until you press Save). Clear memory: the AI forgets every room's messages, summary and notes, so old replies stop steering it.";
+            font-size: 11px; color: Theme.muted; wrap: word-wrap;
+        }
+    }
     HorizontalLayout {
         spacing: 8px;
         alignment: start;
-        Btn { text: root.agent.exists ? "Save" : "Save and start"; primary: true; clicked => { root.save-agent(root.form()); root.a-key = ""; } }
+        Btn { text: root.agent.exists ? "Save" : "Save and start"; primary: true; clicked => { root.save-agent(root.form()); root.a-key = ""; root.preset-done = false; } }
         Btn { text: "Test"; clicked => { root.test-agent(root.form()); } }
         if root.agent.exists: Btn { text: "Remove AI setup"; danger: true; clicked => { root.remove-agent(); } }
     }

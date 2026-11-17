@@ -124,7 +124,7 @@ struct Persona {
 fn persona(cfg: &AgentConfig, lines: &[&Line], event_id: &OwnedEventId, sender: &UserId) -> Persona {
     let mut tail = Vec::new();
     if cfg.reply_chars > 0 {
-        tail.push(format!("Keep the visible reply under {} characters (a <state> block doesn't count).", cfg.reply_chars));
+        tail.push(format!("Keep the visible reply under {} characters (a <state> block doesn't count), and finish your last sentence.", cfg.reply_chars));
     }
     let Some(card) = &cfg.card else { return Persona { system: vec![cfg.system_prompt.clone()], tail } };
     let user = lines.iter().rev().find(|l| &l.event_id == event_id).and_then(|l| l.name.as_deref()).map(safe_name).filter(|n| !n.is_empty()).unwrap_or_else(|| safe_name(sender.localpart()));
@@ -728,6 +728,7 @@ impl AgentRunner {
         let mut web_session = web::Session::new(lines.iter().map(|l| l.body.as_str()).chain([request_text]));
         let mut read_web = false;
         let mut reply = String::new();
+        let mut cut = false;
         // Only a turn that ends without asking for more tools is a finished
         // answer; text from a turn cut off by `max_steps` is half a thought.
         let mut finished = false;
@@ -737,6 +738,7 @@ impl AgentRunner {
                 return Ok((false, None));
             }
             reply = turn.text.clone();
+            cut = turn.cut;
             messages.push(turn.assistant);
             if turn.calls.is_empty() {
                 finished = true;
@@ -775,8 +777,18 @@ impl AgentRunner {
             return Ok((false, None));
         }
 
+        // A reasoning model's thinking never reaches the chat either.
+        let reply = reply::hide_thinking(&reply);
         // The hidden state never reaches the chat, closed, cut off or alone.
         let (shown, state) = reply::hide_state(&reply);
+        // Stopped by the token limit: the unfinished sentence isn't posted
+        // (or remembered, where the model would copy it next time).
+        let shown = if cut {
+            tracing::info!("agent {me}: the reply hit the token limit ({}); posting only its finished sentences", self.cfg.max_tokens);
+            reply::finished_part(shown.trim())
+        } else {
+            shown
+        };
         let shown = reply::cap(shown.trim(), self.cfg.reply_chars);
         if can_reply && !shown.is_empty() && shown != "NO_REPLY" {
             room.send(agent_message(&shown)).await?;

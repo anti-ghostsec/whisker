@@ -5656,6 +5656,25 @@ impl Ctl {
             None => (saved.as_ref().and_then(|c| c.card.clone()), self.card_picture(&vault, id).await),
         };
         match action.as_str() {
+            "clear-memory" => {
+                let running = self.st.lock().unwrap().agents.remove(&id);
+                if let Some(h) = &running {
+                    h.abort();
+                    // Let a save that was under way finish before it's wiped.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                let r = self.mgr.set_extra(&vault, &whisker_agent::memory::vault_key(id), &whisker_agent::memory::Memory::default()).await;
+                if running.is_some()
+                    && let Some(cfg) = saved.filter(|c| c.enabled)
+                    && let Ok(h) = whisker_agent::spawn(cfg, self.mgr.clone())
+                {
+                    self.st.lock().unwrap().agents.insert(id, h);
+                }
+                self.settings_msg(match r {
+                    Ok(()) => "Memory cleared: the AI starts fresh in every room.".to_owned(),
+                    Err(e) => format!("Couldn't clear the memory: {e:#}"),
+                });
+            }
             "import" => {
                 let Some(bytes) = pick_file("Import a character card", &["png", "json"]).await else { return };
                 match whisker_agent::card::import(&bytes) {

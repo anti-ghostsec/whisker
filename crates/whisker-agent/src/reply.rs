@@ -5,6 +5,44 @@
 //! [`hide_state`] takes it out (closed or cut off, any spelling of the tag)
 //! and hands it back so the next prompt can show it to the model again.
 
+/// The reply without a reasoning model's `<think>…</think>` (or
+/// `<thinking>`) part. Unclosed, it hides the rest; a closing tag alone
+/// (the opening one was stripped upstream) hides everything before it.
+pub fn hide_thinking(text: &str) -> String {
+    let mut out = text.to_owned();
+    for tag in ["think", "thinking", "reasoning"] {
+        let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+        loop {
+            let lower = out.to_ascii_lowercase();
+            match (lower.find(&open), lower.find(&close)) {
+                (Some(o), Some(c)) if c > o => out.replace_range(o..c + close.len(), ""),
+                (Some(o), _) => out.truncate(o),
+                (None, Some(c)) => out.replace_range(..c + close.len(), ""),
+                (None, None) => break,
+            }
+        }
+    }
+    out.trim().to_owned()
+}
+
+/// A reply the token limit cut off, without its unfinished last sentence.
+/// If no sentence was finished, the words so far with "…".
+pub fn finished_part(text: &str) -> String {
+    let text = text.trim_end();
+    let ends = |c: char| matches!(c, '.' | '!' | '?' | '…' | '"' | '”' | ')' | '*' | '~') || (c as u32) >= 0x1F300;
+    if text.chars().last().is_some_and(ends) {
+        return text.to_owned();
+    }
+    let last = text.char_indices().filter(|&(_, c)| ends(c) || c == '\n').map(|(i, c)| i + c.len_utf8()).next_back();
+    match last {
+        Some(i) if text[..i].trim().chars().count() >= 2 => text[..i].trim_end().to_owned(),
+        _ => match text.rfind(char::is_whitespace) {
+            Some(w) if w > 0 => format!("{}…", text[..w].trim_end()),
+            _ => format!("{text}…"),
+        },
+    }
+}
+
 /// The reply without any `<state…>` blocks, and the last block's contents.
 /// An opening tag with no closing one (a reply cut short) hides everything
 /// after it; a stray closing tag is dropped.
@@ -117,6 +155,23 @@ pub fn cap(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cut_replies_end_on_a_finished_sentence() {
+        assert_eq!(finished_part("Hey there! I was going to say that before running"), "Hey there!");
+        assert_eq!(finished_part("lol same.\n\nanyway before running"), "lol same.");
+        assert_eq!(finished_part("Done."), "Done.");
+        assert_eq!(finished_part("well before running off to"), "well before running off…");
+        assert_eq!(finished_part("*waves* hi there and"), "*waves*");
+    }
+
+    #[test]
+    fn thinking_never_reaches_the_chat() {
+        assert_eq!(hide_thinking("<think>plan it</think>\nHi!"), "Hi!");
+        assert_eq!(hide_thinking("plan it</think> Hi!"), "Hi!");
+        assert_eq!(hide_thinking("Hi! <think>more"), "Hi!");
+        assert_eq!(hide_thinking("I think so"), "I think so");
+    }
 
     #[test]
     fn state_never_reaches_the_chat() {

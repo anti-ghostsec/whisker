@@ -84,6 +84,12 @@ operating system and the **Wisp** browser.
   The server fetches the video from YouTube for you, and nothing is allowed to send
   Whisker on to YouTube itself, so YouTube never sees your device. The video goes to the
   RAM folder like any other. Without a server, ▶ opens the link in your browser.
+- **AI replies end on a finished sentence.** When a reply hits the token limit, only its
+  finished sentences are posted (and remembered), so the AI doesn't learn to trail off;
+  a reasoning model's thinking is never posted. On an AI's page, *Human chat defaults*
+  fills in settings for a short, casual, person-like chat partner instead of a help bot
+  (press Save to keep them), and *Clear memory* makes it forget every room's messages,
+  summary and notes.
 - **Room list in parts.** Invitations, Spaces, People (direct chats) and Rooms each get a
   heading. Hold a room or space for a moment and drag it to move it within its part (or
   use *Move up* / *Move down* in its menu); *Sort by newest activity again* undoes it. The

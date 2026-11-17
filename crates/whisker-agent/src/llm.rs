@@ -31,6 +31,8 @@ pub struct Turn {
     pub calls: Vec<ToolCall>,
     /// The model declined; don't post anything.
     pub refused: bool,
+    /// It stopped because it hit the token limit, likely mid-sentence.
+    pub cut: bool,
 }
 
 /// Venice-only switches. Both off unless the owner turns them on: Venice's
@@ -165,7 +167,7 @@ impl Llm {
         } else {
             Vec::new()
         };
-        Ok(Turn { assistant: json!({ "role": "assistant", "content": content }), text, calls, refused: stop == "refusal" })
+        Ok(Turn { assistant: json!({ "role": "assistant", "content": content }), text, calls, refused: stop == "refusal", cut: stop == "max_tokens" })
     }
 
     async fn openai(&self, endpoint: &str, system: &[&str], messages: &[Value], tools: &[ToolDef]) -> Result<Turn> {
@@ -186,6 +188,8 @@ impl Llm {
             let mut vp = serde_json::Map::new();
             vp.insert("include_venice_system_prompt".into(), json!(self.venice.system_prompt));
             vp.insert("enable_web_search".into(), json!(if self.venice.web_search { "auto" } else { "off" }));
+            // A reasoning model's thinking is never for the chat.
+            vp.insert("strip_thinking_response".into(), json!(true));
             if let Some(Value::Object(own)) = body.get("venice_parameters") {
                 vp.extend(own.clone());
             }
@@ -221,7 +225,7 @@ impl Llm {
                 calls.push(call);
             }
         }
-        Ok(Turn { assistant: json!({ "role": "assistant", "content": content }), text, calls, refused: false })
+        Ok(Turn { assistant: json!({ "role": "assistant", "content": content }), text, calls, refused: false, cut: choice["finish_reason"] == "length" })
     }
 }
 

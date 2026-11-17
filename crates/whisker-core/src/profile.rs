@@ -62,6 +62,12 @@ pub struct AccountRecord {
     /// different proxies (or Tor circuits) stops a server linking them by IP.
     #[serde(default)]
     pub proxy: Option<String>,
+    /// The order rooms and spaces were dragged into (room ids, first on
+    /// top). Kept here, in the encrypted vault, not on the server: nothing
+    /// about how you sort your rooms leaves this device. Empty: newest
+    /// activity first.
+    #[serde(default)]
+    pub room_order: Vec<String>,
     pub session: MatrixSession,
     /// Encrypts this account's local Matrix store (keys, room state).
     pub store_passphrase: String,

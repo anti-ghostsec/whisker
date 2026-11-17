@@ -78,6 +78,18 @@ operating system and the **Wisp** browser.
   off, tap to load (the default) or automatic. Previews are fetched by your device, through
   the account's proxy when it has one, never by your server, so the site sees a request
   from you (or the proxy) and nothing else. Local and private addresses are never fetched.
+- **YouTube in the message, without YouTube.** Settings → *Play YouTube videos through
+  Invidious*: name an Invidious server (your own is best: most public ones block apps)
+  and YouTube previews come from it, and ▶ on a YouTube card plays the video right there.
+  The server fetches the video from YouTube for you, and nothing is allowed to send
+  Whisker on to YouTube itself, so YouTube never sees your device. The video goes to the
+  RAM folder like any other. Without a server, ▶ opens the link in your browser.
+- **Room list in parts.** Invitations, Spaces, People (direct chats) and Rooms each get a
+  heading. Hold a room or space for a moment and drag it to move it within its part (or
+  use *Move up* / *Move down* in its menu); *Sort by newest activity again* undoes it. The
+  order is kept in your encrypted vault, never on the server.
+- **Space pages hide rooms you can't join**: invite-only rooms (the moderators' room, say)
+  and ones only members of other rooms may join, unless you're already in them or invited.
 - **Room list folds away.** The panel button at the top left of a chat hides the room list
   down to the account rail (and brings it back); it's remembered. On phones a chat gets the
   whole screen, and the keyboard only comes up when you tap the message box (scrolling or

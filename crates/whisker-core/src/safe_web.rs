@@ -20,6 +20,21 @@ pub struct Ask<'a> {
     pub max_bytes: usize,
     pub user_agent: &'a str,
     pub timeout: Duration,
+    /// Redirects must stay on the first URL's host (a privacy front-end
+    /// mustn't hand the request on to the site it stands in for).
+    pub same_host: bool,
+    /// Told the bytes so far and the total (0: not known) as they come.
+    pub progress: Option<&'a (dyn Fn(u64, u64) + Send + Sync)>,
+    /// A server the user named themselves (their own Invidious, say): it
+    /// may be on their own network or another port. Implies `same_host`;
+    /// one on their own network is reached directly, not through the proxy.
+    pub chosen: bool,
+}
+
+impl<'a> Ask<'a> {
+    pub fn new(accept: &'a str, max_bytes: usize, user_agent: &'a str, timeout: Duration) -> Self {
+        Self { accept, headers: &[], max_bytes, user_agent, timeout, same_host: false, progress: None, chosen: false }
+    }
 }
 
 pub struct Got {
@@ -33,8 +48,20 @@ pub struct Got {
 
 /// GETs `url`, following safe redirects.
 pub async fn get(mut url: Url, proxy: Option<&str>, ask: &Ask<'_>) -> Result<Got> {
+    let first_host = url.host_str().unwrap_or_default().to_owned();
+    let chosen_local = ask.chosen && check_url(&url, true).is_err();
+    let proxy = if chosen_local { None } else { proxy };
     for _ in 0..=MAX_REDIRECTS {
-        check_url(&url, proxy.is_some())?;
+        if ask.chosen {
+            if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+                bail!("only plain http and https addresses");
+            }
+        } else {
+            check_url(&url, proxy.is_some())?;
+        }
+        if (ask.same_host || ask.chosen) && url.host_str() != Some(first_host.as_str()) {
+            bail!("{first_host} sent the request on to {}, which was refused", url.host_str().unwrap_or("another site"));
+        }
         let host = url.host_str().unwrap_or_default().to_owned();
         let mut b = crate::tls::http_builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -43,6 +70,7 @@ pub async fn get(mut url: Url, proxy: Option<&str>, ask: &Ask<'_>) -> Result<Got
             .user_agent(ask.user_agent);
         match proxy {
             Some(p) => b = b.proxy(reqwest::Proxy::all(p).map_err(|e| anyhow!("bad proxy: {e}"))?),
+            None if chosen_local => b = b.no_proxy(),
             None => {
                 b = b.no_proxy();
                 // Check every address now and connect only to those.
@@ -79,6 +107,7 @@ pub async fn get(mut url: Url, proxy: Option<&str>, ask: &Ask<'_>) -> Result<Got
             bail!("{url} answered {status}");
         }
         let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+        let total = resp.content_length().unwrap_or(0);
         let mut body = Vec::new();
         let mut truncated = false;
         while let Some(chunk) = resp.chunk().await.map_err(|e| anyhow!("reading {url}: {}", short_err(&e)))? {
@@ -89,6 +118,9 @@ pub async fn get(mut url: Url, proxy: Option<&str>, ask: &Ask<'_>) -> Result<Got
                 break;
             }
             body.extend_from_slice(&chunk);
+            if let Some(p) = ask.progress {
+                p(body.len() as u64, total);
+            }
         }
         return Ok(Got { url, content_type, body, truncated });
     }

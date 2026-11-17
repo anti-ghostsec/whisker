@@ -61,6 +61,10 @@ export global Prefs {
     in-out property <bool> link-posters: true;
     // Web link previews: 0 off, 1 tap to load, 2 automatic.
     in-out property <int> link-previews: 1;
+    // The Invidious server YouTube links go through ("" for none).
+    in-out property <string> invidious;
+    // YouTube videos play in the message (an Invidious server is set).
+    in-out property <bool> youtube-here;
     in-out property <bool> ask-file-servers: false;
     in-out property <bool> ask-room-servers: false;
     // Uploads (see whisker_core::upload::UploadOptions).

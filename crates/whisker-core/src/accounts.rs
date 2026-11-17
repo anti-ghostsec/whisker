@@ -992,6 +992,7 @@ impl AccountManager {
             label: None,
             tags: req.tags.iter().filter_map(|t| normalize_tag(t)).collect(),
             proxy: req.proxy,
+            room_order: Vec::new(),
             session,
             store_passphrase,
             position,
@@ -1219,6 +1220,16 @@ impl AccountManager {
         self.mutate_account(id, |r| r.tags = tags.clone()).await
     }
 
+    /// The order rooms were dragged into (see `AccountRecord::room_order`).
+    pub async fn room_order(&self, id: AccountId) -> Vec<String> {
+        self.inner.read().await.live.get(&id).map(|a| a.record.room_order.clone()).unwrap_or_default()
+    }
+
+    /// Saved in the vault only.
+    pub async fn set_room_order(&self, id: AccountId, order: Vec<String>) -> Result<()> {
+        self.mutate_account_quiet(id, |r| r.room_order = order.clone()).await
+    }
+
     /// Takes effect the next time the vault is unlocked.
     pub async fn set_proxy(&self, id: AccountId, proxy: Option<String>) -> Result<()> {
         let proxy = proxy.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty());
@@ -1405,15 +1416,21 @@ impl AccountManager {
     pub async fn rooms(&self, account: AccountId) -> Vec<timeline::RoomSummary> {
         let Some(c) = self.client(account).await else { return Vec::new() };
         let mut rooms = timeline::rooms(&c).await;
+        let saved_order = self.room_order(account).await;
         let latest = self.latest.lock().unwrap();
         for r in &mut rooms {
             r.latest = latest.get(&(account, r.room_id.clone())).cloned();
         }
         drop(latest);
+        // Dragged into an order: that order, with rooms it doesn't know yet
+        // (just joined) on top.
+        let order: HashMap<String, usize> = saved_order.into_iter().enumerate().map(|(i, id)| (id, i + 1)).collect();
+        let place = |r: &timeline::RoomSummary| order.get(r.room_id.as_str()).copied().unwrap_or(0);
         rooms.sort_by(|a, b| {
             b.invite
                 .cmp(&a.invite)
                 .then_with(|| b.pinned.cmp(&a.pinned))
+                .then_with(|| place(a).cmp(&place(b)))
                 .then_with(|| b.latest.as_ref().map(|l| l.ts).cmp(&a.latest.as_ref().map(|l| l.ts)))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });

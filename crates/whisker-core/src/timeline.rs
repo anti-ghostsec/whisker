@@ -55,6 +55,8 @@ pub struct RoomSummary {
     /// Favourite ("pinned") rooms sort first. Stored as the standard
     /// `m.favourite` tag, so other clients see it too.
     pub pinned: bool,
+    /// A direct chat with someone (listed under People).
+    pub direct: bool,
     /// A space: a folder of rooms rather than a chat.
     pub is_space: bool,
     /// For spaces: the rooms (and spaces) it lists, in its order.
@@ -352,6 +354,7 @@ pub async fn rooms(client: &Client) -> Vec<RoomSummary> {
             members: room.joined_members_count(),
             latest: None,
             pinned: room.is_favourite(),
+            direct: room.direct_targets_length() > 0,
         });
     }
     out
@@ -401,6 +404,11 @@ pub struct SpaceRoom {
 /// The rooms (and sub-spaces) a space lists, joined or not, in the space's
 /// order. Uses the server's space hierarchy; if the server can't give it,
 /// the space's own list (names unknown for rooms we aren't in).
+///
+/// Rooms we couldn't join anyway are left out (invite-only rooms for the
+/// moderators, say): ones the hierarchy says need an invite we don't have,
+/// or that only members of rooms we aren't in may join, and ones the
+/// server left out of the hierarchy because we may not see them.
 pub async fn space_rooms(space: &Room) -> Vec<SpaceRoom> {
     use matrix_sdk::ruma::api::client::space::get_hierarchy::v1::Request;
     let order = read_space_children_via(space).await;
@@ -408,11 +416,22 @@ pub async fn space_rooms(space: &Room) -> Vec<SpaceRoom> {
     req.max_depth = Some(UInt::from(1u32));
     req.limit = Some(UInt::from(200u32));
     let mut found: HashMap<OwnedRoomId, SpaceRoom> = HashMap::new();
-    match space.client().send(req).await {
+    let mut closed: std::collections::HashSet<OwnedRoomId> = std::collections::HashSet::new();
+    let client = space.client();
+    // In it, or invited: always shown.
+    let ours = |id: &OwnedRoomId| client.get_room(id).is_some_and(|r| matches!(r.state(), matrix_sdk::RoomState::Joined | matrix_sdk::RoomState::Invited));
+    let mut listed = false;
+    match client.send(req).await {
         Ok(resp) => {
+            // Only a whole answer says what was left out.
+            listed = resp.next_batch.is_none();
             for chunk in resp.rooms {
                 let r = chunk.summary;
                 if r.room_id == space.room_id() {
+                    continue;
+                }
+                if !ours(&r.room_id) && !joinable(&client, &r.join_rule) {
+                    closed.insert(r.room_id);
                     continue;
                 }
                 let is_space = r.room_type == Some(matrix_sdk::ruma::room::RoomType::Space);
@@ -425,9 +444,12 @@ pub async fn space_rooms(space: &Room) -> Vec<SpaceRoom> {
         }
         Err(e) => tracing::debug!(space = %space.room_id(), "no space hierarchy: {e}"),
     }
-    let client = space.client();
     let mut out = Vec::new();
     for (id, via) in order {
+        // Not ours, and the server either said it's closed or wouldn't show it to us.
+        if !ours(&id) && (closed.contains(&id) || (listed && !found.contains_key(&id))) {
+            continue;
+        }
         let mut r = found.remove(&id).unwrap_or_else(|| {
             // Not in the hierarchy: what we know locally.
             let local = client.get_room(&id);
@@ -447,6 +469,21 @@ pub async fn space_rooms(space: &Room) -> Vec<SpaceRoom> {
     // Rooms the hierarchy lists that our copy of the space doesn't yet.
     out.extend(found.into_values());
     out
+}
+
+/// Whether we could join a room with this rule without being invited:
+/// anyone may, or members of a room we're in may, or we may ask (knock).
+fn joinable(client: &Client, rule: &matrix_sdk::ruma::room::JoinRuleSummary) -> bool {
+    use matrix_sdk::ruma::room::JoinRuleSummary as J;
+    let member_of = |r: &matrix_sdk::ruma::room::RestrictedSummary| {
+        r.allowed_room_ids.iter().any(|id| client.get_room(id).is_some_and(|x| x.state() == matrix_sdk::RoomState::Joined))
+    };
+    match rule {
+        J::Public | J::Knock | J::KnockRestricted(_) => true,
+        J::Restricted(r) => member_of(r),
+        J::Invite | J::Private => false,
+        _ => true,
+    }
 }
 
 /// Joins a room listed in a space, through the servers the space gave.

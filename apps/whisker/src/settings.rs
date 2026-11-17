@@ -87,6 +87,10 @@ pub struct AppSettings {
     /// 2 load them all (each site sees a request from you or your proxy).
     #[serde(default = "one")]
     pub link_previews: i32,
+    /// The Invidious server YouTube previews and videos come through, as
+    /// typed ("" for none: previews from YouTube, videos in the browser).
+    #[serde(default)]
+    pub invidious: String,
     /// Sound level for videos and audio, 1–100.
     #[serde(default = "hundred")]
     pub volume: i32,

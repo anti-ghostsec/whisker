@@ -1,5 +1,6 @@
 //! The room list as a tree: spaces are folders holding their rooms (and
-//! sub-spaces); rooms in no space sit at the top level.
+//! sub-spaces); rooms in no space sit at the top level, people you chat
+//! with directly apart from other rooms.
 
 use matrix_sdk::ruma::OwnedRoomId;
 use std::collections::HashSet;
@@ -16,14 +17,39 @@ pub struct Line<'a> {
     pub unread: u64,
     /// For spaces: how many of its rooms you're in.
     pub rooms: usize,
+    /// Which part of the list: invitations, spaces, people (direct chats)
+    /// or rooms.
+    pub section: Section,
+    /// The space it's listed under (None at the top level).
+    pub parent: Option<&'a OwnedRoomId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Invites,
+    Spaces,
+    People,
+    Rooms,
+}
+
+impl Section {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Invites => "Invitations",
+            Self::Spaces => "Spaces",
+            Self::People => "People",
+            Self::Rooms => "Rooms",
+        }
+    }
 }
 
 /// `rooms` (already in list order) as folder lines. Spaces in `closed` show
 /// without their rooms. With a search, it's a flat list of matching rooms.
 pub fn tree<'a>(rooms: &'a [RoomSummary], closed: &HashSet<OwnedRoomId>, search: &str) -> Vec<Line<'a>> {
-    let line = |room, depth| Line { room, depth, open: false, unread: 0, rooms: 0 };
+    let line = |room: &'a RoomSummary, section| Line { room, depth: 0, open: false, unread: 0, rooms: 0, section, parent: None };
+    let kind = |r: &RoomSummary| if r.direct { Section::People } else { Section::Rooms };
     if !search.is_empty() {
-        return rooms.iter().filter(|r| !r.is_space && r.name.to_lowercase().contains(search)).map(|r| line(r, 0)).collect();
+        return rooms.iter().filter(|r| !r.is_space && r.name.to_lowercase().contains(search)).map(|r| line(r, kind(r))).collect();
     }
     let joined: HashSet<&OwnedRoomId> = rooms.iter().map(|r| &r.room_id).collect();
     // Rooms listed by a space we're in don't also show at the top.
@@ -32,7 +58,7 @@ pub fn tree<'a>(rooms: &'a [RoomSummary], closed: &HashSet<OwnedRoomId>, search:
     // Invitations first, then spaces, then the rest, each in list order.
     let top = |r: &&RoomSummary| !listed.contains(&r.room_id) || r.invite;
     for r in rooms.iter().filter(top).filter(|r| r.invite) {
-        out.push(line(r, 0));
+        out.push(line(r, Section::Invites));
     }
     let mut reached: HashSet<&OwnedRoomId> = HashSet::new();
     for s in rooms.iter().filter(top).filter(|r| r.is_space && !r.invite) {
@@ -45,8 +71,11 @@ pub fn tree<'a>(rooms: &'a [RoomSummary], closed: &HashSet<OwnedRoomId>, search:
             add_space(s, 0, rooms, closed, &mut vec![&s.room_id], &mut reached, &mut out);
         }
     }
-    for r in rooms.iter().filter(top).filter(|r| !r.is_space && !r.invite) {
-        out.push(line(r, 0));
+    // People, then other rooms.
+    for section in [Section::People, Section::Rooms] {
+        for r in rooms.iter().filter(top).filter(|r| !r.is_space && !r.invite && kind(r) == section) {
+            out.push(line(r, section));
+        }
     }
     out
 }
@@ -63,7 +92,8 @@ fn add_space<'a>(
     reached.insert(&space.room_id);
     let at = out.len();
     let open = !closed.contains(&space.room_id);
-    out.push(Line { room: space, depth, open, unread: 0, rooms: 0 });
+    let parent = path.len().checked_sub(2).map(|i| path[i]);
+    out.push(Line { room: space, depth, open, unread: 0, rooms: 0, section: Section::Spaces, parent });
     // Children in the room list's order (most recent first), spaces first.
     let kids: HashSet<&OwnedRoomId> = space.children.iter().collect();
     let mut kid_rooms: Vec<&RoomSummary> = rooms.iter().filter(|r| kids.contains(&r.room_id) && !r.invite).collect();
@@ -88,7 +118,7 @@ fn add_space<'a>(
             unread += k.unread;
             count += 1;
             if open {
-                out.push(Line { room: k, depth: depth + 1, open: false, unread: 0, rooms: 0 });
+                out.push(Line { room: k, depth: depth + 1, open: false, unread: 0, rooms: 0, section: Section::Spaces, parent: Some(&space.room_id) });
             }
         }
     }
@@ -112,6 +142,7 @@ mod tests {
             members: 0,
             latest: None,
             pinned: false,
+            direct: id.starts_with("dm"),
             is_space: space,
             children: kids.iter().map(|k| OwnedRoomId::try_from(format!("!{k}:x")).unwrap()).collect(),
         }
@@ -142,5 +173,16 @@ mod tests {
 
         // Searching lists matching rooms, not folders.
         assert_eq!(names(&tree(&rooms, &HashSet::new(), "dog")), ["dogs"]);
+    }
+
+    #[test]
+    fn people_apart_from_rooms() {
+        let rooms = vec![room("loose", false, &[], 0), room("dmann", false, &[], 0), room("pets", true, &["cats", "dmbob"], 0), room("cats", false, &[], 0), room("dmbob", false, &[], 0)];
+        let t = tree(&rooms, &HashSet::new(), "");
+        assert_eq!(names(&t), ["pets", "  cats", "  dmbob", "dmann", "loose"]);
+        let sections: Vec<Section> = t.iter().map(|l| l.section).collect();
+        assert_eq!(sections, [Section::Spaces, Section::Spaces, Section::Spaces, Section::People, Section::Rooms]);
+        assert_eq!(t[1].parent.map(|p| p.as_str()), Some("!pets:x"));
+        assert_eq!(t[0].parent, None);
     }
 }

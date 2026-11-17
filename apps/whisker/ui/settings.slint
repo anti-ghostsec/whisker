@@ -242,6 +242,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-notify-level(int);
     callback set-key-sharing(int);
     callback set-link-previews(int);
+    callback set-invidious(string);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -378,6 +379,11 @@ component GeneralPage inherits VerticalLayout {
                 current-index: Prefs.link-previews;
                 selected => { root.set-link-previews(self.current-index); }
             }
+        }
+        Field {
+            label: "Play YouTube videos through Invidious";
+            hint: "An Invidious server (like yewtu.be, or your own) fetches YouTube previews and videos for you, so YouTube never sees this device: only that server does (through the account's proxy, if it has one). Videos then play right in the message. Many public servers block apps (they want a captcha), so your own server, or one that allows apps, works best. Leave it empty to open them in your browser instead, and to get previews from YouTube itself.";
+            Input { text: Prefs.invidious; placeholder: "e.g. yewtu.be"; edited(t) => { root.set-invidious(t); } }
         }
         HorizontalLayout {
             spacing: 8px;
@@ -1292,6 +1298,7 @@ export component SettingsPage inherits Rectangle {
     callback set-notify-level(int);
     callback set-key-sharing(int);
     callback set-link-previews(int);
+    callback set-invidious(string);
     callback set-send-typing(bool);
     callback set-clear-command(string);
     callback set-autocorrect(bool);
@@ -1396,6 +1403,7 @@ export component SettingsPage inherits Rectangle {
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-key-sharing(i) => { root.set-key-sharing(i); }
                             set-link-previews(i) => { root.set-link-previews(i); }
+                            set-invidious(t) => { root.set-invidious(t); }
                             set-send-typing(b) => { root.set-send-typing(b); }
                             set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }

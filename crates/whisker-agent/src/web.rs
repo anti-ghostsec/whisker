@@ -262,7 +262,7 @@ impl Web {
         if url.host_str() == Some("api.github.com") {
             extra.push(("X-GitHub-Api-Version", "2022-11-28"));
         }
-        let got = safe_web::get(url, self.proxy.as_deref(), &safe_web::Ask { accept, headers: &extra, max_bytes: MAX_BYTES, user_agent: USER_AGENT, timeout: TIMEOUT }).await?;
+        let got = safe_web::get(url, self.proxy.as_deref(), &safe_web::Ask { headers: &extra, ..safe_web::Ask::new(accept, MAX_BYTES, USER_AGENT, TIMEOUT) }).await?;
         let (url, content_type, body, truncated) = (got.url, got.content_type, got.body, got.truncated);
         let texty = content_type.is_empty()
             || content_type.starts_with("text/")

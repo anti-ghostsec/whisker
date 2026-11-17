@@ -45,6 +45,8 @@ export struct RoomItem {
     depth: int,
     space: bool,
     open: bool,
+    // A heading over a part of the list (People, Rooms…): `name` is its title.
+    header: bool,
 }
 
 // A room in a public directory.
@@ -455,6 +457,9 @@ export global Player {
     callback mute();
     // A new sound level (0–100), once the slider is let go.
     callback set-volume(int);
+    // Keeps the controls up over a playing video while the sound level is
+    // being set (they'd hide with the hover, taking the level with them).
+    in-out property <bool> bar-hold;
     callback toggle-subtitles();
     callback set-large(bool);
 }
@@ -489,6 +494,8 @@ component SeekTrack inherits Rectangle {
 component VolumeSlider inherits Rectangle {
     in-out property <int> value;
     callback committed(int);
+    // Any touch on it (to keep it open).
+    callback touched();
     width: 36px;
     height: 130px;
     property <length> pad: 12px;
@@ -521,6 +528,7 @@ component VolumeSlider inherits Rectangle {
     TouchArea {
         mouse-cursor: pointer;
         pointer-event(e) => {
+            root.touched();
             if e.kind == PointerEventKind.down {
                 root.at(self.mouse-y);
             } else if e.kind == PointerEventKind.up {
@@ -528,7 +536,7 @@ component VolumeSlider inherits Rectangle {
             }
         }
         moved => {
-            if self.pressed { root.at(self.mouse-y); }
+            if self.pressed { root.at(self.mouse-y); root.touched(); }
         }
     }
 }
@@ -543,6 +551,16 @@ component VideoBar inherits Rectangle {
     background: #000000a0;
     // Clicks on the bar itself don't pause.
     TouchArea {}
+    // Lets the controls hide again a few seconds after the level was last touched.
+    property <int> idle;
+    Timer {
+        interval: 1s;
+        running: Player.bar-hold;
+        triggered => {
+            root.idle += 1;
+            if root.idle >= 4 { Player.bar-hold = false; }
+        }
+    }
     if root.stacked: SeekTrack { x: 10px; y: 2px; width: parent.width - 20px; height: 24px; }
     HorizontalLayout {
         y: root.stacked ? 24px : 0px;
@@ -600,7 +618,14 @@ component VideoBar inherits Rectangle {
                 stroke-width: 1.5px;
                 commands: Player.muted ? "M 10.5 4.5 L 15 9.5 M 15 4.5 L 10.5 9.5" : "M 10.5 4.5 Q 12.5 7 10.5 9.5 M 12.5 2.5 Q 16 7 12.5 11.5";
             }
-            TouchArea { mouse-cursor: pointer; clicked => { volume-popup.show(); } }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.idle = 0;
+                    Player.bar-hold = true;
+                    volume-popup.show();
+                }
+            }
             // The level, with the speaker below it to turn the sound off and on.
             volume-popup := PopupWindow {
                 x: (parent.width - 44px) / 2;
@@ -621,12 +646,13 @@ component VideoBar inherits Rectangle {
                             VolumeSlider {
                                 value: Player.muted ? 0 : Player.volume;
                                 committed(v) => { Player.set-volume(v); }
+                                touched => { root.idle = 0; }
                             }
                         }
                         Rectangle {
                             height: 22px;
                             Text { text: Player.muted ? "Unmute" : "Mute"; color: Player.muted ? Theme.accent : white; font-size: 10px; font-weight: 600; }
-                            TouchArea { mouse-cursor: pointer; clicked => { Player.mute(); } }
+                            TouchArea { mouse-cursor: pointer; clicked => { root.idle = 0; Player.mute(); } }
                         }
                     }
                 }
@@ -857,7 +883,7 @@ component MessageRow inherits Rectangle {
                                     if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
                                 }
                                 // Controls, while it plays (on hover) or is paused.
-                                if pic.here && !Player.large && (pic-area.has-hover || !Player.playing): VideoBar {
+                                if pic.here && !Player.large && (pic-area.has-hover || !Player.playing || Player.bar-hold): VideoBar {
                                     id: root.item.id;
                                     y: parent.height - self.height;
                                 }
@@ -933,12 +959,33 @@ component MessageRow inherits Rectangle {
                                     border-radius: 6px;
                                     clip: true;
                                     Image { source: root.item.link-picture; width: parent.width; height: parent.height; image-fit: cover; }
-                                    if root.item.link-video: Rectangle {
+                                    // Playing here (YouTube through Invidious).
+                                    property <bool> here: root.item.link-video && Player.id == root.item.id;
+                                    if self.here && !Player.large && Player.frame.width > 0: Rectangle {
+                                        background: black;
+                                        Image { source: Player.frame; width: parent.width; height: parent.height; image-fit: contain; }
+                                    }
+                                    if root.item.link-video && !(self.here && (Player.playing || Player.loading)): Rectangle {
                                         width: 46px;
                                         height: 46px;
                                         border-radius: 23px;
                                         background: #000000aa;
                                         Text { text: "▶"; color: white; font-size: 20px; x: 16px; }
+                                    }
+                                    if self.here && Player.loading: Rectangle {
+                                        width: 46px; height: 46px; border-radius: 23px;
+                                        background: #000000aa;
+                                        if Player.progress > 0: Text { text: Player.progress + "%"; color: white; font-size: 13px; }
+                                        if Player.progress == 0: Dots {}
+                                    }
+                                    if root.item.link-video && Prefs.youtube-here: yt-area := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { Player.toggle(root.item.id); }
+                                        double-clicked => { if parent.here { Player.set-large(true); } }
+                                        if parent.here && !Player.loading && !Player.large && (yt-area.has-hover || !Player.playing || Player.bar-hold): VideoBar {
+                                            id: root.item.id;
+                                            y: parent.height - self.height;
+                                        }
                                     }
                                 }
                             }
@@ -1187,9 +1234,27 @@ component RoomsToggle inherits Rectangle {
 component RoomRow inherits Rectangle {
     in property <RoomItem> item;
     in property <bool> selected;
+    // Rooms were dragged into an order (the menu can undo it).
+    in property <bool> ordered;
     callback clicked;
     callback menu(string);
+    // Dropped after a drag, this far below (or above) where it was.
+    callback dropped(length);
+    // Held still for a moment, then dragged: moves the room in the list.
+    property <bool> held;
+    property <bool> dragging;
+    // The release that ends a drag isn't a click.
+    property <bool> dragged;
+    property <length> drag-dy;
+    Timer {
+        interval: 450ms;
+        running: !root.item.header && ta.pressed && !root.held;
+        triggered => {
+            if abs(ta.mouse-y - ta.pressed-y) < 8px && abs(ta.mouse-x - ta.pressed-x) < 8px { root.held = true; }
+        }
+    }
     cm := ContextMenuArea {
+        enabled: !root.item.header;
         Menu {
             if root.item.invite: MenuItem { title: "Accept invitation"; activated => { root.menu("accept"); } }
             if root.item.invite: MenuItem { title: "Decline invitation"; activated => { root.menu("leave"); } }
@@ -1200,16 +1265,30 @@ component RoomRow inherits Rectangle {
             if !root.item.invite: MenuItem { title: "Invite people…"; activated => { root.menu("info"); } }
             if !root.item.invite && root.item.space: MenuItem { title: "Space info"; activated => { root.menu("info"); } }
             MenuItem { title: root.item.space ? "Copy space address" : "Copy room address"; activated => { root.menu("copy"); } }
+            if !root.item.invite: MenuItem { title: "Move up"; activated => { root.menu("move-up"); } }
+            if !root.item.invite: MenuItem { title: "Move down"; activated => { root.menu("move-down"); } }
+            if !root.item.invite && root.ordered: MenuItem { title: "Sort by newest activity again"; activated => { root.menu("sort-recent"); } }
             if !root.item.invite: MenuSeparator {}
             if !root.item.invite: MenuItem { title: root.item.space ? "Leave space" : "Leave room"; activated => { root.menu("leave"); } }
         }
     }
-    height: root.item.space ? 44px : 58px;
+    height: root.item.header ? 28px : root.item.space ? 44px : 58px;
     border-radius: 10px;
-    background: selected ? Theme.active : ta.has-hover ? Theme.hover : transparent;
+    background: root.item.header ? transparent : selected || root.dragging ? Theme.active : ta.has-hover ? Theme.hover : transparent;
+    border-width: root.dragging ? 1px : 0px;
+    border-color: Theme.accent;
+    if root.item.header: Text {
+        x: 10px;
+        text: root.item.name;
+        color: Theme.muted;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        vertical-alignment: center;
+    }
     // Rooms in a space hang off a line under the folder.
     for d in root.item.depth: Rectangle { x: 20px + d * 16px; width: 1px; background: Theme.border; }
-    if root.item.space: HorizontalLayout {
+    if root.item.space && !root.item.header: HorizontalLayout {
         padding-left: 8px + root.item.depth * 16px;
         padding-right: 10px;
         spacing: 8px;
@@ -1233,7 +1312,7 @@ component RoomRow inherits Rectangle {
         if !root.item.open || root.item.unread == 0: Text { text: root.item.preview; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
         if !root.item.open && root.item.unread > 0: VerticalLayout { alignment: center; Pill { text: root.item.unread > 99 ? "99+" : root.item.unread; strong: true; } }
     }
-    if !root.item.space: HorizontalLayout {
+    if !root.item.space && !root.item.header: HorizontalLayout {
         padding-left: 8px + root.item.depth * 16px;
         padding-right: 10px;
         spacing: 10px;
@@ -1268,12 +1347,45 @@ component RoomRow inherits Rectangle {
         }
     }
     ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        enabled: !root.item.header;
+        mouse-cursor: root.dragging ? MouseCursor.grabbing : MouseCursor.pointer;
+        clicked => {
+            if root.dragged { root.dragged = false; return; }
+            root.clicked();
+        }
+        moved => {
+            if root.held && self.pressed {
+                root.drag-dy = self.mouse-y - self.pressed-y;
+                if abs(root.drag-dy) > 6px { root.dragging = true; }
+            }
+        }
         // This takes every button, so open the right-click menu from here.
         pointer-event(e) => {
             if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.mouse-x, y: self.mouse-y }); }
+            if e.kind == PointerEventKind.down { root.held = false; root.dragging = false; root.dragged = false; root.drag-dy = 0; }
+            if e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel {
+                if root.dragging && e.kind == PointerEventKind.up { root.dropped(root.drag-dy); }
+                root.dragged = root.dragging;
+                root.dragging = false;
+                root.held = false;
+                root.drag-dy = 0;
+            }
         }
+    }
+    // Where it will land, and its name, following the pointer.
+    if root.dragging: Rectangle {
+        y: root.height / 2 + root.drag-dy;
+        height: 2px;
+        background: Theme.accent;
+    }
+    if root.dragging: Rectangle {
+        x: 40px;
+        y: root.height / 2 + root.drag-dy - 26px;
+        width: min(root.width - 50px, drag-name.preferred-width + 20px);
+        height: 22px;
+        border-radius: 11px;
+        background: Theme.accent;
+        drag-name := Text { text: root.item.name; color: white; font-size: 12px; font-weight: 600; overflow: elide; }
     }
 }
 
@@ -1724,6 +1836,10 @@ export component AppWindow inherits Window {
     in-out property <bool> rooms-hidden;
     // Remembered for next time.
     callback rooms-hidden-changed(bool);
+    // Rooms were dragged into an order of their own.
+    in property <bool> rooms-ordered;
+    // A room or space dropped this many pixels below (above, if negative) where it was.
+    callback move-room(string, float);
     changed rooms-hidden => { root.rooms-hidden-changed(root.rooms-hidden); }
     property <bool> narrow: root.width < 760px;
 
@@ -1824,6 +1940,7 @@ export component AppWindow inherits Window {
     callback set-notify-level(int);
     callback set-key-sharing(int);
     callback set-link-previews(int);
+    callback set-invidious(string);
     callback set-send-typing(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -2035,7 +2152,9 @@ export component AppWindow inherits Window {
                                     // Phones: the chat shows, not a profile left open.
                                     if root.narrow { root.close-panel(); }
                                 }
+                                ordered: root.rooms-ordered;
                                 menu(action) => { root.activity(); root.room-menu(action, r.id); }
+                                dropped(dy) => { root.activity(); root.move-room(r.id, dy / 1px); }
                             }
                         }
                     }
@@ -3066,6 +3185,7 @@ export component AppWindow inherits Window {
             set-notify-level(i) => { root.set-notify-level(i); }
             set-key-sharing(i) => { root.set-key-sharing(i); }
             set-link-previews(i) => { root.set-link-previews(i); }
+            set-invidious(t) => { root.set-invidious(t); }
             set-send-typing(b) => { root.set-send-typing(b); }
             set-autocorrect(b) => { root.set-autocorrect(b); }
             set-spell-check(b) => { root.set-spell-check(b); }

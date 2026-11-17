@@ -127,6 +127,9 @@ struct State {
     thread: Option<OwnedEventId>,
     /// Spaces shown folded (their rooms hidden), per account.
     closed_spaces: HashSet<OwnedRoomId>,
+    /// The room list as last shown, for working out where a dragged room
+    /// was dropped.
+    room_shapes: Vec<RoomShape>,
     /// Character cards imported (or removed: `None`) on an AI's settings
     /// page but not saved yet, with their PNG picture.
     pending_cards: HashMap<AccountId, Option<CardAndPicture>>,
@@ -460,7 +463,88 @@ struct AccountRow {
     a: AccountSummary,
     unread: u64,
 }
+/// A room list row's place: what it is, and the part of the list (and
+/// space) it's in. Rooms only move within that.
+#[derive(Debug, Clone, PartialEq)]
+struct RoomShape {
+    id: String,
+    header: bool,
+    space: bool,
+    section: spaces::Section,
+    parent: Option<String>,
+}
+
+impl RoomShape {
+    /// Its height in the list, as the room list draws it.
+    fn height(&self) -> f32 {
+        if self.header {
+            28.0
+        } else if self.space {
+            44.0
+        } else {
+            58.0
+        }
+    }
+}
+
+/// Where row `from` goes when moved: `offset` pixels down (up if negative)
+/// or, with `step`, to the next (previous) row of its own group. Returns the
+/// room it goes next to, and whether after it; None if it stays.
+fn move_target(rows: &[RoomShape], from: usize, offset: Option<f32>, step: i32) -> Option<(usize, bool)> {
+    let me = rows.get(from)?;
+    // The row that stands for `i` among `me`'s neighbours: itself, or the
+    // space holding it at `me`'s level.
+    let at_level = |mut i: usize| -> Option<usize> {
+        loop {
+            let r = &rows[i];
+            if !r.header && r.section == me.section && r.parent == me.parent {
+                return Some(i);
+            }
+            let p = r.parent.as_ref()?;
+            i = rows.iter().position(|x| &x.id == p && !x.header)?;
+        }
+    };
+    let target = match offset {
+        Some(dy) => {
+            let top: f32 = rows[..from].iter().map(RoomShape::height).sum();
+            let aim = top + me.height() / 2.0 + dy;
+            let mut y = 0.0;
+            let mut hit = rows.len() - 1;
+            for (i, r) in rows.iter().enumerate() {
+                if aim < y + r.height() {
+                    hit = i;
+                    break;
+                }
+                y += r.height();
+            }
+            if aim < 0.0 {
+                hit = 0;
+            }
+            // A heading: the first row of the part below it (or the last above).
+            let hit = if rows[hit].header { if dy < 0.0 { (hit + 1).min(rows.len() - 1) } else { hit.saturating_sub(1) } } else { hit };
+            at_level(hit)?
+        }
+        None => {
+            let mut i = from as i64;
+            loop {
+                i += i64::from(step.signum());
+                if i < 0 || i as usize >= rows.len() {
+                    return None;
+                }
+                let r = &rows[i as usize];
+                if !r.header && r.section == me.section && r.parent == me.parent {
+                    break i as usize;
+                }
+            }
+        }
+    };
+    (target != from).then_some((target, target > from))
+}
+
 struct RoomRowData {
+    header: bool,
+    section: spaces::Section,
+    parent: Option<String>,
     depth: usize,
     space: bool,
     open: bool,
@@ -754,9 +838,10 @@ impl Ctl {
         let (c, key) = (self.clone(), key.clone());
         self.spawn(async move {
             let proxy = c.mgr.details(key.0).await.and_then(|d| d.1);
+            let invidious = c.invidious();
             let got = {
                 let _slot = PREVIEW_SLOTS.acquire().await;
-                whisker_core::link_preview::fetch(&url, proxy.as_deref()).await
+                whisker_core::link_preview::fetch(&url, proxy.as_deref(), invidious.as_ref()).await
             };
             let card = match got {
                 Ok(p) => {
@@ -1115,12 +1200,42 @@ impl Ctl {
         };
         let (cleared, fresh) = cleared;
         let closed = self.st.lock().unwrap().closed_spaces.clone();
-        let rows: Vec<RoomRowData> = spaces::tree(&rooms, &closed, &search)
-            .into_iter()
-            .map(|line| {
+        let ordered = !self.mgr.room_order(account).await.is_empty();
+        let lines = spaces::tree(&rooms, &closed, &search);
+        let mut parts: Vec<spaces::Section> = lines.iter().map(|l| l.section).collect();
+        parts.dedup();
+        let headings = search.is_empty() && parts.len() > 1;
+        let mut last = None;
+        let mut rows: Vec<RoomRowData> = Vec::new();
+        for line in lines {
+            if headings && last != Some(line.section) {
+                last = Some(line.section);
+                rows.push(RoomRowData {
+                    header: true,
+                    section: line.section,
+                    parent: None,
+                    depth: 0,
+                    space: false,
+                    open: false,
+                    pinned: false,
+                    id: format!("§{}", line.section.title()),
+                    name: line.section.title().to_uppercase(),
+                    invite: false,
+                    avatar: None,
+                    preview: String::new(),
+                    time: String::new(),
+                    unread: 0,
+                    encrypted: false,
+                });
+            }
+            let (section, parent) = (line.section, line.parent.map(ToString::to_string));
+            rows.push({
                 let r = line.room;
                 if r.is_space {
-                    return RoomRowData {
+                    RoomRowData {
+                        header: false,
+                        section,
+                        parent,
                         depth: line.depth,
                         space: true,
                         open: line.open,
@@ -1136,8 +1251,8 @@ impl Ctl {
                         time: String::new(),
                         unread: line.unread,
                         encrypted: false,
-                    };
-                }
+                    }
+                } else {
                 let preview = r
                     .latest
                     .as_ref()
@@ -1151,6 +1266,9 @@ impl Ctl {
                     .unwrap_or_else(|| if r.encrypted { "Encrypted room".into() } else { String::new() });
                 let read = room.as_ref() == Some(&r.room_id) || cleared.contains_key(&(account, r.room_id.clone()));
                 RoomRowData {
+                    header: false,
+                    section,
+                    parent,
                     depth: line.depth,
                     space: false,
                     open: false,
@@ -1164,8 +1282,11 @@ impl Ctl {
                     unread: if read { 0 } else { r.unread }.max(fresh.get(&(account, r.room_id.clone())).map_or(0, |f| f.len() as u64)),
                     encrypted: r.encrypted,
                 }
-            })
-            .collect();
+                }
+            });
+        }
+        self.st.lock().unwrap().room_shapes =
+            rows.iter().map(|r| RoomShape { id: r.id.clone(), header: r.header, space: r.space, section: r.section, parent: r.parent.clone() }).collect();
         let (room_id, room_name, topic, invite) = match (current, previewing) {
             (Some(r), _) => (r.room_id.to_string(), r.name, r.topic.unwrap_or_default(), r.invite),
             (None, Some(p)) => (p.room_id.to_string(), p.name, p.topic.unwrap_or_default(), false),
@@ -1193,11 +1314,13 @@ impl Ctl {
                             depth: r.depth as i32,
                             space: r.space,
                             open: r.open,
+                            header: r.header,
                         }
                     })
                     .collect();
                 ui::sync_rows(&m.rooms, items, |a, b| a.id == b.id);
             });
+            u.set_rooms_ordered(ordered);
             u.set_loading_rooms(!synced);
             u.set_current_room(s(room_id));
             u.set_current_invite(invite);
@@ -1792,7 +1915,49 @@ impl Ctl {
         }
     }
 
+    /// A room or space dropped `dy` pixels from where it was in the list.
+    async fn move_room(&self, id: String, dy: f32) {
+        self.move_room_by(id, Some(dy), 0).await;
+    }
+
+    /// Moves a room or space next to another of its group (People, Rooms,
+    /// spaces, or the rooms of one space) and keeps that order, in the
+    /// vault only.
+    async fn move_room_by(&self, id: String, offset: Option<f32>, step: i32) {
+        let Some(account) = self.st.lock().unwrap().account else { return };
+        let shapes = self.st.lock().unwrap().room_shapes.clone();
+        let Some(from) = shapes.iter().position(|r| r.id == id && !r.header) else { return };
+        let Some((to, after)) = move_target(&shapes, from, offset, step) else {
+            if offset.is_some_and(|d| d.abs() > 30.0) {
+                self.status("Rooms move within their own part of the list (People, Rooms, Spaces, or one space's rooms).");
+            }
+            return;
+        };
+        let next_to = shapes[to].id.clone();
+        // The whole list as it's sorted now, with the room moved.
+        let mut order: Vec<String> = self.mgr.rooms(account).await.into_iter().filter(|r| !r.invite).map(|r| r.room_id.to_string()).collect();
+        order.retain(|r| r != &id);
+        let Some(at) = order.iter().position(|r| r == &next_to) else { return };
+        order.insert(if after { at + 1 } else { at }, id);
+        if let Err(e) = self.mgr.set_room_order(account, order).await {
+            self.status(format!("Couldn't keep that order: {e:#}"));
+        }
+        self.refresh_rooms().await;
+    }
+
     async fn room_menu(&self, action: String, id: String) {
+        match action.as_str() {
+            "move-up" => return self.move_room_by(id, None, -1).await,
+            "move-down" => return self.move_room_by(id, None, 1).await,
+            "sort-recent" => {
+                let account = self.st.lock().unwrap().account;
+                if let Some(account) = account {
+                    let _ = self.mgr.set_room_order(account, Vec::new()).await;
+                }
+                return self.refresh_rooms().await;
+            }
+            _ => {}
+        }
         let Ok(room_id) = OwnedRoomId::try_from(id) else { return };
         let Some(account) = self.st.lock().unwrap().account else { return };
         let Some(room) = self.mgr.client(account).await.and_then(|c| c.get_room(&room_id)) else {
@@ -3294,6 +3459,7 @@ impl Ctl {
                     u.set_sticker_save_open(true);
                 });
             }
+            "play" if m.media.is_none() => self.play_youtube(&key, m).await,
             "play" => self.play_media(&key, m).await,
             "view" => self.view_image(&key, m).await,
             "forward" => self.open_forward(key, m.event_id).await,
@@ -4306,6 +4472,109 @@ impl Ctl {
         let mut st = self.settings.lock().unwrap();
         st.volume = level.clamp(1, 100);
         let _ = st.save(self.mgr.data_dir());
+    }
+
+    /// The Invidious server from Settings, when one is set and makes sense.
+    fn invidious(&self) -> Option<whisker_core::link_preview::Url> {
+        let typed = self.settings.lock().unwrap().invidious.clone();
+        (!typed.trim().is_empty()).then(|| whisker_core::link_preview::invidious_base(&typed).ok()).flatten()
+    }
+
+    fn set_invidious(&self, typed: String) {
+        let typed = typed.trim().to_owned();
+        let ok = typed.is_empty() || whisker_core::link_preview::invidious_base(&typed).is_ok();
+        {
+            let mut st = self.settings.lock().unwrap();
+            st.invidious = typed.clone();
+            let _ = st.save(self.mgr.data_dir());
+        }
+        let here = ok && !typed.is_empty();
+        // YouTube cards made the other way are made again the new way.
+        self.st.lock().unwrap().link_cards.retain(|_, c| whisker_core::link_preview::Url::parse(&c.url).ok().and_then(|u| whisker_core::link_preview::youtube_id(&u)).is_none());
+        self.ui(move |u| u.global::<Prefs>().set_youtube_here(here));
+        if !ok {
+            self.status("That isn't an Invidious server's address (like yewtu.be, using https).");
+        }
+    }
+
+    /// Plays the YouTube video a message links to, in the message: fetched
+    /// whole through the Invidious server (so YouTube never sees this
+    /// device) into the RAM folder, then played like a sent video. Without
+    /// a server it opens in the browser.
+    async fn play_youtube(&self, key: &RoomKey, m: HistoryItem) {
+        let url = self.st.lock().unwrap().link_cards.get(&m.event_id).map(|c| c.url.clone());
+        let Some(url) = url else { return };
+        let Some(id) = whisker_core::link_preview::Url::parse(&url).ok().and_then(|u| whisker_core::link_preview::youtube_id(&u)) else { return };
+        let Some(base) = self.invidious() else {
+            self.ui(move |u| u.invoke_open_link(s(url)));
+            return;
+        };
+        let proxy = self.mgr.details(key.0).await.and_then(|d| d.1);
+        let event = m.event_id.to_string();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let here = player::available();
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let here = false;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if here {
+            player::stop(&self.ui);
+            let id = event.clone();
+            self.ui(move |u| {
+                let p = u.global::<Player>();
+                p.set_id(s(id));
+                p.set_loading(true);
+            });
+        }
+        self.status(format!("Loading the video through {}…", base.host_str().unwrap_or("Invidious")));
+        let shown = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let c = self.clone();
+        let progress = move |got: u64, total: u64| {
+            if total == 0 {
+                return;
+            }
+            let pct = (got.min(total) * 100 / total) as u8;
+            if shown.swap(pct, std::sync::atomic::Ordering::Relaxed) != pct {
+                c.status(format!("Loading the video… {pct}%"));
+                c.ui(move |u| u.global::<Player>().set_progress(i32::from(pct)));
+            }
+        };
+        let dir = media_dir(self.mgr.data_dir());
+        let mut path = dir.join(&whisker_core::vault::random_secret()[..16]);
+        let r = self
+            .cancellable(async {
+                let bytes = whisker_core::link_preview::youtube_video(&base, &id, proxy.as_deref(), &progress).await?;
+                let Some(ext) = timeline::sniff_media(&bytes) else { anyhow::bail!("the server didn't send a video") };
+                path.set_extension(ext);
+                whisker_core::stores::make_private_dir(&dir)?;
+                tokio::fs::write(&path, bytes).await?;
+                whisker_core::vault::owner_only(&path, false);
+                anyhow::Ok(())
+            })
+            .await;
+        self.ui(|u| u.global::<Player>().set_progress(0));
+        match r {
+            Ok(()) => {
+                self.status("");
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if here {
+                    let (ui, p) = (self.ui.clone(), path.clone());
+                    if tokio::task::spawn_blocking(move || player::play(ui, event, p)).await.unwrap_or(false) {
+                        return;
+                    }
+                    self.ui(|u| u.global::<Player>().set_loading(false));
+                }
+                let _ = here;
+                #[cfg(not(target_os = "android"))]
+                play_file(&path, true);
+                #[cfg(target_os = "android")]
+                self.status("This phone can't play that video's format.");
+            }
+            Err(e) => {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                self.ui(|u| u.global::<Player>().set_loading(false));
+                self.status(if e.to_string() == "cancelled" { "Download cancelled.".to_owned() } else { format!("Couldn't play it: {e:#}") });
+            }
+        }
     }
 
     fn set_link_previews(&self, mode: i32) {
@@ -5999,6 +6268,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     whisker_core::media_fetch::set_ask_room_servers(prefs.ask_room_servers);
     ui.global::<Prefs>()
         .set_clear_command(s(&prefs.clear_command));
+    ui.global::<Prefs>().set_invidious(s(&prefs.invidious));
+    ui.global::<Prefs>().set_youtube_here(!prefs.invidious.trim().is_empty() && whisker_core::link_preview::invidious_base(&prefs.invidious).is_ok());
     autocorrect::warm();
     ui.global::<ModelInfo>().on_sees(|model, _| {
         let model = model.trim();
@@ -6187,6 +6458,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         });
     }
     on!(on_room_menu, |a, id| room_menu);
+    on!(on_move_room, |id, dy| move_room);
     on!(on_explore_search, |srv, q| explore_search);
     on!(on_explore_join, |t| explore_join);
     on!(on_explore_more, explore_more);
@@ -6279,6 +6551,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_set_link_previews(move |i| c.set_link_previews(i));
+        let c = ctl.clone();
+        ui.on_set_invidious(move |t| c.set_invidious(t.to_string()));
     }
     {
         let c = ctl.clone();
@@ -6626,5 +6900,33 @@ mod tests {
         assert_eq!(split_login("anoncat.gleeze.com", " @nully "), ("anoncat.gleeze.com".into(), "nully".into()));
         assert_eq!(split_login("anoncat.gleeze.com", "@bob:matrix.org"), ("matrix.org".into(), "bob".into()));
         assert_eq!(split_login("", "bob:example.com"), ("example.com".into(), "bob".into()));
+    }
+
+    #[test]
+    fn rooms_move_within_their_part() {
+        use spaces::Section::*;
+        let row = |id: &str, header: bool, space: bool, section, parent: Option<&str>| RoomShape { id: id.into(), header, space, section, parent: parent.map(Into::into) };
+        let rows = vec![
+            row("§s", true, false, Spaces, None),
+            row("pets", false, true, Spaces, None),
+            row("cats", false, false, Spaces, Some("pets")),
+            row("dogs", false, false, Spaces, Some("pets")),
+            row("work", false, true, Spaces, None),
+            row("§p", true, false, People, None),
+            row("ann", false, false, People, None),
+            row("bob", false, false, People, None),
+            row("§r", true, false, Rooms, None),
+            row("loose", false, false, Rooms, None),
+        ];
+        // Down one row, onto the next person: after them.
+        assert_eq!(move_target(&rows, 6, Some(58.0), 0), Some((7, true)));
+        // Too far, into Rooms: stays.
+        assert_eq!(move_target(&rows, 7, Some(120.0), 0), None);
+        // A space dropped on a room inside another space goes next to that space.
+        assert_eq!(move_target(&rows, 4, Some(-100.0), 0), Some((1, false)));
+        // A space's room only moves among that space's rooms.
+        assert_eq!(move_target(&rows, 2, None, 1), Some((3, true)));
+        assert_eq!(move_target(&rows, 2, None, -1), None);
+        assert_eq!(move_target(&rows, 7, None, -1), Some((6, false)));
     }
 }

@@ -4,6 +4,10 @@
 //! need to load the whole watch page); other pages are read for their Open
 //! Graph tags (`og:title`, `og:image`…).
 //!
+//! With an Invidious server chosen in Settings, YouTube links are asked of
+//! it instead (YouTube never hears from this device), and their videos can
+//! be played in the message: see [`youtube_video`].
+//!
 //! Everything is fetched by this device (never asked of the homeserver,
 //! which would learn the links in encrypted rooms) through [`crate::safe_web`],
 //! and through the account's proxy when it has one. The sites still see a
@@ -11,7 +15,7 @@
 
 use crate::safe_web::{self, Ask};
 use anyhow::{Result, bail};
-use reqwest::Url;
+pub use reqwest::Url;
 use std::time::Duration;
 
 const PAGE_BYTES: usize = 768 * 1024;
@@ -50,11 +54,41 @@ pub fn youtube_id(url: &Url) -> Option<String> {
     (id.len() >= 6 && id.len() <= 20 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).then_some(id)
 }
 
-/// Fetches a preview of `url`.
-pub async fn fetch(url: &str, proxy: Option<&str>) -> Result<LinkPreview> {
+/// The base of an Invidious server from what was typed in Settings:
+/// `yewtu.be` → `https://yewtu.be/`. Plain http only for onion sites and
+/// your own network (`http://192.168.1.5:3000`).
+pub fn invidious_base(typed: &str) -> Result<Url> {
+    let typed = typed.trim().trim_end_matches('/');
+    let with_scheme = if typed.contains("://") { typed.to_owned() } else { format!("https://{typed}") };
+    let mut u = Url::parse(&with_scheme)?;
+    let onion = u.host_str().is_some_and(|h| h.ends_with(".onion"));
+    let mut bare = u.clone();
+    let _ = bare.set_port(None);
+    let local = safe_web::check_url(&bare, true).is_err();
+    match u.scheme() {
+        "https" => {}
+        "http" if onion || local => {}
+        "http" => bail!("use https for the Invidious server (plain http only for .onion or your own network)"),
+        _ => bail!("not a web address"),
+    }
+    if u.host_str().is_none_or(str::is_empty) || !u.username().is_empty() || u.password().is_some() {
+        bail!("not a server address");
+    }
+    u.set_path("/");
+    u.set_query(None);
+    u.set_fragment(None);
+    Ok(u)
+}
+
+/// Fetches a preview of `url`; YouTube links through the Invidious server
+/// `invidious` when there is one.
+pub async fn fetch(url: &str, proxy: Option<&str>, invidious: Option<&Url>) -> Result<LinkPreview> {
     let parsed = Url::parse(url)?;
     if let Some(id) = youtube_id(&parsed) {
-        return youtube(url, &id, proxy).await;
+        return match invidious {
+            Some(base) => youtube_via(url, &id, base, proxy).await,
+            None => youtube(url, &id, proxy).await,
+        };
     }
     let page = safe_web::get(parsed, proxy, &ask("text/html,application/xhtml+xml;q=0.9,*/*;q=0.1", PAGE_BYTES)).await?;
     if !page.content_type.is_empty() && !page.content_type.contains("html") {
@@ -103,8 +137,81 @@ async fn youtube(url: &str, id: &str, proxy: Option<&str>) -> Result<LinkPreview
     Ok(LinkPreview { url: url.into(), site: "YouTube".into(), title: clip(&title, 200), description: author, image, video: true })
 }
 
+async fn youtube_via(url: &str, id: &str, base: &Url, proxy: Option<&str>) -> Result<LinkPreview> {
+    let mut api = base.join(&format!("api/v1/videos/{id}"))?;
+    api.query_pairs_mut().append_pair("fields", "title,author");
+    let v: serde_json::Value = match safe_web::get(api, proxy, &Ask { chosen: true, ..ask("application/json", 256 * 1024) }).await {
+        Ok(got) => serde_json::from_slice(&got.body).unwrap_or_default(),
+        Err(e) => {
+            tracing::debug!("no Invidious API answer: {e:#}");
+            Default::default()
+        }
+    };
+    let title = v["title"].as_str().unwrap_or_default().to_owned();
+    let author = v["author"].as_str().unwrap_or_default().to_owned();
+    let image = picture_on(base.join(&format!("vi/{id}/hqdefault.jpg"))?, proxy, true).await;
+    if title.is_empty() && image.is_none() {
+        bail!("the Invidious server had nothing for that video");
+    }
+    Ok(LinkPreview { url: url.into(), site: "YouTube".into(), title: clip(&title, 200), description: author, image, video: true })
+}
+
+/// The biggest download [`youtube_video`] takes.
+pub const VIDEO_BYTES: usize = 400 * 1024 * 1024;
+
+/// Downloads YouTube video `id` through the Invidious server at `base`,
+/// which fetches it from YouTube for us (`local=true`, and redirects may not
+/// leave the server, so YouTube never sees this device). The one-file kind
+/// with sound and picture together (720p when there is one, else 360p),
+/// as MP4. `progress` hears the bytes so far and the total.
+pub async fn youtube_video(base: &Url, id: &str, proxy: Option<&str>, progress: &(dyn Fn(u64, u64) + Send + Sync)) -> Result<Vec<u8>> {
+    let mut api = base.join(&format!("api/v1/videos/{id}"))?;
+    api.query_pairs_mut().append_pair("fields", "formatStreams").append_pair("local", "true");
+    // Servers that keep their API to themselves: try the usual 720p and 360p kinds.
+    let itags = match safe_web::get(api, proxy, &Ask { chosen: true, ..ask("application/json", 512 * 1024) }).await {
+        Ok(got) => serde_json::from_slice::<serde_json::Value>(&got.body).ok().as_ref().and_then(best_stream).map_or_else(|| vec!["22".into(), "18".into()], |i| vec![i]),
+        Err(e) => {
+            tracing::debug!("no Invidious API answer: {e:#}");
+            vec!["22".into(), "18".into()]
+        }
+    };
+    let mut why = anyhow::anyhow!("the Invidious server has no playable copy of that video");
+    for itag in itags {
+        let mut file = base.join("latest_version")?;
+        file.query_pairs_mut().append_pair("id", id).append_pair("itag", &itag).append_pair("local", "true");
+        let ask = Ask { chosen: true, progress: Some(progress), ..Ask::new("video/mp4,video/*;q=0.9", VIDEO_BYTES, USER_AGENT, Duration::from_secs(20 * 60)) };
+        match safe_web::get(file, proxy, &ask).await {
+            Ok(got) if got.truncated => bail!("that video is over {} MB", VIDEO_BYTES / 1024 / 1024),
+            Ok(got) if got.content_type.contains("html") => {
+                why = anyhow::anyhow!("the Invidious server answered with a web page (it may block apps, or want a captcha): try another server, or your own");
+            }
+            Ok(got) => return Ok(got.body),
+            Err(e) => why = e,
+        }
+    }
+    Err(why)
+}
+
+/// The itag of the best MP4 with sound (up to 720p) in an Invidious
+/// `formatStreams` answer.
+fn best_stream(v: &serde_json::Value) -> Option<String> {
+    let height = |f: &serde_json::Value| f["resolution"].as_str().and_then(|r| r.trim_end_matches('p').parse::<u32>().ok()).unwrap_or(0);
+    v["formatStreams"]
+        .as_array()?
+        .iter()
+        .filter(|f| f["container"].as_str() == Some("mp4") || f["type"].as_str().is_some_and(|t| t.starts_with("video/mp4")))
+        .filter(|f| height(f) <= 720)
+        .max_by_key(|f| height(f))
+        .and_then(|f| f["itag"].as_str().map(str::to_owned).or_else(|| f["itag"].as_u64().map(|i| i.to_string())))
+        .filter(|i| i.chars().all(|c| c.is_ascii_digit()))
+}
+
 async fn picture(url: Url, proxy: Option<&str>) -> Option<Vec<u8>> {
-    match safe_web::get(url, proxy, &ask("image/avif,image/webp,image/png,image/jpeg,image/gif,image/*;q=0.8", IMAGE_BYTES)).await {
+    picture_on(url, proxy, false).await
+}
+
+async fn picture_on(url: Url, proxy: Option<&str>, chosen: bool) -> Option<Vec<u8>> {
+    match safe_web::get(url, proxy, &Ask { chosen, ..ask("image/avif,image/webp,image/png,image/jpeg,image/gif,image/*;q=0.8", IMAGE_BYTES) }).await {
         Ok(got) if !got.truncated && (got.content_type.is_empty() || got.content_type.starts_with("image/")) => Some(got.body),
         Ok(_) => None,
         Err(e) => {
@@ -115,7 +222,7 @@ async fn picture(url: Url, proxy: Option<&str>) -> Option<Vec<u8>> {
 }
 
 fn ask(accept: &str, max_bytes: usize) -> Ask<'_> {
-    Ask { accept, headers: &[], max_bytes, user_agent: USER_AGENT, timeout: TIMEOUT }
+    Ask::new(accept, max_bytes, USER_AGENT, TIMEOUT)
 }
 
 fn host_of(url: &Url) -> String {
@@ -239,6 +346,23 @@ mod tests {
     }
 
     #[test]
+    fn reads_invidious_answers() {
+        let base = |t: &str| invidious_base(t).map(|u| u.to_string());
+        assert_eq!(base("yewtu.be").unwrap(), "https://yewtu.be/");
+        assert_eq!(base("https://inv.example.org/feed/popular?x=1").unwrap(), "https://inv.example.org/");
+        assert!(base("http://inv.example.org").is_err());
+        assert!(base("http://abc.onion").is_ok());
+        assert!(base("ftp://x.org").is_err());
+        let v = serde_json::json!({"formatStreams": [
+            {"itag": "18", "container": "mp4", "resolution": "360p"},
+            {"itag": "22", "container": "mp4", "resolution": "720p"},
+            {"itag": "43", "container": "webm", "resolution": "1080p"},
+        ]});
+        assert_eq!(best_stream(&v), Some("22".into()));
+        assert_eq!(best_stream(&serde_json::json!({"formatStreams": [{"itag": "x/../", "container": "mp4"}]})), None);
+    }
+
+    #[test]
     fn reads_open_graph_tags() {
         let html = r#"<html><head><title>Plain &amp; title</title>
             <meta property="og:title" content="Big &quot;news&quot;">
@@ -260,9 +384,9 @@ mod live {
     #[tokio::test]
     #[ignore]
     async fn fetches_real_previews() {
-        let yt = super::fetch("https://youtu.be/dQw4w9WgXcQ", None).await.unwrap();
+        let yt = super::fetch("https://youtu.be/dQw4w9WgXcQ", None, None).await.unwrap();
         assert!(!yt.title.is_empty() && yt.image.is_some() && yt.video, "{yt:?}");
-        let gh = super::fetch("https://github.com/rust-lang/rust", None).await.unwrap();
+        let gh = super::fetch("https://github.com/rust-lang/rust", None, None).await.unwrap();
         assert!(!gh.title.is_empty() && gh.image.is_some(), "{:?}", (gh.title, gh.site));
     }
 }

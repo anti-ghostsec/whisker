@@ -433,8 +433,11 @@ whisker-agentd agent add --account <id> --api-url openrouter.ai/api --api-key-en
 Agents start when you unlock the vault in the GUI. To keep one running all the time, run
 `whisker-agentd run` on a server instead (not both at once on the same data directory).
 
-The agent joins rooms when a commander or one of your own accounts invites it. It replies
-when someone mentions it and to every DM (`--trigger every` makes it read every message).
+The agent joins rooms when a commander or one of your own accounts invites it, and DMs from
+anyone it already shares a room with (strangers' invites are left alone). Invites that came
+while it was off are answered when it starts. It replies when someone mentions it, and in a DM
+to every message, back and forth with no @ or reply needed (`--trigger every` makes it read
+every message everywhere). A room with just it and one other person counts as a DM.
 
 ## Status
 

@@ -334,7 +334,14 @@ impl AgentRunner {
                 }
                 None => body,
             };
-            if !self.cfg.rooms.is_empty() && !self.cfg.rooms.contains(&room_id) {
+            // The room list limits group rooms; DMs are always its own.
+            if !self.cfg.rooms.is_empty()
+                && !self.cfg.rooms.contains(&room_id)
+                && !match client.get_room(&room_id) {
+                    Some(r) => is_dm(&r).await,
+                    None => false,
+                }
+            {
                 continue;
             }
             self.memory.push(&room_id, Line::new(sender.clone(), sender_name, event_id.clone(), &body), unix_now());
@@ -360,7 +367,8 @@ impl AgentRunner {
             }
             // A reply to one of its messages, a message in a thread it
             // started, or a pill naming it, is talking to it.
-            let mut addressed = pills.iter().any(|(_, id)| id == me.as_str());
+            // In a DM every message is to it: back and forth, no @ needed.
+            let mut addressed = pills.iter().any(|(_, id)| id == me.as_str()) || is_dm(&room).await;
             if !addressed && let Some(to) = &reply_to {
                 addressed = self.replies_to_me(&room, &room_id, to, &me).await;
             }
@@ -589,38 +597,31 @@ impl AgentRunner {
         }
     }
 
-    /// Joins rooms when a commander or one of your own accounts invites the agent.
+    /// Joins rooms it's invited to: any room from a commander or one of your
+    /// own accounts, and DMs from people it already shares a room with.
+    /// Invites that came in while it was off are answered at startup.
     fn accept_invites(&self, client: &matrix_sdk::Client, me: &UserId) {
         use matrix_sdk::ruma::events::room::member::{MembershipState, StrippedRoomMemberEvent};
-        let me = me.to_owned();
-        let commanders = self.cfg.permissions.commanders.users.clone();
-        let mgr = self.mgr.clone();
-        let greeting = self.cfg.card.clone().filter(|c| self.cfg.greet && !c.first_mes.trim().is_empty());
-        client.add_event_handler(move |ev: StrippedRoomMemberEvent, room: Room| {
-            let (me, commanders, mgr, greeting) = (me.clone(), commanders.clone(), mgr.clone(), greeting.clone());
+        let invites = Invites {
+            me: me.to_owned(),
+            commanders: self.cfg.permissions.commanders.users.clone(),
+            mgr: self.mgr.clone(),
+            greeting: self.cfg.card.clone().filter(|c| self.cfg.greet && !c.first_mes.trim().is_empty()),
+        };
+        for room in client.invited_rooms() {
+            let (invites, client) = (invites.clone(), client.clone());
+            tokio::spawn(async move {
+                let Ok(details) = room.invite_details().await else { return };
+                invites.answer(&client, room, details.inviter_id).await;
+            });
+        }
+        client.add_event_handler(move |ev: StrippedRoomMemberEvent, room: Room, client: matrix_sdk::Client| {
+            let invites = invites.clone();
             async move {
-                if ev.state_key != me || ev.content.membership != MembershipState::Invite {
+                if ev.state_key != invites.me || ev.content.membership != MembershipState::Invite {
                     return;
                 }
-                let own = mgr.accounts().await.iter().any(|a| a.kind == AccountKind::Human && a.user_id == ev.sender.as_str());
-                if !(own || commanders.contains(&ev.sender)) {
-                    return;
-                }
-                if let Err(e) = room.join().await {
-                    tracing::warn!("agent {me} could not join {}: {e}", room.room_id());
-                    return;
-                }
-                // Say hello in character, addressed to whoever invited us.
-                if let Some(card) = greeting {
-                    let who = match room.get_member_no_sync(&ev.sender).await {
-                        Ok(Some(m)) => m.display_name().unwrap_or(ev.sender.localpart()).to_owned(),
-                        _ => ev.sender.localpart().to_owned(),
-                    };
-                    let text = reply::hide_state(&card.fill(&card.first_mes, &who)).0;
-                    if let Err(e) = room.send(agent_message(text.trim())).await {
-                        tracing::warn!("agent {me} could not greet in {}: {e}", room.room_id());
-                    }
-                }
+                invites.answer(&client, room, ev.sender).await;
             }
         });
     }
@@ -637,7 +638,7 @@ impl AgentRunner {
     }
 
     async fn triggered(&self, room: &Room, names: &[String], body: &str) -> bool {
-        let direct = room.is_direct().await.unwrap_or(false);
+        let direct = is_dm(room).await;
         match self.cfg.trigger {
             Trigger::Every => true,
             Trigger::DirectOnly => direct,
@@ -1029,5 +1030,69 @@ mod picture_tests {
         let (l, r) = (back.get_pixel(100, 256), back.get_pixel(900, 256));
         assert!(l[0] > 180 && l[2] < 60, "left is {l:?}");
         assert!(r[2] > 180 && r[0] < 60, "right is {r:?}");
+    }
+}
+
+/// A DM: flagged as one, or just the agent and one other person.
+async fn is_dm(room: &Room) -> bool {
+    room.is_direct().await.unwrap_or(false) || room.active_members_count() <= 2
+}
+
+/// What answering an invite needs, shared by the startup sweep and the live handler.
+#[derive(Clone)]
+struct Invites {
+    me: OwnedUserId,
+    commanders: BTreeSet<OwnedUserId>,
+    mgr: AccountManager,
+    greeting: Option<crate::card::Card>,
+}
+
+impl Invites {
+    async fn answer(&self, client: &matrix_sdk::Client, room: Room, inviter: OwnedUserId) {
+        let me = &self.me;
+        if !self.may_join(client, &room, &inviter).await {
+            tracing::info!("agent {me} left the invite to {} from {inviter} alone", room.room_id());
+            return;
+        }
+        if let Err(e) = room.join().await {
+            tracing::warn!("agent {me} could not join {}: {e}", room.room_id());
+            return;
+        }
+        tracing::info!("agent {me} joined {} (invited by {inviter})", room.room_id());
+        // Say hello in character, addressed to whoever invited us.
+        if let Some(card) = &self.greeting {
+            let who = match room.get_member_no_sync(&inviter).await {
+                Ok(Some(m)) => m.display_name().unwrap_or(inviter.localpart()).to_owned(),
+                _ => inviter.localpart().to_owned(),
+            };
+            let text = reply::hide_state(&card.fill(&card.first_mes, &who)).0;
+            if let Err(e) = room.send(agent_message(text.trim())).await {
+                tracing::warn!("agent {me} could not greet in {}: {e}", room.room_id());
+            }
+        }
+    }
+
+    /// Your own accounts and commanders may bring it anywhere. Anyone else
+    /// only into a DM, and only if they're already in a room with it, so
+    /// strangers can't find it and run up the AI bill.
+    async fn may_join(&self, client: &matrix_sdk::Client, room: &Room, inviter: &UserId) -> bool {
+        use matrix_sdk::ruma::events::room::member::MembershipState;
+        if self.commanders.contains(inviter) {
+            return true;
+        }
+        if self.mgr.accounts().await.iter().any(|a| a.kind == AccountKind::Human && a.user_id == inviter.as_str()) {
+            return true;
+        }
+        if !room.is_direct().await.unwrap_or(false) {
+            return false;
+        }
+        for shared in client.joined_rooms() {
+            if let Ok(Some(m)) = shared.get_member_no_sync(inviter).await
+                && *m.membership() == MembershipState::Join
+            {
+                return true;
+            }
+        }
+        false
     }
 }

@@ -46,6 +46,8 @@ export global Prefs {
     in-out property <string> clear-command: "/clear";
     // Joins, leaves, renames and other room events in the timeline.
     in-out property <bool> show-events: false;
+    // Room events in full detail (and the ones with no sentence of their own).
+    in-out property <bool> dev-mode: false;
     // 0 off, 1 "New message" only, 2 sender and room, 3 with message text.
     in-out property <int> notify-level: 2;
     // Room keys: 0 every device, 1 devices signed by their owner, 2 verified only.

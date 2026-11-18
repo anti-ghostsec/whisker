@@ -179,6 +179,10 @@ export struct MessageItem {
     id: string,
     // A room event ("Alice joined"), drawn as a small grey line.
     notice: bool,
+    // Developer mode: what a room event changed, the first few lines, and
+    // how many more there are.
+    details: string,
+    more-details: int,
     sender: string,
     name: string,
     body: string,
@@ -301,6 +305,8 @@ export struct Profile {
     can-set-level: bool,
     max-level: int,
     has-dm: bool,
+    // They get your read receipts (in chats with nobody else).
+    sees-reads: bool,
     // 0 = no encryption keys to verify, 1 = not verified, 2 = verified,
     // 3 = verified before but their identity changed, -1 = checking
     verified: int,
@@ -762,11 +768,23 @@ component MessageRow inherits Rectangle {
                     padding-top: 3px;
                     padding-bottom: 3px;
                     spacing: 8px;
-                    // A set width, so wrapped lines count in the row's height.
-                    // Click for the person's profile (their full address, server…).
-                    Text {
-                        text: root.item.body; font-size: 12px; color: notice-ta.has-hover ? Theme.text : Theme.muted; wrap: word-wrap; width: max(40px, root.width - 64px - 16px - 52px);
-                        notice-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
+                    VerticalLayout {
+                        spacing: 2px;
+                        // A set width, so wrapped lines count in the row's height.
+                        // Click for the person's profile (their full address, server…).
+                        Text {
+                            text: root.item.body; font-size: 12px; color: notice-ta.has-hover ? Theme.text : Theme.muted; wrap: word-wrap; width: max(40px, root.width - 64px - 16px - 52px);
+                            notice-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
+                        }
+                        // Developer mode: each value it changed.
+                        if Prefs.dev-mode && root.item.details != "": Text {
+                            text: root.item.details; font-size: 11px; font-family: "monospace"; color: Theme.muted; wrap: word-wrap; width: max(40px, root.width - 64px - 16px - 52px);
+                        }
+                        if Prefs.dev-mode && root.item.more-details > 0: Text {
+                            text: "Show " + root.item.more-details + " more " + (root.item.more-details == 1 ? "change" : "changes");
+                            font-size: 11px; color: more-ta.has-hover ? Theme.text : Theme.accent;
+                            more-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("changes", root.item.id); } }
+                        }
                     }
                     Text { text: root.item.time; visible: area.has-hover; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
                 }
@@ -1937,6 +1955,7 @@ export component AppWindow inherits Window {
     }
     callback set-rich-text(bool);
     callback set-show-events(bool);
+    callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
     callback set-link-previews(int);
@@ -2898,6 +2917,22 @@ export component AppWindow inherits Window {
                                     Btn { text: "Mention"; horizontal-stretch: 1; clicked => { root.profile-action("mention", root.profile.user-id); } }
                                     Btn { text: "Copy address"; horizontal-stretch: 1; clicked => { root.copy-text(root.profile.user-id); } }
                                 }
+                                if !root.profile.is-me: HorizontalLayout {
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        alignment: center;
+                                        Text { text: "Send them read receipts"; color: Theme.text; font-size: 12px; }
+                                        Text {
+                                            text: "They see when you've read their messages, in chats with nobody else (or only others you've turned this on for). Everyone else still sees nothing.";
+                                            font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                                        }
+                                    }
+                                    Switch {
+                                        checked: root.profile.sees-reads;
+                                        toggled => { root.profile-action(self.checked ? "reads-on" : "reads-off", root.profile.user-id); }
+                                    }
+                                }
                                 if !root.profile.is-me && (root.profile.can-kick || root.profile.can-ban): VerticalLayout {
                                     alignment: start;
                                     spacing: 6px;
@@ -3182,6 +3217,7 @@ export component AppWindow inherits Window {
             set-auto-lock(i) => { root.set-auto-lock(i); }
             set-rich-text(b) => { root.set-rich-text(b); }
             set-show-events(b) => { root.set-show-events(b); }
+            set-dev-mode(b) => { root.set-dev-mode(b); }
             set-notify-level(i) => { root.set-notify-level(i); }
             set-key-sharing(i) => { root.set-key-sharing(i); }
             set-link-previews(i) => { root.set-link-previews(i); }

@@ -714,6 +714,8 @@ async fn preview_messages(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -
                         thread,
                         pills,
                         shield: None,
+                        details: Vec::new(),
+                        dev_only: false,
                     });
                 }
             },

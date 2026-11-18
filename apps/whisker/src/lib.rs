@@ -1344,7 +1344,10 @@ impl Ctl {
         let client = self.mgr.client(key.0).await;
         let me: Option<OwnedUserId> = client.as_ref().and_then(|c| c.user_id().map(ToOwned::to_owned));
         let marks = self.st.lock().unwrap().marks.get(key).cloned().unwrap_or_default();
-        let show_events = self.settings.lock().unwrap().show_events;
+        let (show_events, dev_mode) = {
+            let p = self.settings.lock().unwrap();
+            (p.show_events || p.developer_mode, p.developer_mode)
+        };
         let st = self.st.lock().unwrap();
         let mut msgs = st.messages.get(key).cloned().unwrap_or_default();
         // Thread replies: how many each thread has, and the newest.
@@ -1363,6 +1366,9 @@ impl Ctl {
         drop_repeat_joins(&mut msgs);
         if !show_events {
             msgs.retain(|m| !m.notice);
+        }
+        if !dev_mode {
+            msgs.retain(|m| !m.dev_only);
         }
         let by_id: HashMap<&OwnedEventId, &HistoryItem> = msgs.iter().map(|m| (&m.event_id, m)).collect();
         let names: HashMap<&OwnedUserId, &str> = msgs.iter().map(|m| (&m.sender, m.sender_label())).collect();
@@ -2889,6 +2895,8 @@ impl Ctl {
             pills: picked.iter().map(|(n, u)| (n.clone(), u.to_string())).collect(),
 
             shield: None,
+            details: Vec::new(),
+            dev_only: false,
         };
         self.merge(&key, vec![item]);
         self.ui(|u| u.set_stick_bottom(true));
@@ -3376,6 +3384,14 @@ impl Ctl {
                     u.set_cursor_at((quoted.len() + 1) as i32);
                     u.set_draft(s(draft));
                     u.set_cursor_request(u.get_cursor_request() + 1);
+                });
+            }
+            // Developer mode: everything a room event changed.
+            "changes" => {
+                let text = m.details.join("\n");
+                self.ui(move |u| {
+                    u.set_select_title(s("What changed"));
+                    u.set_select_text(s(text));
                 });
             }
             "source" => {
@@ -4339,6 +4355,7 @@ impl Ctl {
         sessions.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
         let (initial, hue) = initial_hue(&name);
         let is_me = me.as_ref() == Some(&user);
+        let sees_reads = self.mgr.sends_reads_to(key.0, &user).await;
         let user_id = user.to_string();
         self.ui(move |u| {
             if u.get_profile().user_id != user_id.as_str() {
@@ -4358,6 +4375,7 @@ impl Ctl {
                 can_set_level,
                 max_level,
                 has_dm,
+                sees_reads,
                 verified,
                 sessions: ModelRc::new(VecModel::from(
                     sessions.iter().map(|(name, id, v)| SessionItem { name: s(name), id: s(id), verified: *v }).collect::<Vec<_>>(),
@@ -4446,6 +4464,25 @@ impl Ctl {
                         u.set_verify_state(s("cancelled"));
                         u.set_verify_message(s(m));
                     });
+                }
+            }
+            "reads-on" | "reads-off" => {
+                let on = action == "reads-on";
+                if let Err(e) = self.mgr.set_sends_reads_to(key.0, &user, on).await {
+                    self.status(format!("Couldn't save that: {e}"));
+                    return;
+                }
+                let uid = user.to_string();
+                self.ui(move |u| {
+                    let mut p = u.get_profile();
+                    if p.user_id == uid.as_str() {
+                        p.sees_reads = on;
+                        u.set_profile(p);
+                    }
+                });
+                // Where it now applies, they see you're up to date right away.
+                if on {
+                    self.mark_read(&key).await;
                 }
             }
             "ignore" => {
@@ -5071,6 +5108,18 @@ impl Ctl {
         }
     }
 
+    fn set_dev_mode(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.developer_mode = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_dev_mode(on);
+        }
+        let c = self.clone();
+        self.spawn(async move { c.show_messages().await });
+    }
+
     fn set_show_events(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.show_events = on;
@@ -5223,6 +5272,8 @@ impl Ctl {
             pills: Vec::new(),
 
             shield: None,
+            details: Vec::new(),
+            dev_only: false,
         };
         self.merge(&key, vec![item]);
         self.show_thread().await;
@@ -5884,7 +5935,7 @@ impl Ctl {
                     if live && self.current().as_ref() != Some(&key) && !self.mgr.accounts().await.iter().any(|a| a.user_id == sender.as_str()) {
                         self.st.lock().unwrap().fresh.entry(key.clone()).or_default().insert(event_id.clone());
                     }
-                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone(), pills, shield };
+                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone(), pills, shield, details: Vec::new(), dev_only: false };
                     // Kept for every room, so opening one shows something at once
                     // (its history still loads on first open).
                     self.merge(&key, vec![item]);
@@ -5909,7 +5960,7 @@ impl Ctl {
                     let key = (account, room_id);
                     if self.st.lock().unwrap().older.contains_key(&key) {
                         self.merge(&key, vec![*item]);
-                        if self.current().as_ref() == Some(&key) && self.settings.lock().unwrap().show_events {
+                        if self.current().as_ref() == Some(&key) && { let p = self.settings.lock().unwrap(); p.show_events || p.developer_mode } {
                             self.append_last(&key).await;
                         }
                     }
@@ -6262,6 +6313,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     #[cfg(target_os = "android")]
     ui.on_to_background(droid::to_background);
     ui.global::<Prefs>().set_show_events(prefs.show_events);
+    ui.global::<Prefs>().set_dev_mode(prefs.developer_mode);
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_key_sharing(prefs.key_sharing.clamp(0, 2));
     ui.global::<Prefs>().set_link_previews(prefs.link_previews.clamp(0, 2));
@@ -6558,6 +6610,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_set_show_events(move |b| c.set_show_events(b));
+    }
+    {
+        let c = ctl.clone();
+        ui.on_set_dev_mode(move |b| c.set_dev_mode(b));
     }
     {
         let c = ctl.clone();
@@ -6875,6 +6931,8 @@ mod tests {
             thread: None,
             pills: Vec::new(),
             shield: None,
+            details: Vec::new(),
+            dev_only: false,
         };
         let mut msgs = vec![
             item("join1", "nully", Some((true, true))),

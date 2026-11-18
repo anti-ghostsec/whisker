@@ -885,7 +885,7 @@ impl AccountManager {
                                 let mut profiles = HashMap::new();
                                 for ev in &update.timeline.events {
                                     let Some(st) = timeline::state_event(ev.raw()) else { continue };
-                                    if let Some(item) = timeline::notice_item(&room, &st, &mut profiles).await {
+                                    if let Some(item) = timeline::state_notice(&room, ev.raw(), &st, &mut profiles).await {
                                         let _ = tx.send(ClientEvent::Notice { account, room_id: room_id.clone(), item: Box::new(item) });
                                     }
                                 }
@@ -993,6 +993,7 @@ impl AccountManager {
             tags: req.tags.iter().filter_map(|t| normalize_tag(t)).collect(),
             proxy: req.proxy,
             room_order: Vec::new(),
+            read_receipts_to: BTreeSet::new(),
             session,
             store_passphrase,
             position,
@@ -1230,6 +1231,23 @@ impl AccountManager {
         self.mutate_account_quiet(id, |r| r.room_order = order.clone()).await
     }
 
+    /// Whether `user` gets this account's read receipts (see `mark_read`).
+    pub async fn sends_reads_to(&self, id: AccountId, user: &UserId) -> bool {
+        self.inner.read().await.live.get(&id).is_some_and(|a| a.record.read_receipts_to.contains(user.as_str()))
+    }
+
+    /// Saved in the vault only.
+    pub async fn set_sends_reads_to(&self, id: AccountId, user: &UserId, on: bool) -> Result<()> {
+        self.mutate_account_quiet(id, |r| {
+            if on {
+                r.read_receipts_to.insert(user.to_string());
+            } else {
+                r.read_receipts_to.remove(user.as_str());
+            }
+        })
+        .await
+    }
+
     /// Takes effect the next time the vault is unlocked.
     pub async fn set_proxy(&self, id: AccountId, proxy: Option<String>) -> Result<()> {
         let proxy = proxy.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty());
@@ -1384,6 +1402,8 @@ async fn publish(
         thread: thread.clone(),
         pills: pills.clone(),
         shield,
+        details: Vec::new(),
+        dev_only: false,
     };
     {
         let mut l = latest.lock().unwrap();
@@ -1439,6 +1459,8 @@ impl AccountManager {
 
     /// Marks a room read up to its newest message. Uses a *private* read
     /// receipt: the unread count clears, but nobody else learns you read it.
+    /// Except where everyone else in the room is someone you send read
+    /// receipts to (a chat with one of them): they get a normal one.
     pub async fn mark_read(&self, account: AccountId, room_id: &OwnedRoomId) -> Result<()> {
         use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
         use matrix_sdk::ruma::events::receipt::ReceiptThread;
@@ -1446,7 +1468,20 @@ impl AccountManager {
         let room = c.get_room(room_id).ok_or_else(|| anyhow!("no such room"))?;
         let latest = self.latest.lock().unwrap().get(&(account, room_id.clone())).map(|l| l.event_id.clone());
         if let Some(ev) = latest {
-            room.send_single_receipt(ReceiptType::ReadPrivate, ReceiptThread::Unthreaded, ev).await?;
+            let to = self.inner.read().await.live.get(&account).map(|a| a.record.read_receipts_to.clone()).unwrap_or_default();
+            let public = !to.is_empty() && {
+                let me = c.user_id();
+                let others: Vec<_> = room
+                    .members_no_sync(matrix_sdk::RoomMemberships::ACTIVE)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|m| Some(m.user_id()) != me)
+                    .collect();
+                !others.is_empty() && others.iter().all(|m| to.contains(m.user_id().as_str()))
+            };
+            let kind = if public { ReceiptType::Read } else { ReceiptType::ReadPrivate };
+            room.send_single_receipt(kind, ReceiptThread::Unthreaded, ev).await?;
         }
         if room.is_marked_unread() {
             room.set_unread_flag(false).await?;

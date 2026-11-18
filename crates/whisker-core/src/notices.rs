@@ -91,6 +91,53 @@ pub fn describe(ev: &AnySyncStateEvent, name: impl Fn(&str) -> String) -> Option
     Some(text)
 }
 
+/// What a room event changed, one line per value, for developer mode:
+/// `users › @a:x.org: 50 → 100`, `events_default: 0` (newly set),
+/// `ban: 50 → removed`. Compares the event's `content` with the
+/// `prev_content` the server sends along (in `unsigned`, or at the top on
+/// older servers); nested settings are walked down to their values.
+pub fn changes(raw: &str) -> Vec<String> {
+    use serde_json::Value;
+    use std::collections::{BTreeMap, BTreeSet};
+    fn flatten<'a>(v: &'a Value, path: String, out: &mut BTreeMap<String, &'a Value>) {
+        match v {
+            Value::Object(m) if !m.is_empty() => {
+                for (k, v) in m {
+                    flatten(v, if path.is_empty() { k.clone() } else { format!("{path} › {k}") }, out);
+                }
+            }
+            _ if path.is_empty() => {}
+            _ => {
+                out.insert(path, v);
+            }
+        }
+    }
+    fn short(v: &Value) -> String {
+        let s = v.to_string();
+        match s.char_indices().nth(120) {
+            Some((i, _)) => format!("{}…", &s[..i]),
+            None => s,
+        }
+    }
+    let Ok(v) = serde_json::from_str::<Value>(raw) else { return Vec::new() };
+    let empty = Value::Object(Default::default());
+    let new = v.get("content").unwrap_or(&empty);
+    let old = v.pointer("/unsigned/prev_content").or_else(|| v.get("prev_content")).unwrap_or(&empty);
+    let (mut a, mut b) = (BTreeMap::new(), BTreeMap::new());
+    flatten(old, String::new(), &mut a);
+    flatten(new, String::new(), &mut b);
+    let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    keys.into_iter()
+        .filter_map(|k| match (a.get(k), b.get(k)) {
+            (Some(o), Some(n)) if o == n => None,
+            (Some(o), Some(n)) => Some(format!("{k}: {} → {}", short(o), short(n))),
+            (None, Some(n)) => Some(format!("{k}: {}", short(n))),
+            (Some(o), None) => Some(format!("{k}: {} → removed", short(o))),
+            (None, None) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::timeline::state_event;
@@ -120,5 +167,21 @@ mod tests {
         let mut same = ev(true);
         same["unsigned"]["prev_content"]["displayname"] = "New".into();
         assert_eq!(describe_json(same), None);
+    }
+
+    #[test]
+    fn changes_list_each_value() {
+        let ev = serde_json::json!({
+            "type": "m.room.power_levels", "state_key": "", "sender": "@a:x", "event_id": "$p", "origin_server_ts": 1,
+            "content": {"events": {"m.reaction": 0, "m.room.name": 50}, "users": {"@a:x": 100, "@new:x": 15}, "ban": 50},
+            "unsigned": {"prev_content": {"events": {"m.reaction": 10, "m.room.name": 50}, "users": {"@a:x": 100, "@old:x": 0}, "ban": 50, "kick": 50}}
+        });
+        assert_eq!(
+            super::changes(&ev.to_string()),
+            ["events › m.reaction: 10 → 0", "kick: 50 → removed", "users › @new:x: 15", "users › @old:x: 0 → removed"]
+        );
+        // No earlier state: everything it sets.
+        let first = serde_json::json!({"type": "x.custom", "state_key": "", "content": {"icon": {"key": "🐱"}, "color": "#fc8c25"}});
+        assert_eq!(super::changes(&first.to_string()), ["color: \"#fc8c25\"", "icon › key: \"🐱\""]);
     }
 }

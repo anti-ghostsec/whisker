@@ -239,6 +239,7 @@ component GeneralPage inherits VerticalLayout {
     in-out property <int> theme;
     callback set-rich-text(bool);
     callback set-show-events(bool);
+    callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
     callback set-link-previews(int);
@@ -309,6 +310,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.show-events;
                 toggled => { root.set-show-events(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Developer mode"; color: Theme.text; }
+                Text {
+                    text: "Room events show exactly what they changed (each permission, each person's level, old → new), and events Whisker has no words for show by their type. Turns on room events too.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.dev-mode;
+                toggled => { root.set-dev-mode(self.checked); }
             }
         }
     }
@@ -1339,6 +1356,7 @@ export component SettingsPage inherits Rectangle {
     callback set-auto-lock(int);
     callback set-rich-text(bool);
     callback set-show-events(bool);
+    callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
     callback set-link-previews(int);
@@ -1444,6 +1462,7 @@ export component SettingsPage inherits Rectangle {
                             set-auto-lock(i) => { root.set-auto-lock(i); }
                             set-rich-text(b) => { root.set-rich-text(b); }
                             set-show-events(b) => { root.set-show-events(b); }
+                            set-dev-mode(b) => { root.set-dev-mode(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-key-sharing(i) => { root.set-key-sharing(i); }
                             set-link-previews(i) => { root.set-link-previews(i); }

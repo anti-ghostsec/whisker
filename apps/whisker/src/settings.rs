@@ -47,6 +47,10 @@ pub struct AppSettings {
     /// Show joins, leaves, renames and other room events in the timeline.
     #[serde(default)]
     pub show_events: bool,
+    /// Room events in full: each value they changed, and the events with
+    /// no sentence of their own.
+    #[serde(default)]
+    pub developer_mode: bool,
     /// Notifications: 0 off, 1 just "New message", 2 sender and room, 3 with text.
     #[serde(default = "two")]
     pub notify_level: i32,
@@ -180,7 +184,7 @@ Rooms without it (most public rooms) can be read by every server in them.
 and avatars.
 • Files come through your own server. Only if you turn on “Ask a file's own server” does Whisker \
 contact other servers directly, and then they see your IP address unless you use a proxy.
-• Whisker doesn't send public read receipts, and sends typing notifications only if you turn them on.
+• Whisker doesn't send public read receipts (unless you turn them on for someone, on their profile, and then only in chats with nobody else), and sends typing notifications only if you turn them on.
 • Devices aren't verified yet, so other people see your Whisker login as an unverified device.
 
 AI accounts

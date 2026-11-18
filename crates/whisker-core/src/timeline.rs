@@ -109,6 +109,12 @@ pub struct HistoryItem {
     pub pills: Vec<(String, String)>,
     /// A warning about who really sent an encrypted message.
     pub shield: Option<Shield>,
+    /// Room events: what exactly changed, one line per value (shown in
+    /// developer mode; see `notices::changes`).
+    pub details: Vec<String>,
+    /// A room event with no sentence of its own ("… sent m.room.x"):
+    /// shown in developer mode only.
+    pub dev_only: bool,
 }
 
 /// Element's warning shield on an encrypted message, in its lax mode: no
@@ -688,6 +694,8 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
                     thread: None,
                     pills: Vec::new(),
                     shield: None,
+                    details: Vec::new(),
+                    dev_only: false,
                 },
             );
         }
@@ -730,7 +738,7 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
                 let Some(st) = state_event(ev.raw()) else { continue };
                 created |= matches!(st, AnySyncStateEvent::RoomCreate(_));
                 at_start |= created;
-                if let Some(item) = notice_item(room, &st, &mut profiles).await {
+                if let Some(item) = state_notice(room, ev.raw(), &st, &mut profiles).await {
                     out.push(item);
                 }
                 continue;
@@ -784,6 +792,8 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             thread,
             pills,
             shield: shield(ev.encryption_info().map(|i| &**i)),
+            details: Vec::new(),
+            dev_only: false,
         });
     }
     out.reverse();
@@ -807,6 +817,45 @@ pub fn state_event(raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>) -> 
     let unsigned = v.as_object_mut()?.entry("unsigned").or_insert_with(|| serde_json::json!({}));
     unsigned.as_object_mut()?.insert("prev_content".into(), prev);
     serde_json::from_value(v).ok().or(Some(parsed))
+}
+
+/// A room event as a timeline notice, with what it changed (developer mode
+/// shows that). One with no sentence of its own comes back too, as "Alice
+/// sent m.room.x", for developer mode only.
+pub async fn state_notice(
+    room: &Room,
+    raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>,
+    ev: &AnySyncStateEvent,
+    profiles: &mut HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)>,
+) -> Option<HistoryItem> {
+    let details = crate::notices::changes(raw.json().get());
+    if let Some(mut item) = notice_item(room, ev, profiles).await {
+        item.details = details;
+        return Some(item);
+    }
+    if !profiles.contains_key(ev.sender()) {
+        profiles.insert(ev.sender().to_owned(), member_profile(room, ev.sender()).await);
+    }
+    let (sender_name, sender_avatar) = profiles.get(ev.sender()).cloned().unwrap_or_default();
+    let who = sender_name.clone().unwrap_or_else(|| ev.sender().localpart().to_owned());
+    Some(HistoryItem {
+        event_id: ev.event_id().to_owned(),
+        sender: ev.sender().to_owned(),
+        sender_name,
+        sender_avatar,
+        body: format!("{who} sent {}", ev.event_type()),
+        ts: ev.origin_server_ts(),
+        reply_to: None,
+        media: None,
+        edited: false,
+        notice: true,
+        member: None,
+        thread: None,
+        pills: Vec::new(),
+        shield: None,
+        details,
+        dev_only: true,
+    })
 }
 
 /// A room event as a timeline notice ("Alice joined"), if it's worth one.
@@ -855,6 +904,8 @@ pub async fn notice_item(
         thread: None,
         pills: Vec::new(),
         shield: None,
+        details: Vec::new(),
+        dev_only: false,
     })
 }
 

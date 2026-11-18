@@ -68,6 +68,11 @@ pub struct AccountRecord {
     /// activity first.
     #[serde(default)]
     pub room_order: Vec<String>,
+    /// People who get this account's read receipts (user ids), in rooms
+    /// with nobody else; everyone else gets none. Kept in the vault, like
+    /// the room order.
+    #[serde(default)]
+    pub read_receipts_to: BTreeSet<String>,
     pub session: MatrixSession,
     /// Encrypts this account's local Matrix store (keys, room state).
     pub store_passphrase: String,

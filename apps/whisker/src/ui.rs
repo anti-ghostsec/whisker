@@ -18,6 +18,10 @@ pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 /// An animation: its frames, and how long each shows (ms).
 pub type Frames = (Arc<Vec<Pixels>>, u32);
 
+/// Developer mode: lines of a room event's changes shown under it (the
+/// rest behind "Show N more changes").
+const DETAIL_LINES: usize = 8;
+
 /// Most frames kept of one animation (the rest are dropped).
 const MAX_FRAMES: usize = 150;
 
@@ -394,6 +398,8 @@ impl Models {
         MessageItem {
             id: s(r.item.event_id.as_str()),
             notice: r.item.notice,
+            details: s(r.item.details.iter().take(DETAIL_LINES).cloned().collect::<Vec<_>>().join("\n")),
+            more_details: r.item.details.len().saturating_sub(DETAIL_LINES) as i32,
             sender: s(r.item.sender.as_str()),
             name: s(&name),
             body: s(&r.item.body),

@@ -570,14 +570,11 @@ fn strip_av(data: &[u8], name: &str, video: bool) -> Option<Vec<u8>> {
         .and_then(|e| e.to_str())
         .filter(|e| (1..=5).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric()))?
         .to_ascii_lowercase();
-    let dir = std::env::temp_dir().join(format!(
-        "whisker-up-{}",
-        &crate::vault::random_secret()[..16]
-    ));
-    crate::stores::make_private_dir(&dir).ok()?;
+    // In RAM (Linux) and private: never the shared temp folder.
+    let dir = crate::stores::scratch()?;
     let (src, out) = (
-        dir.join(format!("in.{ext}")),
-        dir.join(format!("out.{ext}")),
+        dir.path().join(format!("in.{ext}")),
+        dir.path().join(format!("out.{ext}")),
     );
     let result = (|| {
         std::fs::write(&src, data).ok()?;
@@ -626,7 +623,7 @@ fn strip_av(data: &[u8], name: &str, video: bool) -> Option<Vec<u8>> {
             .flatten()
             .filter(|d| !d.is_empty())
     })();
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir);
     result
 }
 
@@ -1145,6 +1142,7 @@ mod tests {
         use std::process::Command;
         let dir = std::env::temp_dir().join(format!("whisker-vid-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        crate::stores::set_scratch_root(&dir);
         let video = dir.join("clip.mp4");
         let made = Command::new("ffmpeg")
             .args([

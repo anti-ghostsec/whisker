@@ -433,15 +433,13 @@ enum Preview {
     Remote,
 }
 
-/// A poster frame (JPEG) for a downloaded video, via ffmpeg.
+/// A poster frame (JPEG) for a downloaded video, via ffmpeg. The video
+/// (decrypted) is written to a private folder in RAM for ffmpeg to read,
+/// never to the shared temp folder, and removed right after.
 fn poster_of(video: &[u8]) -> Option<Vec<u8>> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("whisker-poster-{}-{n}", std::process::id()));
-    std::fs::write(&path, video).ok()?;
-    let poster = whisker_core::timeline::video_poster(&path);
-    let _ = std::fs::remove_file(&path);
-    poster.map(|p| p.jpeg)
+    let dir = whisker_core::stores::scratch()?;
+    let path = dir.write("video", video).ok()?;
+    whisker_core::timeline::video_poster(&path).map(|p| p.jpeg)
 }
 
 /// Opens a downloaded file in the app the system picks for it.

@@ -8507,6 +8507,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "image",
+ "libc",
  "matrix-sdk",
  "matrix-sdk-base",
  "matrix-sdk-test",

@@ -152,6 +152,8 @@ impl AccountManager {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         let (events, _) = broadcast::channel(1024);
         let data_dir: PathBuf = data_dir.into();
+        crate::stores::set_scratch_root(&data_dir);
+        std::thread::spawn(crate::stores::wipe_old_temp_files);
         // Owner-only, including folders and files made by older versions.
         for d in [data_dir.clone(), data_dir.join("vaults"), data_dir.join("stores")] {
             if d.is_dir() {

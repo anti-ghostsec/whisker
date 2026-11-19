@@ -286,7 +286,9 @@ operating system and the **Wisp** browser.
   (room state and encryption keys) is kept *inside its vault file*, not in a folder of
   its own: while a vault is unlocked the store runs from RAM, and it is packed back into
   the vault every 10 minutes and when you lock or quit. Caches (timeline, media) stay
-  in RAM and are rebuilt from the server.
+  in RAM and are rebuilt from the server. Videos that ffmpeg has to read from a file
+  (for a preview frame, or to remove an upload's metadata) go to a private folder with a
+  random name in that same RAM area, never the shared temp folder, and are deleted right after.
 - **Who can read what you send.** By default, keys to read your messages only go to
   devices their owner has signed, so a server can't quietly add a device to someone's
   account and read along. Settings → General → *Privacy & encryption* can widen this to

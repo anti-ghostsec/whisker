@@ -251,6 +251,130 @@ pub fn has_store(store: &Path) -> bool {
     KEPT.iter().any(|n| store.join(n).exists())
 }
 
+static SCRATCH_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Sets where [`scratch`] folders go: in the running-stores root, so on
+/// Linux in RAM. Called once, by the account manager.
+pub fn set_scratch_root(data_dir: &Path) {
+    SCRATCH_ROOT.get_or_init(|| runtime_root(data_dir).join("scratch"));
+}
+
+/// A folder only this user can open, with a random name, for a file that
+/// ffmpeg has to read from disk (a decrypted video, say). It's in RAM on
+/// Linux, never in the shared temp folder, and removed when dropped.
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Writes `bytes` as `name` inside, readable by this user only.
+    pub fn write(&self, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+        let path = self.0.join(name);
+        write_private(&path, bytes)?;
+        Ok(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Older versions left decrypted videos in the shared temp folder (a
+/// preview frame's source, an upload being cleaned) if they were stopped
+/// midway. Each one that's this user's is overwritten and removed. Links
+/// aren't followed, and nothing else there is touched.
+pub fn wipe_old_temp_files() {
+    wipe_old_temp_files_in(&std::env::temp_dir());
+}
+
+fn wipe_old_temp_files_in(tmp: &Path) {
+    let Ok(entries) = std::fs::read_dir(tmp) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
+        if !is_mine(&meta) {
+            continue;
+        }
+        if old_poster_name(name) && meta.is_file() {
+            wipe_file(&e.path());
+        } else if old_upload_name(name) && meta.is_dir() {
+            if let Ok(inner) = std::fs::read_dir(e.path()) {
+                for f in inner.flatten() {
+                    if std::fs::symlink_metadata(f.path()).is_ok_and(|m| m.is_file() && is_mine(&m)) {
+                        wipe_file(&f.path());
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// `whisker-poster-<pid>-<n>`.
+fn old_poster_name(name: &str) -> bool {
+    name.strip_prefix("whisker-poster-")
+        .and_then(|r| r.split_once('-'))
+        .is_some_and(|(a, b)| [a, b].iter().all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit())))
+}
+
+/// `whisker-up-<16 letters and digits>`.
+fn old_upload_name(name: &str) -> bool {
+    name.strip_prefix("whisker-up-").is_some_and(|r| r.len() == 16 && r.bytes().all(|c| c.is_ascii_alphanumeric()))
+}
+
+#[cfg(unix)]
+fn is_mine(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions and can't fail.
+    meta.uid() == unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn is_mine(_: &std::fs::Metadata) -> bool {
+    // The user's own temp folder.
+    true
+}
+
+/// Overwrites a file with zeros (flushed to disk), then removes it.
+fn wipe_file(path: &Path) {
+    use std::io::Write;
+    if let Ok(len) = std::fs::metadata(path).map(|m| m.len())
+        && let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path)
+    {
+        let zeros = vec![0u8; 64 * 1024];
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            if f.write_all(&zeros[..n]).is_err() {
+                break;
+            }
+            left -= n as u64;
+        }
+        let _ = f.sync_all();
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// A new [`Scratch`] folder; `None` before [`set_scratch_root`], or if it
+/// can't be made.
+pub fn scratch() -> Option<Scratch> {
+    let root = SCRATCH_ROOT.get()?;
+    make_private_dir(root).ok()?;
+    let dir = root.join(&crate::vault::random_secret()[..16]);
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    // A fresh name: an existing folder (planted, or a clash) isn't used.
+    b.create(&dir).ok()?;
+    crate::vault::owner_only(&dir, true);
+    Some(Scratch(dir))
+}
+
 pub fn make_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     crate::vault::owner_only(dir, true);
@@ -341,5 +465,43 @@ mod tests {
         assert_eq!(got, "olm");
         assert!(!b.join(KEPT[0]).exists());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn scratch_folders_are_private_and_go_away() {
+        let data = std::env::temp_dir().join(format!("whisker-scratch-{}", crate::vault::random_secret()));
+        set_scratch_root(&data);
+        let s = scratch().expect("a scratch folder");
+        let root = SCRATCH_ROOT.get().unwrap();
+        assert!(s.path().starts_with(root));
+        let f = s.write("video", b"secret").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(s.path()).unwrap().permissions().mode() & 0o077, 0);
+            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o077, 0);
+        }
+        let dir = s.path().to_owned();
+        drop(s);
+        assert!(!dir.exists());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn old_temp_files_are_wiped() {
+        let tmp = std::env::temp_dir().join(format!("whisker-oldtmp-{}", crate::vault::random_secret()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("whisker-poster-123-4"), b"video").unwrap();
+        let up = tmp.join("whisker-up-abcdEF0123456789");
+        std::fs::create_dir_all(&up).unwrap();
+        std::fs::write(up.join("in.mp4"), b"video").unwrap();
+        // Not ours to touch.
+        std::fs::write(tmp.join("whisker-poster-test-1"), b"x").unwrap();
+        std::fs::write(tmp.join("other"), b"x").unwrap();
+        wipe_old_temp_files_in(&tmp);
+        assert!(!tmp.join("whisker-poster-123-4").exists());
+        assert!(!up.exists());
+        assert!(tmp.join("whisker-poster-test-1").exists() && tmp.join("other").exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

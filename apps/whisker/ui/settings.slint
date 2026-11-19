@@ -244,6 +244,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-link-previews(int);
     callback set-invidious(string);
     callback set-send-typing(bool);
+    callback set-voice-messages(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
     callback set-link-posters(bool);
@@ -337,6 +338,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.send-typing;
                 toggled => { root.set-send-typing(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Voice messages"; color: Theme.text; }
+                Text {
+                    text: "A microphone button where Send is while the message box is empty: tap it to record, then Send (or the bin to throw it away). Others' voice messages always play.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.voice-messages;
+                toggled => { root.set-voice-messages(self.checked); }
             }
         }
         HorizontalLayout {
@@ -1344,6 +1361,7 @@ export component SettingsPage inherits Rectangle {
     callback set-link-previews(int);
     callback set-invidious(string);
     callback set-send-typing(bool);
+    callback set-voice-messages(bool);
     callback set-clear-command(string);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -1449,6 +1467,7 @@ export component SettingsPage inherits Rectangle {
                             set-link-previews(i) => { root.set-link-previews(i); }
                             set-invidious(t) => { root.set-invidious(t); }
                             set-send-typing(b) => { root.set-send-typing(b); }
+                            set-voice-messages(b) => { root.set-voice-messages(b); }
                             set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }
                             set-spell-check(b) => { root.set-spell-check(b); }

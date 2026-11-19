@@ -66,6 +66,9 @@ pub struct AppSettings {
     /// Tell others when you're typing (off: it's metadata the server sees).
     #[serde(default)]
     pub send_typing: bool,
+    /// The microphone button for recording voice messages.
+    #[serde(default = "yes")]
+    pub voice_messages: bool,
     /// Fix common typos in the composer as you type. Off unless turned on
     /// (saved under a new name: it used to be on for everyone).
     #[serde(default, rename = "autocorrect_on")]

@@ -1513,6 +1513,44 @@ pub async fn send_bytes(
     crate::upload::post(room, message).await.map(drop)
 }
 
+/// Sends a voice message (a recording, in `mime`, `duration` long) the
+/// way Element sends them: an audio message marked as voice, with its
+/// length and `waveform` (0–1024), so other apps show it as one. It's
+/// Whisker's own recording, so there's no metadata to take out.
+pub async fn send_voice(
+    room: &Room,
+    data: Vec<u8>,
+    mime: &str,
+    ext: &str,
+    duration: std::time::Duration,
+    waveform: Vec<u16>,
+    opts: &crate::upload::UploadOptions,
+) -> Result<()> {
+    use matrix_sdk::ruma::events::room::message::{UnstableAmplitude, UnstableAudioDetailsContentBlock, UnstableVoiceContentBlock};
+    let limit = upload_limit(room).await;
+    if data.len() as u64 > limit {
+        return Err(too_big(limit));
+    }
+    let prepared = crate::upload::Prepared {
+        name: format!("Voice message.{ext}"),
+        mime: mime.parse().unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
+        data,
+        size: None,
+        duration: Some(duration),
+        thumb: None,
+        unclean: None,
+    };
+    let MessageType::Audio(mut audio) = crate::upload::upload(room, prepared, opts.always_encrypt, |_| ()).await? else {
+        bail!("the recording wasn't taken as sound");
+    };
+    if let Some(info) = audio.info.as_mut() {
+        info.duration = Some(duration);
+    }
+    audio.audio = Some(UnstableAudioDetailsContentBlock::new(duration, waveform.into_iter().map(UnstableAmplitude::new).collect()));
+    audio.voice = Some(UnstableVoiceContentBlock::new());
+    crate::upload::post(room, MessageType::Audio(audio)).await.map(drop)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

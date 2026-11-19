@@ -151,6 +151,26 @@ pub fn request_media_access() {
     });
 }
 
+/// Whether Whisker may use the microphone (for voice messages).
+pub fn has_mic() -> bool {
+    with_env(|env, activity| {
+        let name = env.new_string("android.permission.RECORD_AUDIO")?;
+        Ok(env.call_method(activity, "checkSelfPermission", "(Ljava/lang/String;)I", &[JValue::Object(&name)])?.i()? == 0)
+    })
+    .unwrap_or(false)
+}
+
+/// Asks the user (Android's own question) to let Whisker use the microphone.
+pub fn request_mic() {
+    with_env(|env, activity| {
+        let array: JObjectArray = env.new_object_array(1, "java/lang/String", JObject::null())?;
+        let s = env.new_string("android.permission.RECORD_AUDIO")?;
+        env.set_object_array_element(&array, 0, s)?;
+        env.call_method(activity, "requestPermissions", "([Ljava/lang/String;I)V", &[JValue::Object(&array), JValue::Int(8)])?;
+        Ok(())
+    });
+}
+
 /// Puts Whisker in the background, as Home does (Back with nothing open):
 /// it keeps running and stays unlocked, where closing it would lock it.
 pub fn to_background() {

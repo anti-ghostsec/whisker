@@ -1019,3 +1019,7 @@ mod tests {
 /// Posters and metadata removal for videos being sent (see that file).
 #[path = "android_media.rs"]
 pub mod media;
+
+/// Recording voice messages (see that file).
+#[path = "android_voice.rs"]
+pub mod voice;

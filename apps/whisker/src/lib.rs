@@ -24,6 +24,7 @@ mod spell;
 #[cfg(not(target_os = "android"))]
 mod spell_marks;
 mod ui;
+mod voice;
 
 use anyhow::Result;
 use matrix_sdk::ruma::events::room::MediaSource;
@@ -4929,6 +4930,72 @@ impl Ctl {
         Some(format!("{}{fixed}{c}", &prev[..prev.len() - word.len()]))
     }
 
+    fn set_voice_messages(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.voice_messages = on;
+        let _ = st.save(self.mgr.data_dir());
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_voice_messages(on);
+        }
+    }
+
+    // ---- voice messages ----
+
+    /// Starts recording a voice message (asking for the microphone first on
+    /// phones), and keeps the recording bar's time and bars moving.
+    fn voice_start(&self) {
+        let c = self.clone();
+        std::thread::spawn(move || match voice::start() {
+            Ok(()) => {
+                c.ui(|u| {
+                    u.set_record_time(s("0:00"));
+                    u.set_recording(true);
+                });
+                while voice::recording() {
+                    if let Some((t, levels)) = voice::progress(40) {
+                        let secs = t.as_secs().min(voice::MAX_LENGTH.as_secs());
+                        let time = format!("{}:{:02}", secs / 60, secs % 60);
+                        c.ui(move |u| {
+                            u.set_record_time(s(time));
+                            u.set_record_levels(ModelRc::new(VecModel::from(levels)));
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            Err(e) => c.status(e),
+        });
+    }
+
+    fn voice_cancel(&self) {
+        self.ui(|u| u.set_recording(false));
+        std::thread::spawn(voice::cancel);
+    }
+
+    /// Stops the recording and sends it to the room that's open.
+    fn voice_send(&self) {
+        self.ui(|u| u.set_recording(false));
+        let c = self.clone();
+        self.spawn(async move {
+            let Some((_, room)) = c.current_room().await else {
+                voice::cancel();
+                return;
+            };
+            match tokio::task::spawn_blocking(voice::finish).await {
+                Ok(Ok(r)) => {
+                    c.status("Sending the voice message…");
+                    let opts = c.settings.lock().unwrap().upload.clone();
+                    match timeline::send_voice(&room, r.data, r.mime, r.ext, r.duration, r.waveform, &opts).await {
+                        Ok(()) => c.status(""),
+                        Err(e) => c.status(format!("Couldn't send the voice message: {e:#}")),
+                    }
+                }
+                Ok(Err(e)) => c.status(e),
+                Err(_) => {}
+            }
+        });
+    }
+
     fn set_send_typing(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.send_typing = on;
@@ -6359,6 +6426,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_media_in_vault(prefs.media_in_vault);
     mgr.set_media_in_vault(prefs.media_in_vault);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
+    ui.global::<Prefs>().set_voice_messages(prefs.voice_messages);
+    ui.set_voice_available(voice::available());
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
     ui.global::<Prefs>().set_spell_check(prefs.spell_check);
     #[cfg(not(target_os = "android"))]
@@ -6670,6 +6739,14 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_set_send_typing(move |b| c.set_send_typing(b));
+        let c = ctl.clone();
+        ui.on_set_voice_messages(move |b| c.set_voice_messages(b));
+        let c = ctl.clone();
+        ui.on_voice_start(move || c.voice_start());
+        let c = ctl.clone();
+        ui.on_voice_cancel(move || c.voice_cancel());
+        let c = ctl.clone();
+        ui.on_voice_send(move || c.voice_send());
         let c = ctl.clone();
         ui.on_set_autocorrect(move |b| c.set_autocorrect(b));
         let c = ctl.clone();

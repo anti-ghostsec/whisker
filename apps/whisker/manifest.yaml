@@ -23,6 +23,8 @@ android:
       - name: android.permission.WRITE_EXTERNAL_STORAGE
         max_sdk_version: 29
       - name: android.permission.MANAGE_EXTERNAL_STORAGE
+      # Recording voice messages (asked for the first time the microphone is tapped).
+      - name: android.permission.RECORD_AUDIO
     application:
       label: Whisker
       # Android 10 hides the phone's folders from apps unless they ask for

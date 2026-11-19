@@ -1783,6 +1783,17 @@ export component AppWindow inherits Window {
 
     // Composer
     in-out property <string> draft;
+    // Voice messages: whether this device can record them, and the one
+    // being recorded (its time so far and recent loudness, 0–1).
+    in-out property <bool> voice-available;
+    in-out property <bool> recording;
+    in-out property <string> record-time: "0:00";
+    in-out property <[float]> record-levels;
+    callback voice-start();
+    callback voice-cancel();
+    callback voice-send();
+    // An empty message box: the microphone where Send would be (as in Element X).
+    property <bool> show-mic: Prefs.voice-messages && root.voice-available && root.draft == "" && root.pending-files.length == 0 && root.editing == "" && root.current-room != "";
     // The spell check looks again once typing pauses.
     changed draft => { root.spell-refresh(); }
     // The screen's edges (status and navigation bars), and on phones the
@@ -2029,6 +2040,7 @@ export component AppWindow inherits Window {
     // Closes what's on top (Back on Android); false when nothing is.
     function go-back() -> bool {
         if root.sheet-open { root.sheet-open = false; return true; }
+        if root.recording { root.voice-cancel(); return true; }
         if Player.large && Player.id != "" { Player.set-large(false); return true; }
         if root.viewer-open { root.viewer-open = false; return true; }
         if root.emoji-open { root.emoji-open = false; return true; }
@@ -2076,6 +2088,7 @@ export component AppWindow inherits Window {
     callback set-link-previews(int);
     callback set-invidious(string);
     callback set-send-typing(bool);
+    callback set-voice-messages(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
     // Spell check: red lines under misspelled words in the composer, and
@@ -2737,9 +2750,38 @@ export component AppWindow inherits Window {
                             VerticalLayout { alignment: center; Btn { text: root.preview-busy ? "Joining…" : "Join"; primary: true; enabled: !root.preview-busy; clicked => { root.activity(); root.preview-join(); } } }
                         }
                     }
+                    // Recording a voice message: in place of the message box.
+                    if root.recording: HorizontalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        VerticalLayout { alignment: center; IconBtn { icon: "🗑"; size: 40px; clicked => { root.activity(); root.voice-cancel(); } } }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 44px;
+                            border-radius: 12px;
+                            background: Theme.raised;
+                            HorizontalLayout {
+                                padding-left: 14px;
+                                padding-right: 14px;
+                                spacing: 10px;
+                                VerticalLayout { alignment: center; Rectangle { width: 10px; height: 10px; border-radius: 5px; background: Theme.danger; } }
+                                Text { text: root.record-time; color: Theme.text; font-weight: 700; vertical-alignment: center; }
+                                HorizontalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: end;
+                                    spacing: 2px;
+                                    for l in root.record-levels: VerticalLayout {
+                                        alignment: center;
+                                        Rectangle { width: 3px; height: max(3px, l * 30px); border-radius: 1.5px; background: Theme.accent; }
+                                    }
+                                }
+                            }
+                        }
+                        VerticalLayout { alignment: center; Btn { text: "Send"; primary: true; height: 40px; clicked => { root.activity(); root.voice-send(); } } }
+                    }
                     // Composer
                     // (On phones the box gets the whole width; its buttons go in a row under it.)
-                    if (!root.current-space || root.current-room == "") && !root.current-preview: HorizontalLayout {
+                    if (!root.current-space || root.current-room == "") && !root.current-preview && !root.recording: HorizontalLayout {
                         padding: 12px;
                         padding-bottom: root.narrow ? 4px : 12px;
                         spacing: 8px;
@@ -2882,13 +2924,17 @@ export component AppWindow inherits Window {
                                 clicked => { root.activity(); root.emoji-for = ""; root.emoji-search(""); root.emoji-open = !root.emoji-open; }
                             }
                         }
-                        if !root.narrow: VerticalLayout {
+                        if !root.narrow && root.show-mic: VerticalLayout {
+                            alignment: end;
+                            IconBtn { icon: "🎤"; size: 40px; clicked => { root.activity(); root.voice-start(); } }
+                        }
+                        if !root.narrow && !root.show-mic: VerticalLayout {
                             alignment: end;
                             Btn { text: root.editing != "" ? "Save" : "Send"; primary: true; height: 40px; enabled: root.current-room != "" && (root.draft != "" || root.pending-files.length > 0); clicked => { root.do-send(); } }
                         }
                     }
                     // Phones: the message box's buttons, under it.
-                    if root.narrow && (!root.current-space || root.current-room == "") && !root.current-preview: HorizontalLayout {
+                    if root.narrow && (!root.current-space || root.current-room == "") && !root.current-preview && !root.recording: HorizontalLayout {
                         padding-left: 12px;
                         padding-right: 12px;
                         padding-bottom: 10px;
@@ -2902,7 +2948,8 @@ export component AppWindow inherits Window {
                             clicked => { root.activity(); root.emoji-for = ""; root.emoji-search(""); root.emoji-open = !root.emoji-open; }
                         }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { text: root.editing != "" ? "Save" : "Send"; primary: true; height: 38px; enabled: root.current-room != "" && (root.draft != "" || root.pending-files.length > 0); clicked => { root.do-send(); } }
+                        if root.show-mic: IconBtn { icon: "🎤"; size: 38px; clicked => { root.activity(); root.voice-start(); } }
+                        if !root.show-mic: Btn { text: root.editing != "" ? "Save" : "Send"; primary: true; height: 38px; enabled: root.current-room != "" && (root.draft != "" || root.pending-files.length > 0); clicked => { root.do-send(); } }
                     }
                     if root.status != "": HorizontalLayout {
                         padding-left: 16px;
@@ -3340,6 +3387,7 @@ export component AppWindow inherits Window {
             set-link-previews(i) => { root.set-link-previews(i); }
             set-invidious(t) => { root.set-invidious(t); }
             set-send-typing(b) => { root.set-send-typing(b); }
+            set-voice-messages(b) => { root.set-voice-messages(b); }
             set-autocorrect(b) => { root.set-autocorrect(b); }
             set-spell-check(b) => { root.set-spell-check(b); }
             set-link-posters(b) => { root.set-link-posters(b); }

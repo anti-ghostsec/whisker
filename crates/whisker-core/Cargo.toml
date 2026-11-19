@@ -15,6 +15,9 @@ mime_guess = "2.0.5"
 # Metadata removal, conversion and previews of pictures before upload (the version the app uses).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "tiff", "bmp"] }
 sha2 = "0.10.9"
+# Decrypting pieces of encrypted videos while they stream (the versions matrix-sdk uses).
+aes = "0.9.3"
+ctr = "0.10.1"
 # Upload progress (the version matrix-sdk uses).
 eyeball = "0.8.8"
 # Same version matrix-sdk-sqlite uses, for consistent snapshots of its databases.

@@ -3,13 +3,18 @@
 //! sends the sound straight to the system (PulseAudio, else ALSA), drawing
 //! any subtitles onto the picture. Videos start muted. Pausing, seeking,
 //! muting, subtitles and the large view restart ffmpeg at the right place.
+//!
+//! A video plays either from a downloaded file or while it streams, read
+//! through a [`Relay`] (the login never leaves Whisker).
 
 use crate::{AppWindow, Player};
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, Weak};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use whisker_core::files::Relay;
 use whisker_core::timeline::{Subtitles, VideoInfo, probe_video};
 
 /// Frames a second shown.
@@ -20,7 +25,10 @@ const MAX_LARGE_PX: (u32, u32) = (1600, 900);
 
 struct Playing {
     id: String,
-    path: PathBuf,
+    /// The file, or the relay's address.
+    input: OsString,
+    /// Serves `input` while the video streams.
+    _relay: Option<Relay>,
     info: VideoInfo,
     /// Where in the video it is (or was paused), in seconds.
     at: f64,
@@ -63,11 +71,25 @@ pub fn is_loaded(id: &str) -> bool {
 
 /// Starts playing the downloaded video `path` from message `id`.
 pub fn play(ui: Weak<AppWindow>, id: String, path: PathBuf) -> bool {
+    start(ui, id, path.into_os_string(), None)
+}
+
+/// Starts playing message `id`'s video while it streams through `relay`.
+/// False when ffprobe can't make it out that way (then it's downloaded).
+pub fn play_stream(ui: Weak<AppWindow>, id: String, relay: Relay) -> bool {
+    start(ui, id, relay.url.clone().into(), Some(relay))
+}
+
+fn start(ui: Weak<AppWindow>, id: String, input: OsString, relay: Option<Relay>) -> bool {
     stop(&ui);
-    let Some(info) = probe_video(&path) else { return false };
+    let Some(info) = probe_video(&input) else { return false };
     let duration = info.duration.map_or(0.0, |d| d.as_secs_f64());
     let has_subtitles = info.subtitles.is_some();
-    *NOW.lock().unwrap() = Some(Playing { id: id.clone(), path, info, at: 0.0, muted: true, subtitles: has_subtitles, large: false, playing: false, child: None, generation: 0 });
+    // Text subtitles are read from the whole file before the first frame:
+    // when streaming, they're there to turn on, not on at the start.
+    let shown = has_subtitles && !(relay.is_some() && info.subtitles == Some(Subtitles::Text));
+    let playing = Playing { id: id.clone(), input, _relay: relay, info, at: 0.0, muted: true, subtitles: shown, large: false, playing: false, child: None, generation: 0 };
+    *NOW.lock().unwrap() = Some(playing);
     let _ = ui.upgrade_in_event_loop(move |u| {
         let p = u.global::<Player>();
         p.set_id(id.into());
@@ -76,7 +98,7 @@ pub fn play(ui: Weak<AppWindow>, id: String, path: PathBuf) -> bool {
         p.set_position(0.0);
         p.set_muted(true);
         p.set_has_subtitles(has_subtitles);
-        p.set_subtitles(has_subtitles);
+        p.set_subtitles(shown);
         p.set_large(false);
     });
     resume(&ui);
@@ -233,7 +255,7 @@ fn sound_output() -> Option<&'static [&'static str]> {
 
 /// `path` written for an ffmpeg filter option: escaped once for the
 /// option, then again for the filter graph.
-fn filter_path(path: &Path) -> String {
+fn filter_path(path: &OsStr) -> String {
     let escape = |s: &str, special: &str| s.chars().fold(String::new(), |mut out, c| {
         if special.contains(c) {
             out.push('\\');
@@ -244,7 +266,7 @@ fn filter_path(path: &Path) -> String {
     escape(&escape(&path.to_string_lossy(), "\\':"), "\\'[],;")
 }
 
-fn ffmpeg(path: &Path, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtitles: Option<Subtitles>) -> std::io::Result<Child> {
+fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtitles: Option<Subtitles>) -> std::io::Result<Child> {
     let mut cmd = Command::new("ffmpeg");
     let fit = format!("fps={FPS},scale={}:{}", size.0, size.1);
     cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{at:.3}")]);
@@ -252,7 +274,7 @@ fn ffmpeg(path: &Path, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtit
     if subtitles == Some(Subtitles::Text) {
         cmd.arg("-copyts");
     }
-    cmd.args(whisker_core::timeline::ffmpeg_guard(path.as_os_str()));
+    cmd.args(whisker_core::timeline::ffmpeg_guard(path));
     cmd.args(["-re", "-i"]).arg(path);
     match subtitles {
         Some(Subtitles::Text) => cmd.args(["-map", "0:v:0", "-vf", &format!("{fit},subtitles=filename={}:si=0", filter_path(path))]),
@@ -273,7 +295,7 @@ fn ffmpeg(path: &Path, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtit
 
 /// Plays from where it is.
 fn resume(ui: &Weak<AppWindow>) {
-    let (path, at, info, muted, subtitles, large, generation) = {
+    let (input, at, info, muted, subtitles, large, generation) = {
         let mut now = NOW.lock().unwrap();
         let Some(p) = now.as_mut() else { return };
         kill(p);
@@ -282,7 +304,7 @@ fn resume(ui: &Weak<AppWindow>) {
         if p.info.duration.is_some_and(|d| p.at >= d.as_secs_f64() - 0.2) {
             p.at = 0.0;
         }
-        (p.path.clone(), p.at, p.info, p.muted, p.subtitles, p.large, p.generation)
+        (p.input.clone(), p.at, p.info, p.muted, p.subtitles, p.large, p.generation)
     };
     crate::ui::video_starting(ui, move || {
         NOW.lock().unwrap().as_ref().is_some_and(|p| p.generation == generation) && SHOWN.load(std::sync::atomic::Ordering::Relaxed) != generation
@@ -290,19 +312,19 @@ fn resume(ui: &Weak<AppWindow>) {
     let ui = ui.clone();
     let subtitles = if subtitles { info.subtitles } else { None };
     let max = if large { MAX_LARGE_PX } else { MAX_PX };
-    std::thread::spawn(move || run(ui, path, at, info, muted, subtitles, max, generation));
+    std::thread::spawn(move || run(ui, input, at, info, muted, subtitles, max, generation));
 }
 
 /// Starts ffmpeg and shows its frames until it ends or is replaced.
 #[allow(clippy::too_many_arguments)]
-fn run(ui: Weak<AppWindow>, path: PathBuf, at: f64, info: VideoInfo, muted: bool, subtitles: Option<Subtitles>, max: (u32, u32), generation: u64) {
+fn run(ui: Weak<AppWindow>, input: OsString, at: f64, info: VideoInfo, muted: bool, subtitles: Option<Subtitles>, max: (u32, u32), generation: u64) {
     let size = frame_size(&info, max);
     let sound = if info.audio && !muted { sound_output() } else { None };
     let current = || NOW.lock().unwrap().as_ref().is_some_and(|p| p.generation == generation);
     if !current() {
         return;
     }
-    let started = ffmpeg(&path, at, size, sound, subtitles).ok().and_then(|mut child| {
+    let started = ffmpeg(&input, at, size, sound, subtitles).ok().and_then(|mut child| {
         let out = child.stdout.take()?;
         let mut now = NOW.lock().unwrap();
         match now.as_mut() {
@@ -399,7 +421,7 @@ mod tests {
 
     #[test]
     fn escapes_paths_for_filters() {
-        assert_eq!(filter_path(Path::new("/tmp/a.mkv")), "/tmp/a.mkv");
-        assert_eq!(filter_path(Path::new("/x/it's: [a],b.mkv")), "/x/it\\\\\\'s\\\\: \\[a\\]\\,b.mkv");
+        assert_eq!(filter_path(OsStr::new("/tmp/a.mkv")), "/tmp/a.mkv");
+        assert_eq!(filter_path(OsStr::new("/x/it's: [a],b.mkv")), "/x/it\\\\\\'s\\\\: \\[a\\]\\,b.mkv");
     }
 }

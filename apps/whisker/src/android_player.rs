@@ -8,6 +8,9 @@
 //! at the right place, as on the desktop.
 //!
 //! The file stays in Whisker's private folder: nothing is handed to other apps.
+//! Or, on Android 9 and newer, nothing is saved at all: the extractor reads
+//! the file from its server a part at a time while it plays
+//! ([`RemoteFile`], through the account's own connection).
 
 use crate::{AppWindow, Player};
 use ndk::audio::{AudioDirection, AudioFormat, AudioStreamBuilder};
@@ -17,7 +20,10 @@ use ndk::media::media_format::MediaFormat;
 use ndk_sys as ffi;
 use slint::{ComponentHandle, Image as SlintImage, Rgba8Pixel, SharedPixelBuffer, Weak};
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::ffi::{CStr, c_char, c_int, c_void};
+use std::path::PathBuf;
+use std::sync::Arc;
+use whisker_core::files::RemoteFile;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -32,7 +38,7 @@ const END_OF_STREAM: u32 = 4;
 
 struct Playing {
     id: String,
-    path: PathBuf,
+    src: Src,
     info: Info,
     /// Where in it it is (or was paused), in seconds.
     at: f64,
@@ -52,6 +58,15 @@ struct Info {
     width: u32,
     height: u32,
     rotation: i32,
+}
+
+/// Where the extractor reads from.
+#[derive(Clone)]
+enum Src {
+    /// A downloaded file.
+    File(PathBuf),
+    /// The file on its server, read with the app's runtime.
+    Remote(Arc<RemoteFile>, tokio::runtime::Handle),
 }
 
 static NOW: Mutex<Option<Playing>> = Mutex::new(None);
@@ -78,9 +93,20 @@ pub fn is_loaded(id: &str) -> bool {
 
 /// Starts playing the downloaded video (or sound) `path` from message `id`.
 pub fn play(ui: Weak<AppWindow>, id: String, path: PathBuf) -> bool {
+    start(ui, id, Src::File(path))
+}
+
+/// Starts playing message `id`'s video (or sound) while it streams from
+/// `file`. False when the phone can't read it that way (older than
+/// Android 9, or the extractor can't make it out): then it's downloaded.
+pub fn play_remote(ui: Weak<AppWindow>, id: String, file: Arc<RemoteFile>, rt: tokio::runtime::Handle) -> bool {
+    custom_source().is_some() && start(ui, id, Src::Remote(file, rt))
+}
+
+fn start(ui: Weak<AppWindow>, id: String, src: Src) -> bool {
     stop(&ui);
-    let Some(info) = probe(&path) else { return false };
-    *NOW.lock().unwrap() = Some(Playing { id: id.clone(), path, info, at: 0.0, muted: info.video.is_some(), large: false, playing: false, generation: 0 });
+    let Some(info) = probe(&src) else { return false };
+    *NOW.lock().unwrap() = Some(Playing { id: id.clone(), src, info, at: 0.0, muted: info.video.is_some(), large: false, playing: false, generation: 0 });
     let muted = info.video.is_some();
     let _ = ui.upgrade_in_event_loop(move |u| {
         let p = u.global::<Player>();
@@ -202,7 +228,7 @@ fn pause(ui: &Weak<AppWindow>) {
 
 /// Plays from where it is.
 fn resume(ui: &Weak<AppWindow>) {
-    let (path, at, info, muted, large, generation) = {
+    let (src, at, info, muted, large, generation) = {
         let mut now = NOW.lock().unwrap();
         let Some(p) = now.as_mut() else { return };
         p.generation += 1;
@@ -211,17 +237,17 @@ fn resume(ui: &Weak<AppWindow>) {
         if p.info.duration > 0.0 && p.at >= p.info.duration - 0.2 {
             p.at = 0.0;
         }
-        (p.path.clone(), p.at, p.info, p.muted, p.large, p.generation)
+        (p.src.clone(), p.at, p.info, p.muted, p.large, p.generation)
     };
     crate::ui::video_starting(ui, move || current(generation) && SHOWN.load(Ordering::Relaxed) != generation);
     let start = Instant::now() + Duration::from_millis(150);
     let max = if large { MAX_LARGE_PX } else { MAX_PX };
     if info.audio.is_some() && (!muted || info.video.is_none()) {
-        let (path, ui) = (path.clone(), ui.clone());
+        let (src, ui) = (src.clone(), ui.clone());
         // With a picture, the picture's thread says when it's over.
         let leads = info.video.is_none();
         std::thread::spawn(move || {
-            let played = play_sound(&path, info, at, start, generation, leads.then_some(&ui));
+            let played = play_sound(&src, info, at, start, generation, leads.then_some(&ui));
             if leads {
                 finished(&ui, generation, played);
             }
@@ -230,7 +256,7 @@ fn resume(ui: &Weak<AppWindow>) {
     if info.video.is_some() {
         let ui = ui.clone();
         std::thread::spawn(move || {
-            let shown = play_picture(&ui, &path, info, at, start, max, generation);
+            let shown = play_picture(&ui, &src, info, at, start, max, generation);
             finished(&ui, generation, shown);
         });
     }
@@ -268,14 +294,23 @@ fn finished(ui: &Weak<AppWindow>, generation: u64, played: u64) {
     }
 }
 
-/// Android's media extractor over a file.
+/// Android's media extractor over a file, or over a file on its server.
 struct Extractor {
     ptr: *mut ffi::AMediaExtractor,
-    _file: std::fs::File,
+    _file: Option<std::fs::File>,
+    /// The data source reading the server's file, and what it reads with.
+    remote: Option<(*mut c_void, *mut Reader)>,
 }
 
 impl Extractor {
-    fn open(path: &Path) -> Option<Self> {
+    fn open(src: &Src) -> Option<Self> {
+        match src {
+            Src::File(path) => Self::open_file(path),
+            Src::Remote(file, rt) => Self::open_remote(file, rt),
+        }
+    }
+
+    fn open_file(path: &std::path::Path) -> Option<Self> {
         let file = std::fs::File::open(path).ok()?;
         let len = file.metadata().ok()?.len() as i64;
         // SAFETY: plain calls into libmediandk; the file stays open as long as the extractor.
@@ -283,8 +318,34 @@ impl Extractor {
         if ptr.is_null() {
             return None;
         }
-        let me = Self { ptr, _file: file };
-        let status = unsafe { ffi::AMediaExtractor_setDataSourceFd(me.ptr, me._file.as_raw_fd(), 0, len) };
+        let fd = file.as_raw_fd();
+        let me = Self { ptr, _file: Some(file), remote: None };
+        let status = unsafe { ffi::AMediaExtractor_setDataSourceFd(me.ptr, fd, 0, len) };
+        (status.0 == 0).then_some(me)
+    }
+
+    fn open_remote(file: &Arc<RemoteFile>, rt: &tokio::runtime::Handle) -> Option<Self> {
+        let api = custom_source()?;
+        // SAFETY: plain calls into libmediandk. The reader lives (boxed)
+        // until the extractor and the data source are gone (see Drop).
+        let ptr = unsafe { ffi::AMediaExtractor_new() };
+        if ptr.is_null() {
+            return None;
+        }
+        let source = unsafe { (api.new)() };
+        if source.is_null() {
+            unsafe { ffi::AMediaExtractor_delete(ptr) };
+            return None;
+        }
+        let reader = Box::into_raw(Box::new(Reader { file: file.clone(), rt: rt.clone() }));
+        let me = Self { ptr, _file: None, remote: Some((source, reader)) };
+        let status = unsafe {
+            (api.set_userdata)(source, reader.cast());
+            (api.set_read_at)(source, read_at);
+            (api.set_get_size)(source, get_size);
+            (api.set_close)(source, close);
+            (api.set_source)(me.ptr, source)
+        };
         (status.0 == 0).then_some(me)
     }
 
@@ -321,8 +382,107 @@ impl Extractor {
 impl Drop for Extractor {
     fn drop(&mut self) {
         unsafe { ffi::AMediaExtractor_delete(self.ptr) };
+        if let (Some((source, reader)), Some(api)) = (self.remote.take(), custom_source()) {
+            // SAFETY: the extractor that read through them is gone.
+            unsafe {
+                (api.delete)(source);
+                drop(Box::from_raw(reader));
+            }
+        }
     }
 }
+
+/// What a data source reads the server's file with.
+struct Reader {
+    file: Arc<RemoteFile>,
+    rt: tokio::runtime::Handle,
+}
+
+type ReadAt = unsafe extern "C" fn(*mut c_void, i64, *mut c_void, usize) -> isize;
+type GetSize = unsafe extern "C" fn(*mut c_void) -> isize;
+type Close = unsafe extern "C" fn(*mut c_void);
+
+/// Android 9's custom data sources for the extractor, looked up when
+/// Whisker runs: it also runs on Android 8, which doesn't have them.
+struct CustomSource {
+    new: unsafe extern "C" fn() -> *mut c_void,
+    delete: unsafe extern "C" fn(*mut c_void),
+    set_userdata: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    set_read_at: unsafe extern "C" fn(*mut c_void, ReadAt),
+    set_get_size: unsafe extern "C" fn(*mut c_void, GetSize),
+    set_close: unsafe extern "C" fn(*mut c_void, Close),
+    set_source: unsafe extern "C" fn(*mut ffi::AMediaExtractor, *mut c_void) -> ffi::media_status_t,
+}
+
+#[link(name = "dl")]
+unsafe extern "C" {
+    fn dlopen(name: *const c_char, flags: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+}
+
+fn custom_source() -> Option<&'static CustomSource> {
+    static FOUND: std::sync::OnceLock<Option<CustomSource>> = std::sync::OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            const RTLD_NOW: c_int = 2;
+            // SAFETY: libmediandk is already loaded (the player links it); each
+            // symbol is cast to the signature in its NDK header (NdkMediaDataSource.h,
+            // NdkMediaExtractor.h, API 28).
+            unsafe {
+                let lib = dlopen(c"libmediandk.so".as_ptr(), RTLD_NOW);
+                if lib.is_null() {
+                    return None;
+                }
+                let sym = |name: &CStr| Some(dlsym(lib, name.as_ptr())).filter(|p| !p.is_null());
+                Some(CustomSource {
+                    new: std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> *mut c_void>(sym(c"AMediaDataSource_new")?),
+                    delete: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void)>(sym(c"AMediaDataSource_delete")?),
+                    set_userdata: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void, *mut c_void)>(sym(c"AMediaDataSource_setUserdata")?),
+                    set_read_at: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void, ReadAt)>(sym(c"AMediaDataSource_setReadAt")?),
+                    set_get_size: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void, GetSize)>(sym(c"AMediaDataSource_setGetSize")?),
+                    set_close: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void, Close)>(sym(c"AMediaDataSource_setClose")?),
+                    set_source: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut ffi::AMediaExtractor, *mut c_void) -> ffi::media_status_t>(sym(
+                        c"AMediaExtractor_setDataSourceCustom",
+                    )?),
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// Reads `size` bytes at `offset` into `buf` for the extractor (on its
+/// thread, which waits): how many, 0 at the end, -1 when they can't be had.
+unsafe extern "C" fn read_at(user: *mut c_void, offset: i64, buf: *mut c_void, size: usize) -> isize {
+    // SAFETY: `user` is the Extractor's boxed Reader, alive while the extractor is.
+    let reader = unsafe { &*user.cast::<Reader>() };
+    let Ok(offset) = u64::try_from(offset) else { return -1 };
+    if size == 0 {
+        return 0;
+    }
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.rt.block_on(reader.file.read_at(offset, size))));
+    match read {
+        Ok(Ok(data)) => {
+            let n = data.len().min(size);
+            // SAFETY: the extractor gave `buf` room for `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf.cast::<u8>(), n) };
+            n as isize
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("couldn't stream the video: {e:#}");
+            -1
+        }
+        Err(_) => -1,
+    }
+}
+
+unsafe extern "C" fn get_size(user: *mut c_void) -> isize {
+    // SAFETY: as in read_at.
+    let reader = unsafe { &*user.cast::<Reader>() };
+    reader.file.size().and_then(|s| isize::try_from(s).ok()).unwrap_or(-1)
+}
+
+/// The reader is freed with the extractor, not here.
+unsafe extern "C" fn close(_user: *mut c_void) {}
 
 fn mime(f: &mut MediaFormat) -> String {
     f.str("mime").unwrap_or_default().to_owned()
@@ -330,8 +490,8 @@ fn mime(f: &mut MediaFormat) -> String {
 
 /// What's in the file: its length, its picture and sound tracks, and the
 /// picture's size and turn.
-fn probe(path: &Path) -> Option<Info> {
-    let ex = Extractor::open(path)?;
+fn probe(src: &Src) -> Option<Info> {
+    let ex = Extractor::open(src)?;
     let mut info = Info { duration: 0.0, video: None, audio: None, width: 0, height: 0, rotation: 0 };
     for t in 0..ex.tracks() {
         let Some(mut f) = ex.format(t) else { continue };
@@ -413,7 +573,7 @@ enum Outcome {
 
 /// Decodes the picture from `at` and draws it, paced to real time from
 /// `start`. Returns how many frames it showed.
-fn play_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start: Instant, max: (u32, u32), generation: u64) -> u64 {
+fn play_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, at: f64, start: Instant, max: (u32, u32), generation: u64) -> u64 {
     let why = match decode_picture(ui, path, info, at, start, max, generation, Output::Reader) {
         Outcome::Shown(n) => return n,
         Outcome::NoPictures(why) => why,
@@ -491,7 +651,7 @@ impl Layout {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start: Instant, max: (u32, u32), generation: u64, output: Output) -> Outcome {
+fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, at: f64, start: Instant, max: (u32, u32), generation: u64, output: Output) -> Outcome {
     let Some(ex) = Extractor::open(path) else { return Outcome::NoPictures("the file can't be read".into()) };
     let Some(track) = info.video else { return Outcome::Shown(0) };
     let Some(mut format) = ex.format(track) else { return Outcome::NoPictures("no video format".into()) };
@@ -728,7 +888,7 @@ impl Planes<'_> {
 /// Decodes the sound from `at` and plays it, starting at `start`. With
 /// `ui` (sound only, no picture) it also moves the position along. Returns
 /// how many pieces it played.
-fn play_sound(path: &Path, info: Info, at: f64, start: Instant, generation: u64, ui: Option<&Weak<AppWindow>>) -> u64 {
+fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, ui: Option<&Weak<AppWindow>>) -> u64 {
     let Some(ex) = Extractor::open(path) else { return 0 };
     let Some(track) = info.audio else { return 0 };
     let Some(mut format) = ex.format(track) else { return 0 };

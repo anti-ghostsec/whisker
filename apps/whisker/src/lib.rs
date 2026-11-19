@@ -4033,6 +4033,28 @@ impl Ctl {
                 p.set_id(s(id));
                 p.set_loading(true);
             });
+            // Played while it streams when the server sends parts of
+            // files, so it starts at once; else downloaded first, below.
+            match self.cancellable(files::RemoteFile::open_to_play(&client, &media.source)).await {
+                Ok(file) if file.seekable() => {
+                    if timeline::sniff_media(file.head()).is_none() {
+                        self.ui(|u| u.global::<Player>().set_loading(false));
+                        self.status("Couldn't open it: it isn't a video or audio file Whisker knows (use Save to keep it)");
+                        return;
+                    }
+                    if self.play_streaming(file, event_id.to_string()).await {
+                        self.status(if media.kind == MediaKind::Audio { "Playing. Tap it again to pause." } else { "" });
+                        return;
+                    }
+                }
+                Err(e) if e.to_string() == "cancelled" => {
+                    self.ui(|u| u.global::<Player>().set_loading(false));
+                    self.status("Download cancelled.");
+                    return;
+                }
+                Err(e) => tracing::info!("can't stream it, downloading it first: {e:#}"),
+                Ok(_) => tracing::info!("the server sends only whole files; downloading it first"),
+            }
         }
         let dir = media_dir(self.mgr.data_dir());
         // The name is the sender's (`holiday.exe`): the file is named
@@ -4085,6 +4107,33 @@ impl Ctl {
                 self.status(if e.to_string() == "cancelled" { "Download cancelled.".to_owned() } else { format!("Couldn't open it: {e:#}") });
             }
         }
+    }
+
+    /// Starts playing `file` (message `id`) in the window while it streams.
+    /// False when the player can't read it that way.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn play_streaming(&self, file: Arc<files::RemoteFile>, id: String) -> bool {
+        let (ui, shown) = (self.ui.clone(), id.clone());
+        #[cfg(target_os = "android")]
+        let start = {
+            let rt = tokio::runtime::Handle::current();
+            move || player::play_remote(ui, id, file, rt)
+        };
+        #[cfg(not(target_os = "android"))]
+        let start = {
+            let Ok(relay) = files::Relay::serve(file).await else { return false };
+            move || player::play_stream(ui, id, relay)
+        };
+        let played = tokio::task::spawn_blocking(start).await.unwrap_or(false);
+        if !played {
+            // Trying cleared the player: it shows the download instead.
+            self.ui(move |u| {
+                let p = u.global::<Player>();
+                p.set_id(s(shown));
+                p.set_loading(true);
+            });
+        }
+        played
     }
 
     /// Starts a batch of uploads the ✕ next to the status line can stop:

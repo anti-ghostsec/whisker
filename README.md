@@ -142,7 +142,9 @@ operating system and the **Wisp** browser.
   ffmpeg if it's installed, reading only the parts of the video it needs where it can; videos
   you send get one the same way). Click a video to **play it right there in the message**, with
   pause, a seek bar, sound and its subtitles (on Linux, with ffmpeg installed; sound goes through
-  PulseAudio/PipeWire, else ALSA). Videos start muted: the speaker opens a volume slider
+  PulseAudio/PipeWire, else ALSA). It starts at once: the video streams through Whisker's own
+  connection (decrypted on the way in encrypted rooms) instead of downloading first, unless the
+  server only sends whole files. Videos start muted: the speaker opens a volume slider
   (with Mute under it), and the level is kept for next time. Subtitles
   inside the video (SRT, ASS, WebVTT, MP4 text, or picture subtitles from Blu-ray and DVD rips)
   are drawn on it; the CC button hides them. The corners button (or a double-click) shows it

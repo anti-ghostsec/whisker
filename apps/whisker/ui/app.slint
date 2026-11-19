@@ -674,7 +674,23 @@ component MessageRow inherits Rectangle {
     callback show-readers([Reader]);
     // Phones: held down, for the big menu that slides up (see MessageSheet).
     callback hold(MessageItem);
+    // Held long enough: the menu is up, and the tap that ends it is dropped
+    // (until the next press).
     property <bool> held;
+    // A finger down on one of the row's own touch areas (a link card, a
+    // reply quote, a name…), which take the touch so the row can't see it.
+    property <bool> pressing;
+    function press(e: PointerEvent) {
+        if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
+            root.held = false;
+            root.pressing = true;
+        } else if e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel {
+            root.pressing = false;
+        }
+    }
+    // Taps do nothing when they end a hold.
+    function act(a: string, id: string) { if !root.held { root.action(a, id); } }
+    function go(l: string) { if !root.held { root.link(l); } }
     // Text selected in the message, for the menu's Copy.
     property <string> selection;
     // Lit for a moment: a click on a reply to it just scrolled here.
@@ -688,11 +704,11 @@ component MessageRow inherits Rectangle {
     // the finger scrolls instead, which lets go of the press.)
     Timer {
         interval: 450ms;
-        running: Prefs.touch && area.pressed && !root.held;
+        running: Prefs.touch && (area.pressed || root.pressing) && !root.held;
         triggered => { root.held = true; root.hold(root.item); }
     }
     area := TouchArea {
-        changed pressed => { if !self.pressed { root.held = false; } }
+        pointer-event(e) => { root.press(e); }
         cm := ContextMenuArea {
             // Phones get the big menu instead.
             enabled: !Prefs.touch;
@@ -763,7 +779,7 @@ component MessageRow inherits Rectangle {
                         // Click for the person's profile (their full address, server…).
                         Text {
                             text: root.item.body; font-size: 12px; color: notice-ta.has-hover ? Theme.text : Theme.muted; wrap: word-wrap; width: max(40px, root.width - 64px - 16px - 52px);
-                            notice-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                            notice-ta := TouchArea { mouse-cursor: pointer; clicked => { root.act("profile", root.item.id); } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                         // Developer mode: each value it changed.
                         if Prefs.dev-mode && root.item.details != "": Text {
@@ -772,7 +788,7 @@ component MessageRow inherits Rectangle {
                         if Prefs.dev-mode && root.item.more-details > 0: Text {
                             text: "Show " + root.item.more-details + " more " + (root.item.more-details == 1 ? "change" : "changes");
                             font-size: 11px; color: more-ta.has-hover ? Theme.text : Theme.accent;
-                            more-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("changes", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                            more-ta := TouchArea { mouse-cursor: pointer; clicked => { root.act("changes", root.item.id); } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                     }
                     Text { text: root.item.time; visible: area.has-hover; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
@@ -788,7 +804,7 @@ component MessageRow inherits Rectangle {
                         alignment: start;
                         if root.item.first: Avatar {
                             initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; size: 36px;
-                            TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                            TouchArea { mouse-cursor: pointer; clicked => { root.act("profile", root.item.id); } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                         // Always there (shown on hover), so hovering or touching
                         // a message doesn't change its height.
@@ -810,7 +826,7 @@ component MessageRow inherits Rectangle {
                                 color: root.item.mine ? Theme.accent : Theme.text;
                                 font-size: 14px;
                                 // Click a name to reply to this message.
-                                TouchArea { mouse-cursor: pointer; clicked => { root.action("reply", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                                TouchArea { mouse-cursor: pointer; clicked => { root.act("reply", root.item.id); } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                             }
                             if root.item.trust == 1: Text { text: "✓ Verified"; color: Theme.ok; font-size: 10px; font-weight: 700; vertical-alignment: center; }
                             if root.item.trust == 2: Text { text: "⚠ Identity changed"; color: Theme.danger; font-size: 10px; font-weight: 700; vertical-alignment: center; }
@@ -824,7 +840,7 @@ component MessageRow inherits Rectangle {
                                 Text { text: root.item.reply-name; font-size: 12px; font-weight: 700; color: reply-area.has-hover ? Theme.text : Theme.muted; }
                                 Text { text: root.item.reply-text; font-size: 12px; color: reply-area.has-hover ? Theme.text : Theme.muted; overflow: elide; horizontal-stretch: 1; }
                             }
-                            reply-area := TouchArea { mouse-cursor: pointer; clicked => { root.action("jump", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                            reply-area := TouchArea { mouse-cursor: pointer; clicked => { root.act("jump", root.item.id); } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                         // Narrow chat (side panel open): shrink, keeping the shape.
                         // Pictures, and videos that came with a preview frame.
@@ -861,20 +877,6 @@ component MessageRow inherits Rectangle {
                                 if Player.progress > 0: Text { text: Player.progress + "%"; color: white; font-size: 13px; }
                                 if Player.progress == 0: Dots {}
                             }
-                            // Touch screens: held still for half a second, it opens the
-                            // message's menu (the picture takes the touch, so the row's
-                            // own press-and-hold never sees it), and the tap is dropped.
-                            property <bool> held;
-                            Timer {
-                                interval: 500ms;
-                                running: Prefs.touch && pic-area.pressed && !pic.held;
-                                triggered => {
-                                    if abs(pic-area.mouse-x - pic-area.pressed-x) < 12px && abs(pic-area.mouse-y - pic-area.pressed-y) < 12px {
-                                        pic.held = true;
-                                        cm.show({ x: pic-area.absolute-position.x - root.absolute-position.x + pic-area.mouse-x, y: pic-area.absolute-position.y - root.absolute-position.y + pic-area.mouse-y });
-                                    }
-                                }
-                            }
                             // Takes every button, so it opens the menu itself on right-click.
                             pic-area := TouchArea {
                                 mouse-cursor: pointer;
@@ -882,11 +884,10 @@ component MessageRow inherits Rectangle {
                                     if pic.here { Player.set-large(true); }
                                 }
                                 clicked => {
-                                    if pic.held { pic.held = false; return; }
-                                    if root.item.media == 2 { Player.toggle(root.item.id); } else if root.item.picture-failed { root.action("retry-media", root.item.id); } else { root.action("view", root.item.id); }
+                                    if root.held { return; }
+                                    if root.item.media == 2 { Player.toggle(root.item.id); } else if root.item.picture-failed { root.act("retry-media", root.item.id); } else { root.act("view", root.item.id); }
                                 }
-                                pointer-event(e) => {
-                                    if e.kind == PointerEventKind.down { pic.held = false; }
+                                pointer-event(e) => { root.press(e);
                                     if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
                                 }
                                 // Controls, while it plays (on hover) or is paused.
@@ -924,8 +925,8 @@ component MessageRow inherits Rectangle {
                             TouchArea {
                                 mouse-cursor: pointer;
                                 // Videos and audio play; other files save.
-                                clicked => { root.action(root.item.media == 2 || root.item.media == 3 ? "play" : "save", root.item.id); }
-                                pointer-event(e) => {
+                                clicked => { root.act(root.item.media == 2 || root.item.media == 3 ? "play" : "save", root.item.id); }
+                                pointer-event(e) => { root.press(e);
                                     if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
                                 }
                             }
@@ -935,7 +936,7 @@ component MessageRow inherits Rectangle {
                             spacing: 4px;
                             for pic in root.item.big-emoji: Image { source: pic; width: 40px; height: 40px; }
                         }
-                        if (root.item.media == 0 || root.item.caption) && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.link(l); } selected(t) => { root.selection = t; } }
+                        if (root.item.media == 0 || root.item.caption) && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.go(l); } selected(t) => { root.selection = t; } }
                         if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
                         if root.item.link-card > 0: Rectangle {
                             property <length> card-w: min(400px, root.width - 32px - 36px - 12px);
@@ -948,10 +949,10 @@ component MessageRow inherits Rectangle {
                             card-ta := TouchArea {
                                 mouse-cursor: pointer;
                                 // Right-click: the message menu, as anywhere else on it.
-                                pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } }
+                                pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } }
                                 clicked => {
-                                    if root.item.link-card == 1 { root.action("link-preview", root.item.id); }
-                                    else if root.item.link-card == 3 { root.link(root.item.link-url); }
+                                    if root.item.link-card == 1 { root.act("link-preview", root.item.id); }
+                                    else if root.item.link-card == 3 { root.go(root.item.link-url); }
                                 }
                             }
                             card-col := VerticalLayout {
@@ -990,8 +991,8 @@ component MessageRow inherits Rectangle {
                                     if root.item.link-video && Prefs.youtube-here: yt-area := TouchArea {
                                         mouse-cursor: pointer;
                                         // Right-click: the message menu, as anywhere else on it.
-                                        pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } }
-                                        clicked => { Player.toggle(root.item.id); }
+                                        pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } }
+                                        clicked => { if !root.held { Player.toggle(root.item.id); } }
                                         double-clicked => { if parent.here { Player.set-large(true); } }
                                         if parent.here && !Player.loading && !Player.large && (yt-area.has-hover || !Player.playing || Player.bar-hold): VideoBar {
                                             id: root.item.id;
@@ -1011,7 +1012,7 @@ component MessageRow inherits Rectangle {
                                 text: "⚠";
                                 font-size: 10px;
                                 color: root.item.shield == 2 ? Theme.danger : Theme.muted;
-                                shield-ta := TouchArea { mouse-cursor: pointer; pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                                shield-ta := TouchArea { mouse-cursor: pointer; pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                             }
                             if shield-ta.has-hover: Rectangle {
                                 x: 16px;
@@ -1047,7 +1048,7 @@ component MessageRow inherits Rectangle {
                                 }
                                 Text { text: root.item.thread-last; font-size: 12px; color: Theme.muted; overflow: elide; vertical-alignment: center; }
                             }
-                            th-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("thread", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                            th-ta := TouchArea { mouse-cursor: pointer; clicked => { root.act("thread", root.item.id); } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                         if root.item.reactions.length > 0: HorizontalLayout {
                             alignment: start;
@@ -1067,7 +1068,7 @@ component MessageRow inherits Rectangle {
                                     if r.picture.width == 0: Text { text: r.key; font-size: 13px; vertical-alignment: center; }
                                     Text { text: r.count; font-size: 11px; font-weight: 700; color: r.mine ? Theme.accent : Theme.muted; vertical-alignment: center; }
                                 }
-                                chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("react:" + r.key, root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                                chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.act("react:" + r.key, root.item.id); } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                                 // On hover: the emoji large (small ones are hard to make
                                 // out), what it is, and who reacted.
                                 if chip-ta.has-hover: Rectangle {
@@ -1098,7 +1099,7 @@ component MessageRow inherits Rectangle {
                                 border-radius: 12px;
                                 background: add-ta.has-hover ? Theme.hover : transparent;
                                 Text { text: "+"; font-size: 14px; color: Theme.muted; }
-                                add-ta := TouchArea { mouse-cursor: pointer; clicked => { root.pick-reaction(); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                                add-ta := TouchArea { mouse-cursor: pointer; clicked => { if !root.held { root.pick-reaction(); } } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                             }
                         }
                     }
@@ -1116,7 +1117,7 @@ component MessageRow inherits Rectangle {
                             for r in root.item.readers: Avatar { initial: r.initial; hue: r.hue; image: r.avatar; size: 16px; }
                             if root.item.more-readers > 0: Text { text: "+" + root.item.more-readers; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
                         }
-                        TouchArea { mouse-cursor: pointer; clicked => { root.show-readers(root.item.all-readers); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
+                        TouchArea { mouse-cursor: pointer; clicked => { if !root.held { root.show-readers(root.item.all-readers); } } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                     }
                 }
             }

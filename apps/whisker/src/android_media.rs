@@ -21,7 +21,7 @@ pub fn install() {
 /// short clips their first frame), as a JPEG.
 fn poster(path: &std::ffi::OsStr) -> Option<whisker_core::timeline::Poster> {
     let path = Path::new(path);
-    let info = probe(path)?;
+    let info = probe(&Src::File(path.to_owned()))?;
     info.video?;
     let size = frame_size(info, POSTER_PX);
     let last = (info.duration - 0.1).max(0.0);
@@ -43,7 +43,7 @@ fn poster(path: &std::ffi::OsStr) -> Option<whisker_core::timeline::Poster> {
 /// Android's software decoders first (they write into memory, which is
 /// what's read here), then the phone's own.
 fn still(path: &Path, info: Info, at: f64, size: (u32, u32)) -> Option<Vec<u8>> {
-    let ex = Extractor::open(path)?;
+    let ex = Extractor::open_file(path)?;
     let track = info.video?;
     let mut format = ex.format(track)?;
     let kind = mime(&mut format);
@@ -117,7 +117,7 @@ fn strip(data: &[u8], name: &str, video: bool) -> Option<Vec<u8>> {
 
 /// Copies `src`'s picture (when `video`) and sound tracks into `dst`.
 fn remux(src: &Path, dst: &Path, format: ffi::OutputFormat, video: bool) -> bool {
-    let Some(ex) = Extractor::open(src) else { return false };
+    let Some(ex) = Extractor::open_file(src) else { return false };
     let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(dst) else { return false };
     // SAFETY: plain calls into libmediandk; the file stays open while the muxer uses it.
     let muxer = unsafe { ffi::AMediaMuxer_new(file.as_raw_fd(), format) };

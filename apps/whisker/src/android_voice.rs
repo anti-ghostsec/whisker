@@ -5,7 +5,6 @@
 use super::*;
 use std::path::Path;
 use crate::voice::{MAX_LENGTH, RATE};
-use ndk::audio::AudioInputPreset;
 
 /// Records until `stop`, handing samples (mono, [`RATE`]) to `push`. Says on
 /// `ready` whether the microphone opened.
@@ -15,7 +14,6 @@ pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), Strin
             .format(AudioFormat::PCM_I16)
             .channel_count(1)
             .sample_rate(RATE as i32)
-            .input_preset(AudioInputPreset::Generic)
             .open_stream()
     });
     let stream = match stream {

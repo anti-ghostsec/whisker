@@ -397,6 +397,11 @@ optimised in debug too, but Whisker's own code isn't).
 Every push builds Linux, Windows and Android artifacts in Actions. A `v*` tag attaches
 them to a release.
 
+The Android APK from Actions is signed with Whisker's release key, whose certificate
+SHA-256 is in `apps/whisker/android-release-cert.sha256` (a local `x build` signs with
+xbuild's debug key instead). Earlier APKs were debug-signed: uninstall one of those once
+before installing a new one.
+
 To have Whisker in the app menu and the FerroOS Share box, install its desktop entry (it
 expects `whisker` on your `PATH`, e.g. linked into `~/.local/bin`):
 

@@ -73,6 +73,29 @@ pub fn decode_frames(bytes: &[u8], max_w: u32, max_h: u32) -> Option<Frames> {
 /// Biggest animation canvas decoded (pixels): 4096 × 4096.
 const MAX_FRAME_AREA: u64 = 4096 * 4096;
 /// Sound level for videos and audio, 0–100 (see `Player.volume`).
+/// The video in the window (re)starting: with no picture up yet it shows
+/// "Loading" right away; with one (a seek, a pause, sound turned on) that
+/// picture stays, and "Loading" comes only if the new one is slow, so a
+/// seek doesn't flash the spinner. `waiting` says whether the start is still
+/// on and has shown nothing yet.
+pub fn video_starting(ui: &slint::Weak<crate::AppWindow>, waiting: impl Fn() -> bool + Send + 'static) {
+    use slint::ComponentHandle;
+    let _ = ui.upgrade_in_event_loop(|u| {
+        let p = u.global::<crate::Player>();
+        p.set_playing(true);
+        if p.get_frame().size().width == 0 {
+            p.set_loading(true);
+        }
+    });
+    let ui = ui.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if waiting() {
+            let _ = ui.upgrade_in_event_loop(|u| u.global::<crate::Player>().set_loading(true));
+        }
+    });
+}
+
 pub static VOLUME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
 
 pub fn volume() -> u32 {

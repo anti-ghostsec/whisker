@@ -2787,8 +2787,9 @@ export component AppWindow inherits Window {
             }
 
             // Side panel: a person's profile, or the room's details (Element-style).
+            // Phones: the whole width (the account rail is hidden then).
             if root.panel-open && (!root.narrow || root.pane == 2): Rectangle {
-                width: root.narrow ? root.width - 64px : 340px;
+                width: root.narrow ? root.width : 340px;
                 background: Theme.panel;
                 Rectangle { x: 0; width: 1px; background: Theme.border; }
                 VerticalLayout {

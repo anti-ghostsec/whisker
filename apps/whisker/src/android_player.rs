@@ -55,6 +55,8 @@ struct Info {
 }
 
 static NOW: Mutex<Option<Playing>> = Mutex::new(None);
+/// The last start (`Playing::generation`) that showed a picture or played sound.
+static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Videos start over when they end.
 static LOOP: AtomicBool = AtomicBool::new(false);
 
@@ -211,11 +213,7 @@ fn resume(ui: &Weak<AppWindow>) {
         }
         (p.path.clone(), p.at, p.info, p.muted, p.large, p.generation)
     };
-    let _ = ui.upgrade_in_event_loop(|u| {
-        let p = u.global::<Player>();
-        p.set_playing(true);
-        p.set_loading(true);
-    });
+    crate::ui::video_starting(ui, move || current(generation) && SHOWN.load(Ordering::Relaxed) != generation);
     let start = Instant::now() + Duration::from_millis(150);
     let max = if large { MAX_LARGE_PX } else { MAX_PX };
     if info.audio.is_some() && (!muted || info.video.is_none()) {
@@ -610,6 +608,9 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Path, info: Info, at: f64, start:
                     }
                 }
                 let first = shown == 1;
+                if first {
+                    SHOWN.store(generation, Ordering::Relaxed);
+                }
                 let _ = ui.upgrade_in_event_loop(move |u| {
                     let p = u.global::<Player>();
                     p.set_frame(SlintImage::from_rgba8(frame));
@@ -819,6 +820,9 @@ fn play_sound(path: &Path, info: Info, at: f64, start: Instant, generation: u64,
                     }
                 }
                 let first = played == 1;
+                if first {
+                    SHOWN.store(generation, Ordering::Relaxed);
+                }
                 let _ = ui.upgrade_in_event_loop(move |u| {
                     let p = u.global::<Player>();
                     p.set_position(t as f32);

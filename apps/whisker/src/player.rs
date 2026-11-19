@@ -37,6 +37,8 @@ struct Playing {
 }
 
 static NOW: Mutex<Option<Playing>> = Mutex::new(None);
+/// The last start (`Playing::generation`) that showed a picture.
+static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Videos start over when they end.
 static LOOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -282,10 +284,8 @@ fn resume(ui: &Weak<AppWindow>) {
         }
         (p.path.clone(), p.at, p.info, p.muted, p.subtitles, p.large, p.generation)
     };
-    let _ = ui.upgrade_in_event_loop(|u| {
-        let p = u.global::<Player>();
-        p.set_playing(true);
-        p.set_loading(true);
+    crate::ui::video_starting(ui, move || {
+        NOW.lock().unwrap().as_ref().is_some_and(|p| p.generation == generation) && SHOWN.load(std::sync::atomic::Ordering::Relaxed) != generation
     });
     let ui = ui.clone();
     let subtitles = if subtitles { info.subtitles } else { None };
@@ -370,6 +370,9 @@ fn show_frames(ui: &Weak<AppWindow>, out: &mut impl Read, size: (u32, u32), at: 
         }
         shown += 1;
         let first = shown == 1;
+        if first {
+            SHOWN.store(generation, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = ui.upgrade_in_event_loop(move |u| {
             let p = u.global::<Player>();
             p.set_frame(Image::from_rgba8(buf));

@@ -66,8 +66,9 @@ pub struct AppSettings {
     /// Tell others when you're typing (off: it's metadata the server sees).
     #[serde(default)]
     pub send_typing: bool,
-    /// Fix common typos in the composer as you type.
-    #[serde(default = "yes")]
+    /// Fix common typos in the composer as you type. Off unless turned on
+    /// (saved under a new name: it used to be on for everyone).
+    #[serde(default, rename = "autocorrect_on")]
     pub autocorrect: bool,
     /// Red lines under misspelled words in the composer, with suggestions
     /// on right-click.

@@ -6785,6 +6785,8 @@ fn android_main(app: slint::android::AndroidApp) {
     let dir = no_backup_dir(&files);
     // Certificate authorities the user added to the phone are trusted too.
     whisker_core::tls::add_roots(droid::user_certificates());
+    // No ffmpeg on phones: their own tools make video posters and strip metadata.
+    player::media::install();
     slint::android::init(app).expect("Slint Android backend");
     if let Err(e) = run(dir) {
         eprintln!("whisker: {e:#}");

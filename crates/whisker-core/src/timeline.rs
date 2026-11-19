@@ -1290,13 +1290,18 @@ async fn upload_bytes(
     let (name, opts2) = (name.to_owned(), opts.clone());
     let prepared = tokio::task::spawn_blocking(move || {
         // A poster frame, so a video shows as a picture rather than a file.
-        let poster = path
-            .filter(|p| {
-                mime_guess::from_path(p)
-                    .first()
-                    .is_some_and(|m| m.type_() == mime_guess::mime::VIDEO)
-            })
-            .and_then(|p| video_poster(&p));
+        let is_video = |p: &Path| mime_guess::from_path(p).first().is_some_and(|m| m.type_() == mime_guess::mime::VIDEO);
+        let poster = match path {
+            Some(p) => Some(p).filter(|p| is_video(p)).and_then(|p| video_poster(&p)),
+            // Only bytes (shared from another app): a private copy to look at.
+            None if is_video(Path::new(&name)) => crate::stores::scratch().and_then(|dir| {
+                let ext = Path::new(&name).extension()?.to_str()?.to_ascii_lowercase();
+                let copy = dir.path().join(format!("video.{ext}"));
+                std::fs::write(&copy, &data).ok()?;
+                video_poster(&copy)
+            }),
+            None => None,
+        };
         crate::upload::prepare(&name, data, &opts2, poster)
     })
     .await?;
@@ -1310,7 +1315,8 @@ async fn upload_bytes(
     crate::upload::upload(room, prepared, opts.always_encrypt, progress).await
 }
 
-/// A still from a video, made by ffmpeg (when it's installed).
+/// A still from a video, made by ffmpeg (when it's installed) or the
+/// phone's own decoder.
 pub struct Poster {
     pub jpeg: Vec<u8>,
     /// The still's width and height.
@@ -1465,6 +1471,10 @@ fn parse_probe(text: &str) -> Option<VideoInfo> {
 pub fn video_poster(path: impl AsRef<std::ffi::OsStr>) -> Option<Poster> {
     use std::process::{Command, Stdio};
     let path = path.as_ref();
+    // Phones: their own decoder makes it.
+    if let Some(tools) = crate::upload::media_tools() {
+        return (tools.poster)(path);
+    }
     let VideoInfo { width: w, height: h, duration, .. } = probe_video(path)?;
     let pw = w.min(POSTER_PX) & !1;
     let ph = ((u64::from(h) * u64::from(pw) / u64::from(w)) as u32).max(2) & !1;

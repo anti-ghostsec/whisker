@@ -142,7 +142,9 @@ pub fn prepare(
             match strip_av(&data, name, mime.type_() == mime_guess::mime::VIDEO) {
                 Some(clean) => data = clean,
                 None => {
-                    unclean = Some(if crate::timeline::ffmpeg_available() {
+                    unclean = Some(if media_tools().is_some() {
+                        "this phone couldn't remove its metadata (it can for MP4, 3GP and WebM files)".to_owned()
+                    } else if crate::timeline::ffmpeg_available() {
                         "ffmpeg couldn't read it to remove its metadata".to_owned()
                     } else {
                         "removing a video's or sound's metadata needs ffmpeg, which isn't installed".to_owned()
@@ -560,11 +562,36 @@ fn strip_gif(d: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Where there's no ffmpeg (phones), the app's own ways to do what it
+/// does for files being sent: see [`set_media_tools`].
+pub struct MediaTools {
+    /// A still from early in the video at a path ([`crate::timeline::video_poster`]).
+    pub poster: fn(&std::ffi::OsStr) -> Option<crate::timeline::Poster>,
+    /// A video (or, `false`, sound) file called `name` without its metadata
+    /// ([`strip_av`]); `None` when it can't.
+    pub strip: fn(&[u8], &str, bool) -> Option<Vec<u8>>,
+}
+
+static MEDIA_TOOLS: std::sync::OnceLock<MediaTools> = std::sync::OnceLock::new();
+
+/// Set once at start-up, on phones.
+pub fn set_media_tools(tools: MediaTools) {
+    let _ = MEDIA_TOOLS.set(tools);
+}
+
+pub(crate) fn media_tools() -> Option<&'static MediaTools> {
+    MEDIA_TOOLS.get()
+}
+
 /// A video or sound file without its metadata (title, location, recording
 /// device and software, dates, chapters, cover pictures), copied by ffmpeg
-/// without re-encoding. `None` without ffmpeg, or when it can't.
+/// without re-encoding (or the phone's own tools, see [`MediaTools`]).
+/// `None` without either, or when it can't.
 fn strip_av(data: &[u8], name: &str, video: bool) -> Option<Vec<u8>> {
     use std::process::{Command, Stdio};
+    if let Some(tools) = media_tools() {
+        return (tools.strip)(data, name, video).filter(|d| !d.is_empty());
+    }
     let ext = std::path::Path::new(name)
         .extension()
         .and_then(|e| e.to_str())

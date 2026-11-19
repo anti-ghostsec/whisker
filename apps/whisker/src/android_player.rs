@@ -855,3 +855,7 @@ mod tests {
         assert_eq!(frame_size(info(1920, 1080, 90), MAX_PX), (404, 720));
     }
 }
+
+/// Posters and metadata removal for videos being sent (see that file).
+#[path = "android_media.rs"]
+pub mod media;

@@ -672,6 +672,9 @@ component MessageRow inherits Rectangle {
     callback pick-reaction();
     // Clicked the read receipts: everyone who read up to here.
     callback show-readers([Reader]);
+    // Phones: held down, for the big menu that slides up (see MessageSheet).
+    callback hold(MessageItem);
+    property <bool> held;
     // Text selected in the message, for the menu's Copy.
     property <string> selection;
     // Lit for a moment: a click on a reply to it just scrolled here.
@@ -681,8 +684,18 @@ component MessageRow inherits Rectangle {
     if root.flash: Rectangle { background: Theme.accent.transparentize(0.75); }
     // Wraps the whole row, so it keeps its hover over names, pictures,
     // links and chips too (their own touch areas sit inside it).
+    // Phones: a press held still for a moment opens the big menu. (Moving
+    // the finger scrolls instead, which lets go of the press.)
+    Timer {
+        interval: 450ms;
+        running: Prefs.touch && area.pressed && !root.held;
+        triggered => { root.held = true; root.hold(root.item); }
+    }
     area := TouchArea {
+        changed pressed => { if !self.pressed { root.held = false; } }
         cm := ContextMenuArea {
+            // Phones get the big menu instead.
+            enabled: !Prefs.touch;
             Menu {
                 if root.selection != "" || TextTools.spanning: MenuItem { title: "Copy"; activated => { TextTools.copy-selection(root.selection); } }
                 if root.selection != "" || TextTools.spanning: MenuSeparator {}
@@ -1558,6 +1571,122 @@ component PickThumb inherits Rectangle {
     }
 }
 
+// One big row in the phone menu.
+component SheetRow inherits Rectangle {
+    in property <string> text;
+    in property <bool> danger;
+    callback clicked;
+    height: 50px;
+    border-radius: 10px;
+    background: sta.pressed ? Theme.hover : transparent;
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        Text { text: root.text; font-size: 16px; color: root.danger ? Theme.danger : Theme.text; vertical-alignment: center; overflow: elide; }
+    }
+    sta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Phones: a message's menu as big rows sliding up from the bottom (the
+// right-click menu's entries, finger-sized), with quick reactions on top.
+component MessageSheet inherits Rectangle {
+    in property <MessageItem> item;
+    in property <bool> can-moderate;
+    in property <string> room-id;
+    in property <[QuickReaction]> quick-reactions;
+    callback action(string, string);
+    callback copy(string);
+    callback link(string);
+    callback pick-reaction();
+    callback close();
+    property <bool> links-open;
+    property <bool> mod-open;
+    function run(a: string) { root.action(a, root.item.id); root.close(); }
+    background: #00000099;
+    TouchArea { clicked => { root.close(); } }
+    Rectangle {
+        y: root.height - self.height;
+        height: min(body.preferred-height + Safe.bottom + 24px, root.height * 0.85);
+        background: Theme.panel;
+        border-top-left-radius: 16px;
+        border-top-right-radius: 16px;
+        TouchArea {}
+        VerticalLayout {
+            padding-top: 8px;
+            padding-bottom: Safe.bottom + 8px;
+            HorizontalLayout { alignment: center; Rectangle { width: 40px; height: 4px; border-radius: 2px; background: Theme.border; } }
+            Flickable {
+                content-width: self.width;
+                content-height: body.preferred-height;
+                body := VerticalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-top: 8px;
+                    spacing: 2px;
+                    if Prefs.menu-react && !root.item.notice: HorizontalLayout {
+                        alignment: space-around;
+                        padding-bottom: 6px;
+                        for r in root.quick-reactions: Rectangle {
+                            width: 48px;
+                            height: 48px;
+                            border-radius: 24px;
+                            background: qta.pressed ? Theme.hover : Theme.raised;
+                            if r.icon.width > 0: Image { source: r.icon; width: 28px; height: 28px; }
+                            if r.icon.width == 0: Text { text: r.emoji; font-size: 24px; }
+                            qta := TouchArea { clicked => { root.run("react:" + r.emoji); } }
+                        }
+                        Rectangle {
+                            width: 48px;
+                            height: 48px;
+                            border-radius: 24px;
+                            background: pta.pressed ? Theme.hover : Theme.raised;
+                            Text { text: "+"; font-size: 24px; color: Theme.text; }
+                            pta := TouchArea { clicked => { root.pick-reaction(); root.close(); } }
+                        }
+                    }
+                    if root.links-open: VerticalLayout {
+                        spacing: 2px;
+                        SheetRow { text: "‹ Back"; clicked => { root.links-open = false; } }
+                        for l in root.item.links: SheetRow { text: l; clicked => { root.link(l); root.close(); } }
+                    }
+                    if root.mod-open: VerticalLayout {
+                        spacing: 2px;
+                        SheetRow { text: "‹ Back"; clicked => { root.mod-open = false; } }
+                        SheetRow { text: "Kick " + root.item.name; danger: true; clicked => { root.run("kick"); } }
+                        SheetRow { text: "Ban " + root.item.name; danger: true; clicked => { root.run("ban"); } }
+                    }
+                    if !root.links-open && !root.mod-open: VerticalLayout {
+                        spacing: 2px;
+                        if Prefs.menu-reply && !root.item.notice: SheetRow { text: "Reply"; clicked => { root.run("reply"); } }
+                        if Prefs.menu-thread && !root.item.notice: SheetRow { text: "Reply in thread"; clicked => { root.run("thread"); } }
+                        if Prefs.menu-copy: SheetRow { text: "Copy text"; clicked => { root.copy(root.item.body); root.close(); } }
+                        if Prefs.menu-forward && !root.item.notice: SheetRow { text: "Forward…"; clicked => { root.run("forward"); } }
+                        if Prefs.menu-quote && !root.item.notice: SheetRow { text: "Quote"; clicked => { root.run("quote"); } }
+                        if root.item.media > 0: SheetRow { text: "Share…"; clicked => { root.run("share"); } }
+                        if root.item.media == 1: SheetRow { text: "Save image"; clicked => { root.run("save"); } }
+                        if root.item.media == 1: SheetRow { text: "Save as sticker"; clicked => { root.run("save-sticker"); } }
+                        if root.item.media == 2: SheetRow { text: "Save video"; clicked => { root.run("save"); } }
+                        if root.item.media == 3: SheetRow { text: "Save audio"; clicked => { root.run("save"); } }
+                        if root.item.media > 3: SheetRow { text: "Save file"; clicked => { root.run("save"); } }
+                        if Prefs.menu-open-media && root.item.media == 1: SheetRow { text: "Open image"; clicked => { root.run("view"); } }
+                        if Prefs.menu-open-media && (root.item.media == 2 || root.item.media == 3): SheetRow { text: "Play"; clicked => { root.run("play"); } }
+                        if root.item.links.length == 1: SheetRow { text: "Open link"; clicked => { root.link(root.item.links[0]); root.close(); } }
+                        if root.item.links.length > 1: SheetRow { text: "Open link ›"; clicked => { root.links-open = true; } }
+                        if Prefs.menu-copy-file && root.item.media > 0: SheetRow { text: "Copy file link"; clicked => { root.run("copy-file"); } }
+                        if Prefs.menu-copy-link: SheetRow { text: "Copy link to message"; clicked => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); root.close(); } }
+                        if root.item.mine && !root.item.notice: SheetRow { text: root.item.media == 0 ? "Edit" : root.item.caption ? "Edit caption" : "Add a caption"; clicked => { root.run("edit"); } }
+                        if Prefs.menu-profile: SheetRow { text: "View profile"; clicked => { root.run("profile"); } }
+                        if Prefs.menu-copy-id: SheetRow { text: "Copy user id"; clicked => { root.copy(root.item.sender); root.close(); } }
+                        if Prefs.menu-source: SheetRow { text: "Show source"; clicked => { root.run("source"); } }
+                        if !root.item.mine && root.can-moderate && !root.item.notice: SheetRow { text: "Moderate " + root.item.name + " ›"; danger: true; clicked => { root.mod-open = true; } }
+                        if (root.item.mine || root.can-moderate) && !root.item.notice: SheetRow { text: "Delete"; danger: true; clicked => { root.run("delete"); } }
+                    }
+                }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Whisker";
     // Emoji first: otherwise a text font with plain black-and-white emoji
@@ -1774,6 +1903,11 @@ export component AppWindow inherits Window {
     property <length> rail-drag-dy;
     in-out property <bool> profile-open;
     in-out property <bool> room-info-open;
+    // Phones: the big menu of the message held down (see MessageSheet).
+    property <bool> sheet-open;
+    property <MessageItem> sheet-item;
+    // Which list it's from: "m" the room, "t" a thread.
+    property <string> sheet-list;
     property <bool> panel-open: root.profile-open || root.room-info-open || root.thread-open;
     // Thread panel: the thread's messages, and sending into it.
     in-out property <bool> thread-open;
@@ -1893,6 +2027,7 @@ export component AppWindow inherits Window {
     callback to-background();
     // Closes what's on top (Back on Android); false when nothing is.
     function go-back() -> bool {
+        if root.sheet-open { root.sheet-open = false; return true; }
         if Player.large && Player.id != "" { Player.set-large(false); return true; }
         if root.viewer-open { root.viewer-open = false; return true; }
         if root.emoji-open { root.emoji-open = false; return true; }
@@ -2452,6 +2587,7 @@ export component AppWindow inherits Window {
                                     quick-reactions: root.quick-reactions;
                                     pick-reaction => { root.emoji-for = m.id; root.emoji-search(""); root.emoji-open = true; }
                                     show-readers(list) => { root.readers-list = list; root.readers-open = true; }
+                                    hold(it) => { root.sheet-item = it; root.sheet-list = "m"; root.sheet-open = true; }
                                     action(a, id) => {
                                         root.activity();
                                         // Room events (joins, kicks…) ask the app: the profile is
@@ -3003,6 +3139,7 @@ export component AppWindow inherits Window {
                                     quick-reactions: root.quick-reactions;
                                     pick-reaction => { root.emoji-for = m.id; root.emoji-search(""); root.emoji-open = true; }
                                     show-readers(list) => { root.readers-list = list; root.readers-open = true; }
+                                    hold(it) => { root.sheet-item = it; root.sheet-list = "t"; root.sheet-open = true; }
                                     action(a, id) => {
                                         root.activity();
                                         // Room events (joins, kicks…) ask the app: the profile is
@@ -3334,6 +3471,26 @@ export component AppWindow inherits Window {
                 Btn { text: "Copy"; clicked => { root.copy-text(root.topic-text); } }
                 Btn { text: "Close"; primary: true; clicked => { root.topic-open = false; } }
             }
+        }
+
+        if root.sheet-open: MessageSheet {
+            item: root.sheet-item;
+            can-moderate: root.can-moderate;
+            room-id: root.current-room;
+            quick-reactions: root.quick-reactions;
+            close => { root.sheet-open = false; }
+            pick-reaction => { root.emoji-for = root.sheet-item.id; root.emoji-search(""); root.emoji-open = true; }
+            action(a, id) => {
+                root.activity();
+                // As from the row itself (see MessageRow's action above).
+                if a == "profile" && !root.sheet-item.notice {
+                    root.show-profile(root.sheet-item.sender, root.sheet-item.name, root.sheet-item.initial, root.sheet-item.hue, root.sheet-item.avatar);
+                } else if !(a == "thread" && root.sheet-list == "t") {
+                    root.message-action(a, id);
+                }
+            }
+            copy(t) => { root.copy-text(t); }
+            link(l) => { root.open-link(l); }
         }
 
         if root.readers-open: Overlay {

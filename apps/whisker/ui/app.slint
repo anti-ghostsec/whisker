@@ -74,10 +74,7 @@ export struct Reader {
 // One line of a message: 0 text, 1 quote, 2 code, 3 heading, 4 blank.
 export struct Block {
     kind: int,
-    text: styled-text,
     plain: string,
-    // Names someone: drawn styled (the name as a link) even in plain mode.
-    mention: bool,
 }
 
 // A folder or file in Whisker's own file list (Android, see picker.rs).
@@ -333,7 +330,7 @@ component Blocks inherits VerticalLayout {
     callback selected(string);
     spacing: 2px;
     for b[i] in root.blocks: VerticalLayout {
-        if b.kind == 0 && !Prefs.rich-text && !b.mention: TextInput {
+        if b.kind == 0: TextInput {
             width: root.avail;
             text: b.plain;
             read-only: true;
@@ -348,19 +345,10 @@ component Blocks inherits VerticalLayout {
             changed cursor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
             changed anchor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
         }
-        if b.kind == 0 && (Prefs.rich-text || b.mention): StyledText {
-            width: root.avail;
-            text: b.text;
-            default-color: root.faint ? Theme.muted : Theme.text;
-            link-color: Theme.accent;
-            link-clicked(l) => { root.link(l); }
-            // Shown over it while a dragged selection covers it.
-            Rectangle { width: parent.width; height: parent.height; background: TextTools.shaded(root.key + "|" + (i + 1), TextTools.shade-version) ? TextTools.highlight : transparent; accessible-role: text; accessible-label: b.plain; accessible-description: "selbox|" + root.key + "|" + (i + 1); }
-        }
         if b.kind == 1: HorizontalLayout {
             spacing: 8px;
             Rectangle { width: 3px; border-radius: 2px; background: Theme.accent.transparentize(0.4); }
-            if !Prefs.rich-text && !b.mention: TextInput {
+            TextInput {
                 width: root.avail - 11px;
                 text: b.plain;
                 read-only: true;
@@ -373,15 +361,6 @@ component Blocks inherits VerticalLayout {
                 selection-background-color: Theme.accent.transparentize(0.55);
                 changed cursor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
                 changed anchor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
-            }
-            if Prefs.rich-text || b.mention: StyledText {
-                width: root.avail - 11px;
-                text: b.text;
-                default-color: Theme.muted;
-                link-color: Theme.accent;
-                link-clicked(l) => { root.link(l); }
-            // Shown over it while a dragged selection covers it.
-            Rectangle { width: parent.width; height: parent.height; background: TextTools.shaded(root.key + "|" + (i + 1), TextTools.shade-version) ? TextTools.highlight : transparent; accessible-role: text; accessible-label: b.plain; accessible-description: "selbox|" + root.key + "|" + (i + 1); }
             }
         }
         if b.kind == 2: Rectangle {
@@ -409,7 +388,7 @@ component Blocks inherits VerticalLayout {
                 }
             }
         }
-        if b.kind == 3 && !Prefs.rich-text && !b.mention: TextInput {
+        if b.kind == 3: TextInput {
             width: root.avail;
             text: b.plain;
             read-only: true;
@@ -425,9 +404,6 @@ component Blocks inherits VerticalLayout {
             changed cursor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
             changed anchor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
         }
-        if b.kind == 3 && (Prefs.rich-text || b.mention): StyledText { width: root.avail; text: b.text; default-color: Theme.text; default-font-size: 17px; link-color: Theme.accent; link-clicked(l) => { root.link(l); }
-            // Shown over it while a dragged selection covers it.
-            Rectangle { width: parent.width; height: parent.height; background: TextTools.shaded(root.key + "|" + (i + 1), TextTools.shade-version) ? TextTools.highlight : transparent; accessible-role: text; accessible-label: b.plain; accessible-description: "selbox|" + root.key + "|" + (i + 1); } }
         if b.kind == 4: Rectangle { height: 6px; }
     }
 }
@@ -774,7 +750,7 @@ component MessageRow inherits Rectangle {
                         // Click for the person's profile (their full address, server…).
                         Text {
                             text: root.item.body; font-size: 12px; color: notice-ta.has-hover ? Theme.text : Theme.muted; wrap: word-wrap; width: max(40px, root.width - 64px - 16px - 52px);
-                            notice-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
+                            notice-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                         // Developer mode: each value it changed.
                         if Prefs.dev-mode && root.item.details != "": Text {
@@ -783,7 +759,7 @@ component MessageRow inherits Rectangle {
                         if Prefs.dev-mode && root.item.more-details > 0: Text {
                             text: "Show " + root.item.more-details + " more " + (root.item.more-details == 1 ? "change" : "changes");
                             font-size: 11px; color: more-ta.has-hover ? Theme.text : Theme.accent;
-                            more-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("changes", root.item.id); } }
+                            more-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("changes", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                     }
                     Text { text: root.item.time; visible: area.has-hover; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
@@ -799,7 +775,7 @@ component MessageRow inherits Rectangle {
                         alignment: start;
                         if root.item.first: Avatar {
                             initial: root.item.initial; hue: root.item.hue; image: root.item.avatar; size: 36px;
-                            TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } }
+                            TouchArea { mouse-cursor: pointer; clicked => { root.action("profile", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                         // Always there (shown on hover), so hovering or touching
                         // a message doesn't change its height.
@@ -821,7 +797,7 @@ component MessageRow inherits Rectangle {
                                 color: root.item.mine ? Theme.accent : Theme.text;
                                 font-size: 14px;
                                 // Click a name to reply to this message.
-                                TouchArea { mouse-cursor: pointer; clicked => { root.action("reply", root.item.id); } }
+                                TouchArea { mouse-cursor: pointer; clicked => { root.action("reply", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                             }
                             if root.item.trust == 1: Text { text: "✓ Verified"; color: Theme.ok; font-size: 10px; font-weight: 700; vertical-alignment: center; }
                             if root.item.trust == 2: Text { text: "⚠ Identity changed"; color: Theme.danger; font-size: 10px; font-weight: 700; vertical-alignment: center; }
@@ -835,7 +811,7 @@ component MessageRow inherits Rectangle {
                                 Text { text: root.item.reply-name; font-size: 12px; font-weight: 700; color: reply-area.has-hover ? Theme.text : Theme.muted; }
                                 Text { text: root.item.reply-text; font-size: 12px; color: reply-area.has-hover ? Theme.text : Theme.muted; overflow: elide; horizontal-stretch: 1; }
                             }
-                            reply-area := TouchArea { mouse-cursor: pointer; clicked => { root.action("jump", root.item.id); } }
+                            reply-area := TouchArea { mouse-cursor: pointer; clicked => { root.action("jump", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                         // Narrow chat (side panel open): shrink, keeping the shape.
                         // Pictures, and videos that came with a preview frame.
@@ -958,6 +934,8 @@ component MessageRow inherits Rectangle {
                             Rectangle { x: 0; width: 3px; background: Theme.accent; }
                             card-ta := TouchArea {
                                 mouse-cursor: pointer;
+                                // Right-click: the message menu, as anywhere else on it.
+                                pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } }
                                 clicked => {
                                     if root.item.link-card == 1 { root.action("link-preview", root.item.id); }
                                     else if root.item.link-card == 3 { root.link(root.item.link-url); }
@@ -998,6 +976,8 @@ component MessageRow inherits Rectangle {
                                     }
                                     if root.item.link-video && Prefs.youtube-here: yt-area := TouchArea {
                                         mouse-cursor: pointer;
+                                        // Right-click: the message menu, as anywhere else on it.
+                                        pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } }
                                         clicked => { Player.toggle(root.item.id); }
                                         double-clicked => { if parent.here { Player.set-large(true); } }
                                         if parent.here && !Player.loading && !Player.large && (yt-area.has-hover || !Player.playing || Player.bar-hold): VideoBar {
@@ -1018,7 +998,7 @@ component MessageRow inherits Rectangle {
                                 text: "⚠";
                                 font-size: 10px;
                                 color: root.item.shield == 2 ? Theme.danger : Theme.muted;
-                                shield-ta := TouchArea { mouse-cursor: pointer; }
+                                shield-ta := TouchArea { mouse-cursor: pointer; pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                             }
                             if shield-ta.has-hover: Rectangle {
                                 x: 16px;
@@ -1054,7 +1034,7 @@ component MessageRow inherits Rectangle {
                                 }
                                 Text { text: root.item.thread-last; font-size: 12px; color: Theme.muted; overflow: elide; vertical-alignment: center; }
                             }
-                            th-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("thread", root.item.id); } }
+                            th-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("thread", root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                         }
                         if root.item.reactions.length > 0: HorizontalLayout {
                             alignment: start;
@@ -1074,7 +1054,7 @@ component MessageRow inherits Rectangle {
                                     if r.picture.width == 0: Text { text: r.key; font-size: 13px; vertical-alignment: center; }
                                     Text { text: r.count; font-size: 11px; font-weight: 700; color: r.mine ? Theme.accent : Theme.muted; vertical-alignment: center; }
                                 }
-                                chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("react:" + r.key, root.item.id); } }
+                                chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.action("react:" + r.key, root.item.id); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                                 // On hover: the emoji large (small ones are hard to make
                                 // out), what it is, and who reacted.
                                 if chip-ta.has-hover: Rectangle {
@@ -1105,7 +1085,7 @@ component MessageRow inherits Rectangle {
                                 border-radius: 12px;
                                 background: add-ta.has-hover ? Theme.hover : transparent;
                                 Text { text: "+"; font-size: 14px; color: Theme.muted; }
-                                add-ta := TouchArea { mouse-cursor: pointer; clicked => { root.pick-reaction(); } }
+                                add-ta := TouchArea { mouse-cursor: pointer; clicked => { root.pick-reaction(); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                             }
                         }
                     }
@@ -1123,7 +1103,7 @@ component MessageRow inherits Rectangle {
                             for r in root.item.readers: Avatar { initial: r.initial; hue: r.hue; image: r.avatar; size: 16px; }
                             if root.item.more-readers > 0: Text { text: "+" + root.item.more-readers; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
                         }
-                        TouchArea { mouse-cursor: pointer; clicked => { root.show-readers(root.item.all-readers); } }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.show-readers(root.item.all-readers); } pointer-event(e) => { if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }
                     }
                 }
             }
@@ -1953,7 +1933,6 @@ export component AppWindow inherits Window {
         root.profile-open = true;
         root.profile-requested(user);
     }
-    callback set-rich-text(bool);
     callback set-show-events(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
@@ -3215,7 +3194,6 @@ export component AppWindow inherits Window {
             navigate(id) => { root.activity(); root.open-settings(id); }
             set-theme(t) => { root.set-theme(t); }
             set-auto-lock(i) => { root.set-auto-lock(i); }
-            set-rich-text(b) => { root.set-rich-text(b); }
             set-show-events(b) => { root.set-show-events(b); }
             set-dev-mode(b) => { root.set-dev-mode(b); }
             set-notify-level(i) => { root.set-notify-level(i); }

@@ -4,7 +4,7 @@
 //! row, remove one row) instead of being rebuilt on every event, which keeps
 //! scrolling smooth and stops the scroll position jumping.
 
-use crate::format::{self, Kind};
+use crate::format;
 use crate::{AccountItem, AppWindow, Block, ForwardItem, MessageItem, ReactionChip, Reader, RoomItem};
 use matrix_sdk::ruma::OwnedMxcUri;
 use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
@@ -218,34 +218,10 @@ pub fn emoji_image(emoji: &str) -> Image {
     })
 }
 
-thread_local! {
-    /// Rich text (styled, not selectable) instead of selectable plain text.
-    pub static RICH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// `pills` are mentions (name, user id): lines naming them are drawn styled
-/// (even when rich text is off) with the name as a link, like Element's pills.
-pub fn blocks(body: &str, pills: &[(String, String)]) -> ModelRc<Block> {
-    let lines = if RICH.get() { format::split(body) } else { format::merged(body) };
-    let rich = RICH.get();
-    let v: Vec<Block> = lines
-        .into_iter()
-        .map(|l| {
-            let text_like = matches!(l.kind, Kind::Text | Kind::Quote | Kind::Heading);
-            let mention = text_like && pills.iter().any(|(n, _)| l.source.contains(n.as_str()));
-            Block {
-                kind: l.kind as i32,
-                mention,
-                text: match l.kind {
-                    Kind::Code | Kind::Blank => Default::default(),
-                    _ if mention => format::styled(&format::link_mentions(&l.source, pills)),
-                    _ if !rich => Default::default(),
-                    _ => format::styled(&l.source),
-                },
-                plain: s(&l.source),
-            }
-        })
-        .collect();
+/// A message body as plain, selectable blocks (paragraphs, quotes, code,
+/// headings). Mentions show as the name, like the rest of the text.
+pub fn blocks(body: &str) -> ModelRc<Block> {
+    let v: Vec<Block> = format::merged(body).into_iter().map(|l| Block { kind: l.kind as i32, plain: s(&l.source) }).collect();
     ModelRc::new(VecModel::from(v))
 }
 
@@ -348,7 +324,7 @@ impl Models {
         let loaded = |m: &Option<OwnedMxcUri>| m.as_ref().is_some_and(|m| matches!(pixels.lock().unwrap().get(m), Some(Some(_))));
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", r.item).hash(&mut h);
-        (r.mine, r.first, r.picture_failed, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust, RICH.get()).hash(&mut h);
+        (r.mine, r.first, r.picture_failed, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust).hash(&mut h);
         r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
         r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
         loaded(&r.item.sender_avatar).hash(&mut h);
@@ -403,7 +379,7 @@ impl Models {
             sender: s(r.item.sender.as_str()),
             name: s(&name),
             body: s(&r.item.body),
-            blocks: blocks(&r.item.body, &r.item.pills),
+            blocks: blocks(&r.item.body),
             links: ModelRc::new(VecModel::from(format::links(&r.item.body).iter().map(s).collect::<Vec<_>>())),
             readers: ModelRc::new(VecModel::from(readers.iter().take(5).cloned().collect::<Vec<_>>())),
             all_readers: ModelRc::new(VecModel::from(readers)),

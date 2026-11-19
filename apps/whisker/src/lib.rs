@@ -1592,7 +1592,7 @@ impl Ctl {
         match got {
             Some((name, text)) => self.ui(move |u| {
                 u.set_topic_title(s(format!("Message from {name}")));
-                u.set_topic_blocks(ui::blocks(&text, &[]));
+                u.set_topic_blocks(ui::blocks(&text));
                 u.set_topic_text(s(text));
                 u.set_topic_open(true);
             }),
@@ -3069,7 +3069,7 @@ impl Ctl {
         self.ui(move |u| {
             let text = if text.trim().is_empty() { "This room has no description.".to_owned() } else { text };
             u.set_topic_title(s(name));
-            u.set_topic_blocks(ui::blocks(&text, &[]));
+            u.set_topic_blocks(ui::blocks(&text));
             u.set_topic_text(s(text));
             u.set_topic_open(true);
         });
@@ -5130,19 +5130,6 @@ impl Ctl {
         self.spawn(async move { c.show_messages().await });
     }
 
-    fn set_rich_text(&self, on: bool) {
-        let mut st = self.settings.lock().unwrap();
-        st.rich_text = on;
-        let _ = st.save(self.mgr.data_dir());
-        drop(st);
-        ui::RICH.set(on);
-        if let Some(u) = self.ui.upgrade() {
-            u.global::<Prefs>().set_rich_text(on);
-        }
-        let c = self.clone();
-        self.spawn(async move { c.show_messages().await });
-    }
-
     fn remove_message(&self, key: &RoomKey, id: &OwnedEventId) {
         if let Some(list) = self.st.lock().unwrap().messages.get_mut(key) {
             list.retain(|m| &m.event_id != id);
@@ -6305,7 +6292,6 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.set_theme(prefs.theme.index());
     ui.set_auto_lock(prefs.auto_lock_index());
     ui.set_encryption_summary(ENCRYPTION_SUMMARY.into());
-    ui.global::<Prefs>().set_rich_text(prefs.rich_text);
     #[cfg(target_os = "android")]
     ui.global::<Prefs>().set_touch(true);
     #[cfg(target_os = "android")]
@@ -6358,7 +6344,6 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     apply_menu(&ui, &prefs.menu_hidden);
     let servers: Vec<SharedString> = SUGGESTED_SERVERS.iter().map(s).chain([s("Other server…")]).collect();
     ui.set_login_servers(slint::ModelRc::new(slint::VecModel::from(servers)));
-    ui::RICH.set(prefs.rich_text);
 
     let ctl = Ctl {
         rt: rt.handle().clone(),
@@ -6600,10 +6585,6 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_set_auto_lock(move |i| c.set_auto_lock(i));
-    }
-    {
-        let c = ctl.clone();
-        ui.on_set_rich_text(move |b| c.set_rich_text(b));
     }
     {
         let c = ctl.clone();

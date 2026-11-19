@@ -186,8 +186,8 @@ operating system and the **Wisp** browser.
   (the default), or the message too.
 - **Typing:** "Bob is typing…" shows above the composer. Whisker only tells others that
   *you're* typing if you turn that on.
-- **Drag to select** any part of a message and copy it with Ctrl+C (turn on *Rich message
-  text* in Settings for bold/italic/clickable links instead; rich text can't be selected).
+- **Drag to select** any part of a message and copy it with Ctrl+C. Links open from the
+  message's right-click menu (*Open link*).
   Click a **name** to reply to that message; click an **avatar** to open the person's
   profile (direct chat, mention, copy id, kick/ban if you're a moderator, ignore).
 - **Drag an account** up or down the rail to reorder; the others slide aside like tabs (or

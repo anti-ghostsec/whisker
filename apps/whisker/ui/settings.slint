@@ -237,7 +237,6 @@ component MenuToggle inherits HorizontalLayout {
 
 component GeneralPage inherits VerticalLayout {
     in-out property <int> theme;
-    callback set-rich-text(bool);
     callback set-show-events(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
@@ -278,22 +277,6 @@ component GeneralPage inherits VerticalLayout {
                 model: ["Dark", "Light", "Follow system"];
                 current-index <=> root.theme;
                 selected => { root.set-theme(self.current-index); }
-            }
-        }
-        HorizontalLayout {
-            spacing: 8px;
-            VerticalLayout {
-                horizontal-stretch: 1;
-                alignment: center;
-                Text { text: "Rich message text"; color: Theme.text; }
-                Text {
-                    text: "Shows bold, italic and clickable links. Rich text can't be selected with the mouse; leave this off to drag-select and copy parts of messages.";
-                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
-                }
-            }
-            Switch {
-                checked: Prefs.rich-text;
-                toggled => { root.set-rich-text(self.checked); }
             }
         }
         HorizontalLayout {
@@ -1354,7 +1337,6 @@ export component SettingsPage inherits Rectangle {
     callback navigate(string);
     callback set-theme(int);
     callback set-auto-lock(int);
-    callback set-rich-text(bool);
     callback set-show-events(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
@@ -1460,7 +1442,6 @@ export component SettingsPage inherits Rectangle {
                             encryption-summary: root.encryption-summary;
                             set-theme(t) => { root.set-theme(t); }
                             set-auto-lock(i) => { root.set-auto-lock(i); }
-                            set-rich-text(b) => { root.set-rich-text(b); }
                             set-show-events(b) => { root.set-show-events(b); }
                             set-dev-mode(b) => { root.set-dev-mode(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }

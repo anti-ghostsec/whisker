@@ -5,6 +5,7 @@
 //! (nothing re-encoded). Set up in [`install`].
 
 use super::*;
+use std::path::Path;
 use std::io::Read;
 
 /// Widest and tallest still made.

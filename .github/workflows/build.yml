@@ -206,7 +206,9 @@ jobs:
             --out "$RUNNER_TEMP/whisker-signed.apk" "$apk"
           mv "$RUNNER_TEMP/whisker-signed.apk" "$apk"
           # Signed with Whisker's key, not some other one.
-          got=$("${tools}apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          certs=$("${tools}apksigner" verify --print-certs "$apk")
+          printf '%s\n' "$certs"
+          got=$(printf '%s\n' "$certs" | sed -n 's/^Signer[^:]*certificate SHA-256 digest: //p' | head -1)
           echo "Signing certificate SHA-256: $got"
           [ "$got" = "$(tr -d '[:space:]' < apps/whisker/android-release-cert.sha256)" ] || { echo "::error::Signed with $got, not Whisker's release key" >&2; exit 1; }
 
@@ -234,7 +236,9 @@ jobs:
         run: |
           set -eu
           tools="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)"
-          got=$("${tools}apksigner" verify --print-certs dist/whisker.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          certs=$("${tools}apksigner" verify --print-certs dist/whisker.apk)
+          printf '%s\n' "$certs"
+          got=$(printf '%s\n' "$certs" | sed -n 's/^Signer[^:]*certificate SHA-256 digest: //p' | head -1)
           [ "$got" = "$(tr -d '[:space:]' < apps/whisker/android-release-cert.sha256)" ] || { echo "::error::The APK is signed with $got, not Whisker's release key" >&2; exit 1; }
 
       - name: Attach artifacts

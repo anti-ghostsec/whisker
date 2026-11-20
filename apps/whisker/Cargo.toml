@@ -25,22 +25,22 @@ directories.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-slint = "1.18.1"
+slint = "1.19.0"
 
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = "0.17.2"
 # Drag selection across messages (select.rs) reads the window's mouse and
 # Slint's item tree, which only these expose. Pinned: unstable APIs.
-slint = { version = "1.18.1", features = ["unstable-winit-030"] }
-i-slint-core = "=1.18.1"
+slint = { version = "1.19.0", features = ["unstable-winit-030"] }
+i-slint-core = "=1.19.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Already in the tree (accessibility, file dialogs); used for notifications.
 zbus = "5"
 
 [target.'cfg(target_os = "android")'.dependencies]
-slint = { version = "1.18.1", features = ["backend-android-activity-06"] }
+slint = { version = "1.19.0", features = ["backend-android-activity-06"] }
 # Reading share intents (already in the tree through Slint's Android backend).
 jni = "0.21"
 # Playing videos and sound with the phone's own decoders (android_player.rs);
@@ -49,6 +49,6 @@ ndk = { version = "0.9", features = ["media", "audio", "api-level-26"] }
 ndk-sys = { version = "0.6", features = ["media"] }
 
 [build-dependencies]
-slint-build = "1.18.1"
+slint-build = "1.19.0"
 
 # Android permissions, name and Share menu entry are in manifest.yaml.

@@ -14,9 +14,7 @@ fn main() -> anyhow::Result<()> {
     }
     let dir = match std::env::var_os("WHISKER_DATA_DIR") {
         Some(d) => d.into(),
-        None => directories::ProjectDirs::from("io.github", "anti-ghostsec", "Whisker")
-            .map(|d| d.data_dir().to_owned())
-            .ok_or_else(|| anyhow::anyhow!("no home directory; set WHISKER_DATA_DIR"))?,
+        None => whisker_core::stores::default_data_dir().ok_or_else(|| anyhow::anyhow!("no home directory; set WHISKER_DATA_DIR"))?,
     };
     // Files (or links) shared from another app. If Whisker is already open,
     // they go to it and this copy stops here.

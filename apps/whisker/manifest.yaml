@@ -31,6 +31,9 @@ android:
       # the older way (later versions show them again). Not in xbuild
       # itself: the build adds it (see .github/workflows).
       request_legacy_external_storage: true
+      # No copy of Whisker's data in Google's cloud backup or adb backups
+      # (also added by the build, see .github/workflows).
+      allow_backup: false
       activities:
         # Whisker shows up in other apps' Share menus, for any files or text.
         - intent_filters:

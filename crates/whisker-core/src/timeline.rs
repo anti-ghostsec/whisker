@@ -1541,7 +1541,8 @@ pub fn video_poster(path: impl AsRef<std::ffi::OsStr>) -> Option<Poster> {
             .args(ffmpeg_guard(path))
             .args(["-ss", seek, "-i"])
             .arg(path)
-            .args(["-frames:v", "1", "-vf", &format!("scale={pw}:{ph}"), "-f", "image2", "-c:v", "mjpeg", "-q:v", "4", "pipe:1"])
+            // No encoder name or other tags in the picture that gets sent.
+            .args(["-frames:v", "1", "-vf", &format!("scale={pw}:{ph}"), "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact", "-f", "image2", "-c:v", "mjpeg", "-q:v", "4", "pipe:1"])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()

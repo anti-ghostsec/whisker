@@ -27,7 +27,10 @@ operating system and the **Wisp** browser.
   with its own passphrase. **Lock** closes all vaults. See [Hidden vaults on disk](#hidden-vaults-on-disk)
   for what someone with your files can and can't tell.
 - **A proxy per account.** You can give each account its own proxy (for example a Tor SOCKS
-  port), so a server can't link your alts by IP address.
+  port), so a server can't link your alts by IP address. Everything that account does goes
+  through it: its server, link previews, YouTube through your Invidious server (on any port),
+  and its AI service, the setup's Test button included. A `socks5://` proxy is used as
+  `socks5h://`, so host names are looked up by the proxy, not by your network.
 - **AI accounts.** Each AI signs in as its own Matrix account, separate from yours, with its
   own settings page. Paste the address of any AI API (OpenRouter, Groq, Mistral, DeepSeek,
   Gemini, OpenAI, Venice, LM Studio, llama.cpp, vLLM, Ollama, or any Anthropic-style API).
@@ -255,7 +258,7 @@ operating system and the **Wisp** browser.
   also offers Reply in thread, Quote, Play / Open image, Copy link to message, View profile,
   Copy user id and Show source, which start off.
 - **Settings page** (⚙): dark (the default), light or follow-system theme; auto-lock after
-  5/15/60 minutes idle; change a vault's passphrase; nickname, tags and proxy per account;
+  5/15/60 minutes idle (15 on a new install); change a vault's passphrase; nickname, tags and proxy per account;
   a full AI agent setup form (model, API key, effort, permissions, commanders, audit room).
 - **AI accounts.** An AI chats as its own Matrix account. Add one from Settings → General
   → *Add an AI account*, or turn an account you have into one from its settings page. Its

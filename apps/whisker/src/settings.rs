@@ -39,7 +39,9 @@ pub const AUTO_LOCK_MINUTES: [u64; 4] = [0, 5, 15, 60];
 pub struct AppSettings {
     #[serde(default)]
     pub theme: Theme,
-    #[serde(default)]
+    /// New installs lock after 15 idle minutes (settings saved before
+    /// keep their choice).
+    #[serde(default = "default_auto_lock")]
     pub auto_lock_minutes: u64,
     /// Show joins, leaves, renames and other room events in the timeline.
     #[serde(default)]
@@ -139,6 +141,10 @@ fn two() -> i32 {
     2
 }
 
+fn default_auto_lock() -> u64 {
+    15
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         serde_json::from_str("{}").expect("defaults")
@@ -159,7 +165,11 @@ impl AppSettings {
 
     pub fn save(&self, data_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(data_dir)?;
-        std::fs::write(Self::path(data_dir), serde_json::to_vec_pretty(self)?)
+        let path = Self::path(data_dir);
+        std::fs::write(&path, serde_json::to_vec_pretty(self)?)?;
+        // It names choices (auto-lock, proxies on or off) others needn't see.
+        whisker_core::vault::owner_only(&path, false);
+        Ok(())
     }
 
     pub fn auto_lock_index(&self) -> i32 {
@@ -186,7 +196,7 @@ and avatars.
 • Files come through your own server. Only if you turn on “Ask a file's own server” does Whisker \
 contact other servers directly, and then they see your IP address unless you use a proxy.
 • Whisker doesn't send public read receipts (unless you turn them on for someone, on their profile, and then only in chats with nobody else), and sends typing notifications only if you turn them on.
-• Devices aren't verified yet, so other people see your Whisker login as an unverified device.
+• Verify your Whisker login from another session (or with emoji) so other people see it as verified; until then it shows as unverified.
 
 AI accounts
 • An AI account reads messages like any member, including in encrypted rooms it's been invited to, \

@@ -218,18 +218,19 @@ pub struct AgentRunner {
 
 impl AgentRunner {
     pub fn new(cfg: AgentConfig, mgr: AccountManager) -> Result<Self> {
-        let llm = Llm::new(cfg.api.clone(), cfg.max_tokens, cfg.extra_params.clone())?.with_venice(cfg.venice());
+        // The account's proxy is set in `run`, before anything is sent.
+        let llm = Llm::new(cfg.api.clone(), cfg.max_tokens, cfg.extra_params.clone(), None)?.with_venice(cfg.venice());
         let mut sum_api = cfg.api.clone();
         if !cfg.summary_model.trim().is_empty() {
             sum_api.model = cfg.summary_model.trim().to_owned();
         }
-        let summarizer = Llm::new(sum_api, 600, Default::default())?.with_venice(cfg.venice());
+        let summarizer = Llm::new(sum_api, 600, Default::default(), None)?.with_venice(cfg.venice());
         let vision = match cfg.image_model.trim() {
             "" => None,
             model => {
                 let mut api = cfg.api.clone();
                 api.model = model.to_owned();
-                Some(Llm::new(api, 500, Default::default())?.with_venice(cfg.venice()))
+                Some(Llm::new(api, 500, Default::default(), None)?.with_venice(cfg.venice()))
             }
         };
         Ok(Self {
@@ -556,7 +557,9 @@ impl AgentRunner {
     }
 
     async fn is_own_agent(&self, user: &UserId) -> bool {
-        self.mgr.accounts().await.iter().any(|a| a.kind == AccountKind::Agent && a.user_id == user.as_str())
+        // Only this vault's: treating a hidden vault's AI accounts as its
+        // own would show, by its silence, which accounts are linked.
+        self.mgr.accounts().await.iter().any(|a| a.kind == AccountKind::Agent && a.user_id == user.as_str() && Some(&a.vault) == self.vault.as_ref())
     }
 
     /// Folds what scrolled out of `history` into the room's summary (or
@@ -607,6 +610,7 @@ impl AgentRunner {
             commanders: self.cfg.permissions.commanders.users.clone(),
             mgr: self.mgr.clone(),
             greeting: self.cfg.card.clone().filter(|c| self.cfg.greet && !c.first_mes.trim().is_empty()),
+            vault: self.vault.clone(),
         };
         for room in client.invited_rooms() {
             let (invites, client) = (invites.clone(), client.clone());
@@ -1045,6 +1049,7 @@ struct Invites {
     commanders: BTreeSet<OwnedUserId>,
     mgr: AccountManager,
     greeting: Option<crate::card::Card>,
+    vault: Option<VaultId>,
 }
 
 impl Invites {
@@ -1080,7 +1085,9 @@ impl Invites {
         if self.commanders.contains(inviter) {
             return true;
         }
-        if self.mgr.accounts().await.iter().any(|a| a.kind == AccountKind::Human && a.user_id == inviter.as_str()) {
+        // Your accounts in this vault only: joining for an account kept in
+        // another (hidden) vault would link the two.
+        if self.mgr.accounts().await.iter().any(|a| a.kind == AccountKind::Human && a.user_id == inviter.as_str() && Some(&a.vault) == self.vault.as_ref()) {
             return true;
         }
         if !room.is_direct().await.unwrap_or(false) {

@@ -29,11 +29,14 @@ pub struct Ask<'a> {
     /// may be on their own network or another port. Implies `same_host`;
     /// one on their own network is reached directly, not through the proxy.
     pub chosen: bool,
+    /// Where a redirect may go, beyond the usual checks (the AI's list of
+    /// allowed sites, say). `None`: anywhere public.
+    pub redirect_ok: Option<&'a (dyn Fn(&Url) -> bool + Send + Sync)>,
 }
 
 impl<'a> Ask<'a> {
     pub fn new(accept: &'a str, max_bytes: usize, user_agent: &'a str, timeout: Duration) -> Self {
-        Self { accept, headers: &[], max_bytes, user_agent, timeout, same_host: false, progress: None, chosen: false }
+        Self { accept, headers: &[], max_bytes, user_agent, timeout, same_host: false, progress: None, chosen: false, redirect_ok: None }
     }
 }
 
@@ -49,7 +52,10 @@ pub struct Got {
 /// GETs `url`, following safe redirects.
 pub async fn get(mut url: Url, proxy: Option<&str>, ask: &Ask<'_>) -> Result<Got> {
     let first_host = url.host_str().unwrap_or_default().to_owned();
-    let chosen_local = ask.chosen && check_url(&url, true).is_err();
+    // Only a server on this computer or network skips the proxy (it can't
+    // be reached through one). Judged by its host alone: an unusual port
+    // (Invidious's 3000, say) is still a server out on the internet.
+    let chosen_local = ask.chosen && is_local_host(&url);
     let proxy = if chosen_local { None } else { proxy };
     for _ in 0..=MAX_REDIRECTS {
         if ask.chosen {
@@ -100,7 +106,13 @@ pub async fn get(mut url: Url, proxy: Option<&str>, ask: &Ask<'_>) -> Result<Got
         let status = resp.status();
         if status.is_redirection() {
             let to = resp.headers().get(reqwest::header::LOCATION).and_then(|l| l.to_str().ok()).ok_or_else(|| anyhow!("redirect without a location"))?;
-            url = url.join(to)?;
+            let next = url.join(to)?;
+            if let Some(ok) = ask.redirect_ok
+                && !ok(&next)
+            {
+                bail!("{} sent the request on to {next}, which isn't allowed", url.host_str().unwrap_or("the site"));
+            }
+            url = next;
             continue;
         }
         if !status.is_success() {
@@ -144,19 +156,31 @@ pub fn check_url(url: &Url, proxied: bool) -> Result<()> {
     }
     match url.host() {
         None => bail!("no host"),
-        Some(url::Host::Ipv4(ip)) if !is_public(IpAddr::V4(ip)) => bail!("refusing a private or local address"),
-        Some(url::Host::Ipv6(ip)) if !is_public(IpAddr::V6(ip)) => bail!("refusing a private or local address"),
+        Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) if is_local_host(url) => bail!("refusing a private or local address"),
         Some(url::Host::Domain(d)) => {
             let d = d.trim_end_matches('.').to_ascii_lowercase();
-            let local = d == "localhost" || !d.contains('.') || [".localhost", ".local", ".internal", ".lan", ".home", ".home.arpa", ".corp", ".intranet"].iter().any(|s| d.ends_with(s));
             // Onion sites only make sense (and are only reachable) through a Tor proxy.
-            if local || (d.ends_with(".onion") && !proxied) {
+            if is_local_host(url) || (d.ends_with(".onion") && !proxied) {
                 bail!("refusing local or unreachable host {d}");
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Whether `url`'s host is on this computer or the local network: a
+/// private or loopback address, or a name like `localhost` or `nas.lan`.
+pub fn is_local_host(url: &Url) -> bool {
+    match url.host() {
+        None => false,
+        Some(url::Host::Ipv4(ip)) => !is_public(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => !is_public(IpAddr::V6(ip)),
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || !d.contains('.') || [".localhost", ".local", ".internal", ".lan", ".home", ".home.arpa", ".corp", ".intranet"].iter().any(|s| d.ends_with(s))
+        }
+    }
 }
 
 /// Whether `ip` is on the public internet.
@@ -203,3 +227,21 @@ fn public_v4(ip: Ipv4Addr) -> bool {
         || o[0] >= 240)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_local_hosts_skip_the_proxy() {
+        let local = |u: &str| is_local_host(&Url::parse(u).unwrap());
+        // An unusual port doesn't make a server local.
+        assert!(!local("https://invidious.example.org:3000"));
+        assert!(!local("http://9.9.9.9:3000"));
+        assert!(!local("http://abc.onion:3000"));
+        assert!(local("http://localhost:3000"));
+        assert!(local("http://192.168.1.5:3000"));
+        assert!(local("http://nas.lan"));
+        assert!(local("http://[::1]:8080"));
+    }
+}

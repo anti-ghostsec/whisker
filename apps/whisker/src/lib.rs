@@ -1074,12 +1074,14 @@ impl Ctl {
         if pass.len() < 8 {
             return self.settings_msg("Use at least 8 characters.");
         }
-        // A passphrase that already opens a vault would make the two indistinguishable.
-        if let Ok(v) = self.mgr.unlock(&pass).await
-            && !v.is_empty()
-        {
-            self.after_unlock(v).await;
-            return self.settings_msg("That passphrase already opens a vault (now unlocked). Pick another.");
+        // One passphrase opening two vaults (the main one included, which
+        // is open now) would open both: handing it over would give the
+        // hidden one away.
+        self.settings_msg("Checking the passphrase isn't used already…");
+        match self.mgr.passphrase_in_use(&pass, None).await {
+            Ok(false) => {}
+            Ok(true) => return self.settings_msg("That passphrase already opens one of your vaults. A hidden vault needs a passphrase of its own."),
+            Err(e) => return self.settings_msg(format!("{e:#}")),
         }
         match self.mgr.create_vault(&pass).await {
             Ok(v) => {
@@ -1098,7 +1100,7 @@ impl Ctl {
         }
         self.mgr.lock_all().await;
         spell::clear_custom();
-        let _ = std::fs::remove_dir_all(media_dir(self.mgr.data_dir()));
+        whisker_core::stores::shred_dir(&media_dir(self.mgr.data_dir()));
         *self.st.lock().unwrap() = State::default();
         self.avatars.lock().unwrap().clear();
         self.ui(|u| {
@@ -6170,7 +6172,10 @@ impl Ctl {
         self.ui(|u| u.set_test_status(s("Asking the model…")));
         let msg = match self.agent_config(&f).await {
             Err(e) => format!("✗ {e:#}"),
-            Ok((_, _, cfg)) => match Llm::new(cfg.api.clone(), cfg.max_tokens.min(300), cfg.extra_params.clone()).map(|l| l.with_venice(cfg.venice())) {
+            // Through the AI account's proxy, like its replies.
+            Ok((_, _, cfg)) => match Llm::new(cfg.api.clone(), cfg.max_tokens.min(300), cfg.extra_params.clone(), self.mgr.details(cfg.account).await.and_then(|d| d.1).as_deref())
+                .map(|l| l.with_venice(cfg.venice()))
+            {
                 Err(e) => format!("✗ {e:#}"),
                 Ok(llm) => match tokio::time::timeout(Duration::from_secs(60), llm.test()).await {
                     Ok(Ok(reply)) => format!("✓ It works. The model said: “{}”", short_reply(&reply)),
@@ -6629,8 +6634,18 @@ fn split_login(hs: &str, user: &str) -> (String, String) {
 }
 
 pub fn run(data_dir: PathBuf) -> Result<()> {
+    // Before any secret is in memory: no core dumps.
+    whisker_core::harden_process();
     let rt = tokio::runtime::Runtime::new()?;
     let ui = AppWindow::new()?;
+    // On Linux the running stores (decrypted) belong in RAM. Without a RAM
+    // folder they'd silently be on the disk: say so.
+    #[cfg(all(unix, not(target_os = "android")))]
+    if whisker_core::stores::runtime_root(&data_dir) == data_dir.join("run") {
+        ui.set_status(s(
+            "No RAM folder ($XDG_RUNTIME_DIR or /dev/shm) is usable, so while unlocked your decrypted messages and keys are kept on the disk. They're overwritten when you lock.",
+        ));
+    }
     #[cfg(not(target_os = "android"))]
     select::install(&ui);
     #[cfg(target_os = "android")]
@@ -7059,7 +7074,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     // even when it ends with an error (the display went away at logout).
     let ran = ui.run();
     rt.block_on(ctl.mgr.lock_all());
-    let _ = std::fs::remove_dir_all(media_dir(ctl.mgr.data_dir()));
+    whisker_core::stores::shred_dir(&media_dir(ctl.mgr.data_dir()));
     share::stop_listening(ctl.mgr.data_dir());
     Ok(ran?)
 }

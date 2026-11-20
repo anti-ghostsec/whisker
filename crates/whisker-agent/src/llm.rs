@@ -56,15 +56,22 @@ pub struct Llm {
 }
 
 impl Llm {
-    pub fn new(api: ApiConfig, max_tokens: u32, extra: Map<String, Value>) -> Result<Self> {
-        let http = whisker_core::tls::http_builder().timeout(Duration::from_secs(300)).build()?;
-        Ok(Self { api, max_tokens, extra, http, proxy: None, resolved: OnceCell::new(), venice: Venice::default() })
+    /// `proxy` is the AI account's: every request to the AI service goes
+    /// through it, so the service never sees the real address (the API key
+    /// travels with each request). It's asked for here so no caller can
+    /// forget it.
+    pub fn new(api: ApiConfig, max_tokens: u32, extra: Map<String, Value>, proxy: Option<&str>) -> Result<Self> {
+        let http = whisker_core::tls::http_builder().timeout(Duration::from_secs(300)).redirect(reqwest::redirect::Policy::none()).build()?;
+        let mut llm = Self { api, max_tokens, extra, http, proxy: None, resolved: OnceCell::new(), venice: Venice::default() };
+        llm.set_proxy(proxy.map(str::to_owned))?;
+        Ok(llm)
     }
 
     /// Sends every request through `proxy` (the AI account's), so the AI
     /// service never sees the real address of an account kept behind Tor.
     pub fn set_proxy(&mut self, proxy: Option<String>) -> Result<()> {
-        let mut b = whisker_core::tls::http_builder().timeout(Duration::from_secs(300));
+        // No redirects: the API key header would be sent on to wherever it points.
+        let mut b = whisker_core::tls::http_builder().timeout(Duration::from_secs(300)).redirect(reqwest::redirect::Policy::none());
         if let Some(p) = &proxy {
             b = b.proxy(reqwest::Proxy::all(p).map_err(|e| anyhow::anyhow!("bad proxy: {e}"))?);
         }

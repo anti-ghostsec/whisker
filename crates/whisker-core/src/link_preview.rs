@@ -20,7 +20,9 @@ use std::time::Duration;
 
 const PAGE_BYTES: usize = 768 * 1024;
 const IMAGE_BYTES: usize = 6 * 1024 * 1024;
-const USER_AGENT: &str = "Mozilla/5.0 (compatible; Whisker link preview)";
+/// The commonest browser's, as Tor Browser sends: naming Whisker would tell
+/// every site (and anyone watching) which app fetched the preview.
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0";
 const TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

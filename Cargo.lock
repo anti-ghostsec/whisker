@@ -8504,6 +8504,7 @@ dependencies = [
  "argon2",
  "chacha20poly1305",
  "ctr",
+ "directories",
  "eyeball",
  "flate2",
  "futures-util",

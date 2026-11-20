@@ -445,12 +445,15 @@ fn png_chunks(d: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
     }
 }
 
-/// Drops text (often the program, author or a description), EXIF and
-/// the time it was saved; stops at the end.
+/// Keeps only the chunks that make up the picture (and its animation);
+/// drops everything else: text (often the program, author or a
+/// description), EXIF, the time it was saved, colour profiles (their names
+/// can say which device made them), content credentials (C2PA `caBX`,
+/// with editing history and signer) and any chunk Whisker doesn't know.
 fn strip_png(d: &[u8]) -> Option<Vec<u8>> {
     let mut out = PNG_SIG.to_vec();
     for (id, whole) in png_chunks(d)? {
-        if !matches!(&id, b"tEXt" | b"zTXt" | b"iTXt" | b"eXIf" | b"tIME") {
+        if matches!(&id, b"IHDR" | b"PLTE" | b"IDAT" | b"IEND" | b"tRNS" | b"gAMA" | b"cHRM" | b"sRGB" | b"sBIT" | b"bKGD" | b"acTL" | b"fcTL" | b"fdAT") {
             out.extend_from_slice(whole);
         }
     }

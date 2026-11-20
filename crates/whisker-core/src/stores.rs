@@ -159,9 +159,10 @@ pub fn snapshot(store: &Path) -> Result<Vec<u8>> {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute("VACUUM INTO ?1", [copy.to_string_lossy()]).with_context(|| format!("copying {name}"))?;
         drop(conn);
-        let bytes = std::fs::read(&copy)?;
-        std::fs::remove_file(&copy)?;
-        parts.push((name, bytes));
+        let bytes = std::fs::read(&copy);
+        // A decrypted copy: overwritten, not just unlinked.
+        wipe_file(&copy);
+        parts.push((name, bytes?));
     }
     let mut z = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(3));
     z.write_all(&(parts.len() as u32).to_le_bytes())?;
@@ -219,9 +220,9 @@ pub fn snapshot_media(cache: &Path) -> Result<Option<Vec<u8>>> {
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.execute("VACUUM INTO ?1", [copy.to_string_lossy()]).context("copying the media cache")?;
     drop(conn);
-    let bytes = std::fs::read(&copy)?;
-    std::fs::remove_file(&copy)?;
-    Ok(Some(bytes))
+    let bytes = std::fs::read(&copy);
+    wipe_file(&copy);
+    Ok(Some(bytes?))
 }
 
 /// Puts a [`snapshot_media`] back as the media cache in `cache`.
@@ -249,6 +250,25 @@ pub fn copy_legacy(legacy: &Path, store: &Path) -> Result<()> {
 /// Whether `store` holds a running store.
 pub fn has_store(store: &Path) -> bool {
     KEPT.iter().any(|n| store.join(n).exists())
+}
+
+/// Where Whisker keeps its data unless told otherwise. On Windows that's
+/// the *local* app data folder: the roaming one is copied to other
+/// computers and servers by domain roaming profiles. Data an older version
+/// left in the roaming folder is moved over once.
+pub fn default_data_dir() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("io.github", "anti-ghostsec", "Whisker")?;
+    let (local, roaming) = (dirs.data_local_dir().to_owned(), dirs.data_dir().to_owned());
+    if local != roaming && roaming.is_dir() && !local.exists() {
+        if let Some(parent) = local.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::rename(&roaming, &local) {
+            tracing::warn!("couldn't move Whisker's data out of the roaming folder: {e}");
+            return Some(roaming);
+        }
+    }
+    Some(local)
 }
 
 static SCRATCH_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -279,7 +299,8 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // Overwritten first: off Linux this folder is on a disk.
+        shred_dir(&self.0);
     }
 }
 

@@ -2,7 +2,7 @@
 //! against mock OpenAI-style, Ollama and Anthropic-style servers.
 
 use serde_json::json;
-use whisker_agent::{ApiConfig, ApiFormat, Llm, detect};
+use whisker_agent::{ApiConfig, ApiFormat, Llm, detect_via};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -17,21 +17,21 @@ async fn openai_style_server_at_bare_address() {
         .mount(&s).await;
 
     // User typed just the address, no /v1.
-    let d = detect(&s.uri(), Some("k")).await.unwrap();
+    let d = detect_via(&s.uri(), Some("k"), None).await.unwrap();
     assert_eq!(d.format, ApiFormat::OpenAiChat);
     assert_eq!(d.endpoint, format!("{}/v1/chat/completions", s.uri()));
     assert_eq!(d.models, vec!["a-model", "b-model"]);
 
     let api = ApiConfig { url: s.uri(), api_key: Some("k".into()), model: "a-model".into(), ..Default::default() };
     // Format left Unknown: the client detects it by itself on first use.
-    assert_eq!(Llm::new(api, 100, Default::default()).unwrap().test().await.unwrap(), "hi there");
+    assert_eq!(Llm::new(api, 100, Default::default(), None).unwrap().test().await.unwrap(), "hi there");
 }
 
 #[tokio::test]
 async fn wrong_key_is_reported() {
     let s = MockServer::start().await;
     Mock::given(method("GET")).respond_with(ResponseTemplate::new(401)).mount(&s).await;
-    let e = detect(&s.uri(), Some("bad")).await.unwrap_err();
+    let e = detect_via(&s.uri(), Some("bad"), None).await.unwrap_err();
     assert!(e.to_string().contains("rejected the API key"), "{e}");
 }
 
@@ -41,7 +41,7 @@ async fn ollama_native() {
     Mock::given(method("GET")).and(path("/api/tags"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": [{"name": "llama3:8b"}]})))
         .mount(&s).await;
-    let d = detect(&s.uri(), None).await.unwrap();
+    let d = detect_via(&s.uri(), None, None).await.unwrap();
     assert_eq!(d.service, "Ollama");
     assert_eq!(d.models, vec!["llama3:8b"]);
     assert!(d.endpoint.ends_with("/v1/chat/completions"));
@@ -59,10 +59,10 @@ async fn anthropic_style_server() {
         .mount(&s).await;
     Mock::given(method("GET")).respond_with(ResponseTemplate::new(401)).mount(&s).await;
 
-    let d = detect(&s.uri(), Some("k")).await.unwrap();
+    let d = detect_via(&s.uri(), Some("k"), None).await.unwrap();
     assert_eq!(d.format, ApiFormat::AnthropicMessages);
     let api = ApiConfig { url: s.uri(), api_key: Some("k".into()), model: "m1".into(), format: d.format, endpoint: d.endpoint, service: d.service };
-    assert_eq!(Llm::new(api, 100, Default::default()).unwrap().test().await.unwrap(), "hello");
+    assert_eq!(Llm::new(api, 100, Default::default(), None).unwrap().test().await.unwrap(), "hello");
 }
 
 #[tokio::test]
@@ -78,7 +78,7 @@ async fn adapts_to_max_completion_tokens() {
         url: s.uri(), model: "m".into(), format: ApiFormat::OpenAiChat,
         endpoint: format!("{}/v1/chat/completions", s.uri()), ..Default::default()
     };
-    assert_eq!(Llm::new(api, 100, Default::default()).unwrap().test().await.unwrap(), "ok");
+    assert_eq!(Llm::new(api, 100, Default::default(), None).unwrap().test().await.unwrap(), "ok");
 }
 
 #[tokio::test]
@@ -99,7 +99,7 @@ async fn venice_gets_private_defaults() {
         service: "Venice".into(),
         ..Default::default()
     };
-    assert_eq!(Llm::new(api.clone(), 50, Default::default()).unwrap().test().await.unwrap(), "ciao");
+    assert_eq!(Llm::new(api.clone(), 50, Default::default(), None).unwrap().test().await.unwrap(), "ciao");
 
     // Turned on in settings, web search is "auto".
     server.reset().await;
@@ -109,6 +109,6 @@ async fn venice_gets_private_defaults() {
         .expect(1)
         .mount(&server)
         .await;
-    let llm = Llm::new(api, 50, Default::default()).unwrap().with_venice(whisker_agent::llm::Venice { system_prompt: true, web_search: true });
+    let llm = Llm::new(api, 50, Default::default(), None).unwrap().with_venice(whisker_agent::llm::Venice { system_prompt: true, web_search: true });
     assert_eq!(llm.test().await.unwrap(), "si");
 }

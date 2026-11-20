@@ -41,7 +41,8 @@ pub const MAX_TEXT: usize = 24_000;
 const MAX_LINKS: usize = 40;
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// Sent instead of anything that could tell who's asking.
-const USER_AGENT: &str = "Mozilla/5.0 (compatible; WhiskerBot/1.0)";
+/// A common browser's: naming Whisker would tell sites which app is asking.
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 /// Sites the model may read anything from when the owner hasn't listed any.
 pub const DEFAULT_SITES: &[&str] = &["github.com", "api.github.com", "raw.githubusercontent.com", "gist.github.com", "gist.githubusercontent.com"];
@@ -262,7 +263,12 @@ impl Web {
         if url.host_str() == Some("api.github.com") {
             extra.push(("X-GitHub-Api-Version", "2022-11-28"));
         }
-        let got = safe_web::get(url, self.proxy.as_deref(), &safe_web::Ask { headers: &extra, ..safe_web::Ask::new(accept, MAX_BYTES, USER_AGENT, TIMEOUT) }).await?;
+        // A redirect may stay on the same site, or go to an allowed one: an
+        // allowed page mustn't be able to send the fetch anywhere it likes.
+        let (first, sites) = (url.host_str().unwrap_or_default().to_ascii_lowercase(), self.sites.clone());
+        let redirect_ok = move |u: &Url| u.host_str().is_some_and(|h| h.eq_ignore_ascii_case(&first)) || Session::default().may(u, &sites);
+        let ask = safe_web::Ask { headers: &extra, redirect_ok: Some(&redirect_ok), ..safe_web::Ask::new(accept, MAX_BYTES, USER_AGENT, TIMEOUT) };
+        let got = safe_web::get(url, self.proxy.as_deref(), &ask).await?;
         let (url, content_type, body, truncated) = (got.url, got.content_type, got.body, got.truncated);
         let texty = content_type.is_empty()
             || content_type.starts_with("text/")

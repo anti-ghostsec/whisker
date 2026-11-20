@@ -105,7 +105,8 @@ fn marked(v: &Value, trait_name: &str) -> Option<String> {
 }
 
 fn http(proxy: Option<&str>) -> Result<reqwest::Client> {
-    let mut b = whisker_core::tls::http_builder().timeout(Duration::from_secs(15));
+    // No redirects: the API key header would be sent on to wherever it points.
+    let mut b = whisker_core::tls::http_builder().timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none());
     if let Some(p) = proxy {
         b = b.proxy(reqwest::Proxy::all(p).map_err(|e| anyhow::anyhow!("bad proxy: {e}"))?);
     }
@@ -190,13 +191,10 @@ async fn get_json(req: reqwest::RequestBuilder) -> Result<(u16, Option<Value>)> 
     Ok((status, resp.json::<Value>().await.ok()))
 }
 
-/// Finds out what API is at `url`. Tries the most specific guess first.
-pub async fn detect(url: &str, key: Option<&str>) -> Result<Detected> {
-    detect_via(url, key, None).await
-}
-
-/// [`detect`] through a proxy (the AI account's, so the AI service sees
-/// the same address as the account's server does).
+/// Finds out what API is at `url`, trying the most specific guess first,
+/// through `proxy` (the AI account's, so the AI service sees the same
+/// address as the account's server does; `None` only for an account
+/// without one).
 pub async fn detect_via(url: &str, key: Option<&str>, proxy: Option<&str>) -> Result<Detected> {
     let full = normalize_url(url);
     let parsed = reqwest::Url::parse(&full).map_err(|_| anyhow!("that isn't a valid address"))?;

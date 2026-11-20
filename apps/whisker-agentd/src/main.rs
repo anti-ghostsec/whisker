@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use whisker_agent::{AgentConfig, ApiConfig, Llm, Permission, Trigger, agents_in, detect, save_agents, start_all};
+use whisker_agent::{AgentConfig, ApiConfig, Llm, Permission, Trigger, agents_in, detect_via, save_agents, start_all};
 use whisker_core::{AccountId, AccountKind, AccountManager, LoginRequest};
 
 #[derive(Parser)]
@@ -93,9 +93,7 @@ fn passphrase(prompt: &str) -> Result<String> {
 }
 
 fn default_data_dir() -> Result<PathBuf> {
-    directories::ProjectDirs::from("io.github", "anti-ghostsec", "Whisker")
-        .map(|d| d.data_dir().to_owned())
-        .context("no home directory; pass --data-dir")
+    whisker_core::stores::default_data_dir().context("no home directory; pass --data-dir")
 }
 
 /// Unlocks and returns the single vault the passphrase opened.
@@ -110,8 +108,10 @@ async fn unlock(mgr: &AccountManager) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before any secret is in memory: no core dumps.
+    whisker_core::harden_process();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,matrix_sdk=warn".into()))
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .init();
     let cli = Cli::parse();
     let mgr = AccountManager::new(match cli.data_dir {
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
             if std::env::var("WHISKER_PASSPHRASE").is_err() && a != rpassword::prompt_password("Repeat: ")? {
                 bail!("passphrases differ");
             }
-            if !mgr.unlock(&a).await?.is_empty() {
+            if mgr.passphrase_in_use(&a, None).await? {
                 bail!("a vault already opens with that passphrase");
             }
             mgr.create_vault(&a).await?;
@@ -173,7 +173,10 @@ async fn main() -> Result<()> {
                 Some(var) => Some(std::env::var(&var).with_context(|| format!("${var} is not set"))?),
                 None => None,
             };
-            let found = detect(&api_url, api_key.as_deref()).await?;
+            // Through the AI account's proxy: the AI service sees the API key
+            // with each request, and must not see the real address with it.
+            let proxy = mgr.details(account).await.and_then(|d| d.1);
+            let found = detect_via(&api_url, api_key.as_deref(), proxy.as_deref()).await?;
             println!("found {} ({:?}), {} models", found.service, found.format, found.models.len());
             let Some(model) = model else {
                 for m in &found.models {
@@ -189,7 +192,7 @@ async fn main() -> Result<()> {
                 endpoint: found.endpoint,
                 service: found.service,
             };
-            println!("testing… {}", Llm::new(api.clone(), 200, Default::default())?.test().await?);
+            println!("testing… {}", Llm::new(api.clone(), 200, Default::default(), proxy.as_deref())?.test().await?);
             let mut cfg = AgentConfig::new(account, api);
             cfg.permissions.global = grant
                 .iter()

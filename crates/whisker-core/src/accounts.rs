@@ -528,6 +528,39 @@ impl AccountManager {
         Ok(id)
     }
 
+    /// Whether `passphrase` opens any vault file other than `except`: the
+    /// open ones included (the main vault is always open when a hidden one
+    /// is made). One passphrase opening two vaults would open both at once,
+    /// so handing it over would give away the hidden one. Nothing is opened.
+    pub async fn passphrase_in_use(&self, passphrase: &str, except: Option<&str>) -> Result<bool> {
+        let mut files = Vec::new();
+        if let Ok(dir) = std::fs::read_dir(self.vaults_dir()) {
+            for e in dir.flatten() {
+                let p = e.path();
+                let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if p.extension().is_some_and(|x| x == "vault") && Some(stem.as_str()) != except {
+                    files.push(p);
+                }
+            }
+        }
+        let pass = passphrase.to_owned();
+        Ok(tokio::task::spawn_blocking(move || {
+            let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
+            let chunk = files.len().div_ceil(threads).max(1);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = files
+                    .chunks(chunk)
+                    .map(|part| {
+                        let pass = &pass;
+                        s.spawn(move || part.iter().any(|p| Vault::open::<Profile>(p, pass).is_ok()))
+                    })
+                    .collect();
+                handles.into_iter().any(|h| h.join().unwrap_or(false))
+            })
+        })
+        .await?)
+    }
+
     /// Tries `passphrase` against every vault that isn't open yet, restores
     /// the accounts of each one it opens, and starts syncing them.
     /// Returns the ids of the vaults it opened (empty means a wrong passphrase).
@@ -723,6 +756,19 @@ impl AccountManager {
     }
 
     async fn restore(&self, vault: &str, mut record: AccountRecord) -> Result<()> {
+        // Saved by an older version as socks5:// (names looked up outside the proxy).
+        if let Some(p) = &record.proxy
+            && proxy_url(p) != *p
+        {
+            record.proxy = Some(proxy_url(p));
+            let (id, proxy) = (record.id, record.proxy.clone());
+            self.mutate_profile(vault, |prof| {
+                if let Some(r) = prof.accounts.iter_mut().find(|r| r.id == id) {
+                    r.proxy = proxy;
+                }
+            })
+            .await?;
+        }
         // Servers move (the saved URL can go dead), so ask the server name
         // where it lives now, but don't let a slow answer hold up unlocking.
         if let Some(now) = discover(&record).await
@@ -998,7 +1044,8 @@ impl AccountManager {
     }
 
     /// Logs in a new account and saves it into `req.vault`.
-    pub async fn login(&self, req: LoginRequest<'_>) -> Result<AccountId> {
+    pub async fn login(&self, mut req: LoginRequest<'_>) -> Result<AccountId> {
+        req.proxy = req.proxy.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(proxy_url);
         if !self.inner.read().await.vaults.contains_key(req.vault) {
             bail!("vault is locked");
         }
@@ -1293,7 +1340,7 @@ impl AccountManager {
 
     /// Takes effect the next time the vault is unlocked.
     pub async fn set_proxy(&self, id: AccountId, proxy: Option<String>) -> Result<()> {
-        let proxy = proxy.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty());
+        let proxy = proxy.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()).map(|p| proxy_url(&p));
         self.mutate_account(id, |r| r.proxy = proxy.clone()).await
     }
 
@@ -1308,6 +1355,9 @@ impl AccountManager {
     pub async fn change_passphrase(&self, vault: &str, old: &str, new: &str) -> Result<()> {
         if new.len() < 8 {
             bail!("use at least 8 characters");
+        }
+        if self.passphrase_in_use(new, Some(vault)).await? {
+            bail!("that passphrase already opens another vault: pick one you don't use for any other");
         }
         let path = self.vaults_dir().join(format!("{vault}.vault"));
         let (old, new_) = (old.to_owned(), new.to_owned());
@@ -1590,6 +1640,18 @@ impl AccountManager {
     }
 }
 
+/// A proxy address as it's used: `socks5://` becomes `socks5h://`, so host
+/// names (the homeserver's, every site's) are looked up by the proxy, not
+/// by this computer's resolver, which would tell the network (and the DNS
+/// server) every host an account behind Tor talks to.
+pub fn proxy_url(p: &str) -> String {
+    let p = p.trim();
+    match p.get(..9) {
+        Some(head) if head.eq_ignore_ascii_case("socks5://") => format!("socks5h://{}", &p[9..]),
+        _ => p.to_owned(),
+    }
+}
+
 /// Where `record`'s server says its client API lives now (from
 /// `/.well-known/matrix/client`), or `None` if it doesn't say in time.
 async fn discover(record: &AccountRecord) -> Option<String> {
@@ -1607,7 +1669,15 @@ async fn well_known(origin: &str, proxy: Option<&str>) -> Option<String> {
     let url = format!("{origin}/.well-known/matrix/client");
     let v: serde_json::Value = http.build().ok()?.get(url).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
     let base = v.get("m.homeserver")?.get("base_url")?.as_str()?.trim_end_matches('/');
-    base.starts_with("http").then(|| base.to_owned())
+    // Never down to plain http: a file fetched over https naming an http
+    // address would send the account's token unencrypted (and anyone in
+    // between could rewrite it). Only a server already reached over http
+    // (an .onion, or one on the local network) may name an http address.
+    let ok = base.starts_with("https://") || (base.starts_with("http://") && origin.starts_with("http://"));
+    if !ok {
+        tracing::warn!("ignoring the homeserver address {origin} names: it isn't https");
+    }
+    ok.then(|| base.to_owned())
 }
 
 /// The client API address for a server typed at sign-in: what its
@@ -1670,6 +1740,14 @@ fn vouch_pairs(accounts: &[(AccountKind, &str)]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod vouch_tests {
     use super::*;
+
+    #[test]
+    fn socks_proxies_look_names_up_through_the_proxy() {
+        assert_eq!(proxy_url("socks5://127.0.0.1:9050"), "socks5h://127.0.0.1:9050");
+        assert_eq!(proxy_url(" SOCKS5://h:1 "), "socks5h://h:1");
+        assert_eq!(proxy_url("socks5h://h:1"), "socks5h://h:1");
+        assert_eq!(proxy_url("http://h:8080"), "http://h:8080");
+    }
 
     #[test]
     fn vouching_stays_inside_a_vault() {

@@ -7,6 +7,48 @@ fn main() {
     let config = slint_build::CompilerConfiguration::new().with_style("fluent".into());
     slint_build::compile_with_config("ui/app.slint", config).expect("Slint UI failed to compile");
     emoji_table();
+    android_libcxx();
+}
+
+/// Android: links the C++ library of the NDK the build uses (ANDROID_NDK_HOME).
+/// Skia is C++ built against that NDK's libc++, while xbuild links with the
+/// older one it brings itself. What Skia needs and the older one lacks is
+/// then left unresolved, and Android refuses to load the app's library: it
+/// opens and closes at once. Only the two C++ archives are put ahead of
+/// xbuild's own folder; the rest of the NDK's folder has a static libc.
+fn android_libcxx() {
+    for v in ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK"] {
+        println!("cargo:rerun-if-env-changed={v}");
+    }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
+        return;
+    }
+    let triple = match std::env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
+        "aarch64" => "aarch64-linux-android",
+        "arm" => "arm-linux-androideabi",
+        "x86" => "i686-linux-android",
+        "x86_64" => "x86_64-linux-android",
+        other => panic!("no Android NDK libraries for {other}"),
+    };
+    let ndk = ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK"]
+        .iter()
+        .find_map(|v| std::env::var_os(v).filter(|p| !p.is_empty()))
+        .map(std::path::PathBuf::from)
+        .expect("set ANDROID_NDK_HOME to the Android NDK: its C++ library is linked into Whisker");
+    let hosts = ndk.join("toolchains/llvm/prebuilt");
+    let libs = std::fs::read_dir(&hosts)
+        .unwrap_or_else(|e| panic!("{}: {e}", hosts.display()))
+        .filter_map(|e| Some(e.ok()?.path().join("sysroot/usr/lib").join(triple)))
+        .find(|d| d.join("libc++_static.a").is_file())
+        .unwrap_or_else(|| panic!("no libc++_static.a for {triple} under {}", hosts.display()));
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("ndk-libcxx");
+    std::fs::create_dir_all(&out).unwrap();
+    for name in ["libc++_static.a", "libc++abi.a"] {
+        let from = libs.join(name);
+        println!("cargo:rerun-if-changed={}", from.display());
+        std::fs::copy(&from, out.join(name)).unwrap_or_else(|e| panic!("{}: {e}", from.display()));
+    }
+    println!("cargo:rustc-link-search=native={}", out.display());
 }
 
 /// Embeds the emoji pictures (assets/emoji/emoji_u*.png) as a table from

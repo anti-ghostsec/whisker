@@ -178,6 +178,22 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: x build -p whisker --platform android --arch arm64 --release --format apk
 
+      # Android loads the app's library only if everything it needs is in
+      # it or in the phone's own libraries. A C++ name left unresolved (the
+      # C++ library linked in is older than the one Skia was built with)
+      # builds fine and then closes the app the moment it opens.
+      - name: Check the library loads
+        run: |
+          set -eu
+          unzip -p target/x/release/android/whisker.apk lib/arm64-v8a/libwhisker.so > "$RUNNER_TEMP/libwhisker.so"
+          missing=$(llvm-readelf --dyn-syms -W "$RUNNER_TEMP/libwhisker.so" | awk '$7 == "UND" && $8 ~ /^_Z/ { print $8 }')
+          rm -f "$RUNNER_TEMP/libwhisker.so"
+          if [ -n "$missing" ]; then
+            printf '%s\n' "$missing"
+            echo "::error::libwhisker.so needs C++ names nothing on the phone provides: it would not load"
+            exit 1
+          fi
+
       # Signed in its own job (below), which builds nothing: no build
       # script or dependency ever runs where the release key is.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

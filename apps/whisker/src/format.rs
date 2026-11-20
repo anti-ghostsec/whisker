@@ -114,6 +114,78 @@ pub fn plain_inline(s: &str) -> String {
     out
 }
 
+/// Where the web addresses in `text` are: byte ranges, in order.
+fn link_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(off) = text[i..].find("http") {
+        let start = i + off;
+        let tail = &text[start..];
+        let boundary = text[..start].chars().next_back().is_none_or(|c| c.is_whitespace() || "(<\"'[".contains(c));
+        if boundary && (tail.starts_with("https://") || tail.starts_with("http://")) {
+            let len = tail.find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"').unwrap_or(tail.len());
+            let mut url = &tail[..len];
+            // Sentence punctuation after it isn't part of it; nor is a
+            // closing bracket it didn't open.
+            loop {
+                let trimmed = url.trim_end_matches(['.', ',', '!', '?', ';', ':', '\'', ']']);
+                let trimmed = if trimmed.ends_with(')') && !trimmed.contains('(') { &trimmed[..trimmed.len() - 1] } else { trimmed };
+                if trimmed.len() == url.len() {
+                    break;
+                }
+                url = trimmed;
+            }
+            if url.len() > "https://".len() {
+                out.push(start..start + url.len());
+                i = start + url.len();
+                continue;
+            }
+        }
+        i = start + 4;
+    }
+    out
+}
+
+/// `text` as Markdown for a Slint `StyledText`, with its web addresses as
+/// links and everything else shown exactly as written (escaped). `None`
+/// when it has no links (it's then shown as plain, selectable text).
+pub fn linked_markdown(text: &str) -> Option<String> {
+    let ranges = link_ranges(text);
+    if ranges.is_empty() {
+        return None;
+    }
+    fn plain(out: &mut String, t: &str) {
+        for (n, line) in t.split('\n').enumerate() {
+            if n > 0 {
+                // A hard line break: lines stay lines.
+                out.push_str("\\\n");
+            }
+            // Leading spaces would make an indented code block.
+            let line = if out.is_empty() || out.ends_with('\n') { line.trim_start() } else { line };
+            for c in line.chars() {
+                if c.is_ascii_punctuation() {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut at = 0;
+    for r in ranges {
+        plain(&mut out, &text[at..r.start]);
+        let url = &text[r.clone()];
+        out.push('[');
+        plain(&mut out, url);
+        out.push_str("](<");
+        out.push_str(url);
+        out.push_str(">)");
+        at = r.end;
+    }
+    plain(&mut out, &text[at..]);
+    Some(out)
+}
+
 /// Web links in a message, for "Open link" in the right-click menu.
 pub fn links(body: &str) -> Vec<String> {
     let mut found = Vec::new();
@@ -129,6 +201,19 @@ pub fn links(body: &str) -> Vec<String> {
 #[cfg(test)]
 mod merged_tests {
     use super::*;
+
+    #[test]
+    fn links_become_markdown_links() {
+        assert_eq!(linked_markdown("no links here"), None);
+        assert_eq!(linked_markdown("see https://a.org/x."), Some("see [https\\:\\/\\/a\\.org\\/x](<https://a.org/x>)\\.".to_owned()));
+        // Everything else is shown as written: no Markdown, no HTML.
+        let md = linked_markdown("*hi* <b> (https://b.org)").unwrap();
+        assert!(md.starts_with("\\*hi\\* \\<b\\> \\("), "{md}");
+        assert!(md.ends_with("](<https://b.org>)\\)"), "{md}");
+        assert_eq!(link_ranges("x https://w.org/a_(b) y").len(), 1);
+        assert_eq!(&"x https://w.org/a_(b) y"[link_ranges("x https://w.org/a_(b) y")[0].clone()], "https://w.org/a_(b)");
+        assert!(link_ranges("nohttps://x.org").is_empty());
+    }
 
     #[test]
     fn splits_blocks() {

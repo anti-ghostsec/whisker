@@ -261,7 +261,17 @@ pub fn emoji_image(emoji: &str) -> Image {
 /// A message body as plain, selectable blocks (paragraphs, quotes, code,
 /// headings). Mentions show as the name, like the rest of the text.
 pub fn blocks(body: &str) -> ModelRc<Block> {
-    let v: Vec<Block> = format::merged(body).into_iter().map(|l| Block { kind: l.kind as i32, plain: s(&l.source) }).collect();
+    let v: Vec<Block> = format::merged(body)
+        .into_iter()
+        .map(|l| {
+            // Paragraphs and quotes with web links: the links clickable.
+            let rich = matches!(l.kind, format::Kind::Text | format::Kind::Quote)
+                .then(|| format::linked_markdown(&l.source))
+                .flatten()
+                .and_then(|md| slint::StyledText::from_markdown(&md).ok());
+            Block { kind: l.kind as i32, plain: s(&l.source), linked: rich.is_some(), rich: rich.unwrap_or_default() }
+        })
+        .collect();
     ModelRc::new(VecModel::from(v))
 }
 

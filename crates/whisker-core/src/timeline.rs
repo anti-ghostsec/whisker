@@ -996,11 +996,8 @@ pub const LOCAL_ECHO: &str = "$whisker-local-";
 /// get notified.
 pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>, mentions: &[(String, OwnedUserId)]) -> Result<OwnedEventId> {
     let (linked, users) = link_mentions(text, mentions);
-    let mut content = RoomMessageEventContentWithoutRelation::text_markdown(&linked);
+    let mut content = text_content(&linked, text);
     if !users.is_empty() {
-        if let MessageType::Text(t) = &mut content.msgtype {
-            t.body = text.to_owned();
-        }
         content = content.add_mentions(matrix_sdk::ruma::events::Mentions::with_user_ids(users));
     }
     let content = match reply_to {
@@ -1126,11 +1123,57 @@ pub fn plain_name(name: &str) -> String {
         .collect()
 }
 
+/// A text message: `formatted` (Markdown, with mention links) becomes its
+/// formatted text, with bare web addresses made into links there, so every
+/// app shows them as links; `plain` is its plain text, as typed.
+fn text_content(formatted: &str, plain: &str) -> RoomMessageEventContentWithoutRelation {
+    let mut content = RoomMessageEventContentWithoutRelation::text_markdown(autolink(formatted));
+    if let MessageType::Text(t) = &mut content.msgtype {
+        t.body = plain.to_owned();
+    }
+    content
+}
+
+/// Bare `http(s)://` addresses as Markdown autolinks (`<…>`), so the
+/// formatted text has them as links. Left alone: text with code in it
+/// (an address there is code), and addresses already in a Markdown link.
+fn autolink(text: &str) -> String {
+    if text.contains('`') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut rest = text;
+    while !rest.is_empty() {
+        let start = rest.find(|c: char| !c.is_whitespace()).unwrap_or(rest.len());
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        if word.starts_with("https://") || word.starts_with("http://") {
+            // Sentence punctuation after it isn't part of the address.
+            let url = word.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '\'', '"']);
+            let ok = url.len() > "https://".len() && !url.contains(['<', '>']);
+            if ok {
+                out.push('<');
+                out.push_str(url);
+                out.push('>');
+                out.push_str(&word[url.len()..]);
+            } else {
+                out.push_str(word);
+            }
+        } else {
+            out.push_str(word);
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
 /// Posts `text` as a reply in the thread started by `root`; `latest` is
 /// the thread's newest message (for clients without thread support).
 pub async fn send_in_thread(room: &Room, root: &EventId, latest: &EventId, text: &str) -> Result<OwnedEventId> {
     use matrix_sdk::ruma::events::relation::Thread;
-    let mut content = RoomMessageEventContent::text_markdown(text);
+    let mut content: RoomMessageEventContent = text_content(text, text).into();
     content.relates_to = Some(Relation::Thread(Thread::plain(root.to_owned(), latest.to_owned())));
     let config = send_config();
     Ok(room.send(content).with_request_config(config).await?.response.event_id)
@@ -1138,7 +1181,7 @@ pub async fn send_in_thread(room: &Room, root: &EventId, latest: &EventId, text:
 
 /// Replaces the text of one of our own messages.
 pub async fn edit_text(room: &Room, target: &EventId, text: &str) -> Result<()> {
-    let new = RoomMessageEventContentWithoutRelation::text_markdown(text);
+    let new = text_content(text, text);
     let content = room.make_edit_event(target, EditedContent::RoomMessage(new)).await.map_err(|e| anyhow!("couldn't edit: {e}"))?;
     room.send(content).await?;
     Ok(())
@@ -1759,5 +1802,23 @@ mod media_safety_tests {
     fn names_read_as_they_are() {
         assert_eq!(plain_name("photo\u{202E}gnp.exe"), "photognp.exe");
         assert_eq!(plain_name("Ad\u{200B}min\n"), "Admin");
+    }
+
+    #[test]
+    fn bare_links_become_links() {
+        assert_eq!(autolink("see https://a.org/x. ok"), "see <https://a.org/x>. ok");
+        assert_eq!(autolink("http://b.org"), "<http://b.org>");
+        assert_eq!(autolink("[docs](https://a.org)"), "[docs](https://a.org)");
+        assert_eq!(autolink("`curl https://a.org`"), "`curl https://a.org`");
+        assert_eq!(autolink("a\n https://c.org!"), "a\n <https://c.org>!");
+        let c = text_content("go https://a.org/x?y=1&z=2 now", "go https://a.org/x?y=1&z=2 now");
+        let MessageType::Text(t) = c.msgtype else { panic!() };
+        assert_eq!(t.body, "go https://a.org/x?y=1&z=2 now");
+        let html = t.formatted.expect("formatted").body;
+        assert!(html.contains("<a href=\"https://a.org/x?y=1&amp;z=2\">"), "{html}");
+        // Plain text without links or Markdown stays plain.
+        let c = text_content("hello there", "hello there");
+        let MessageType::Text(t) = c.msgtype else { panic!() };
+        assert!(t.formatted.is_none());
     }
 }

@@ -308,6 +308,10 @@ operating system and the **Wisp** browser.
   without tags. Files Whisker can't clean (HEIC, AVIF, RAW, PDF, Office documents and the
   like, or video when ffmpeg is missing) are held back with a message instead of being
   sent as they are; turn the setting off to send them anyway.
+- **Links you can click.** Web addresses in messages are shown as links; click one to open
+  it. Ones you type are sent as real links too, so every app shows them that way, with no
+  rich text needed. (Text with a link in it can't be drag-selected; *Copy whole message*
+  copies it.)
 - **Links show where they go.** A link whose text isn't its address shows the real site
   next to it.
 - **Notifications from hidden vaults** only ever say "New message": who and where are

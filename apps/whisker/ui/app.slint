@@ -75,6 +75,10 @@ export struct Reader {
 export struct Block {
     kind: int,
     plain: string,
+    // Text with web links in it: drawn with the links clickable (it can't
+    // be selected then; Copy in the menu still copies it).
+    linked: bool,
+    rich: styled-text,
 }
 
 // A folder or file in Whisker's own file list (Android, see picker.rs).
@@ -342,7 +346,18 @@ component Blocks inherits VerticalLayout {
     callback selected(string);
     spacing: 2px;
     for b[i] in root.blocks: VerticalLayout {
-        if b.kind == 0: TextInput {
+        if b.linked && (b.kind == 0 || b.kind == 1): HorizontalLayout {
+            spacing: 8px;
+            if b.kind == 1: Rectangle { width: 3px; border-radius: 2px; background: Theme.accent.transparentize(0.4); }
+            StyledText {
+                width: b.kind == 1 ? root.avail - 11px : root.avail;
+                text: b.rich;
+                default-color: b.kind == 1 || root.faint ? Theme.muted : Theme.text;
+                link-color: Theme.accent;
+                link-clicked(l) => { root.link(l); }
+            }
+        }
+        if !b.linked && b.kind == 0: TextInput {
             width: root.avail;
             text: b.plain;
             read-only: true;
@@ -357,7 +372,7 @@ component Blocks inherits VerticalLayout {
             changed cursor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
             changed anchor-position-byte-offset => { root.selected(TextTools.slice(self.text, self.anchor-position-byte-offset, self.cursor-position-byte-offset)); }
         }
-        if b.kind == 1: HorizontalLayout {
+        if !b.linked && b.kind == 1: HorizontalLayout {
             spacing: 8px;
             Rectangle { width: 3px; border-radius: 2px; background: Theme.accent.transparentize(0.4); }
             TextInput {

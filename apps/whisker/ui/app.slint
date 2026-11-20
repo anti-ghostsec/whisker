@@ -4264,10 +4264,17 @@ export component AppWindow inherits Window {
             if root.verify-state == "emojis": VerticalLayout {
                 spacing: 12px;
                 Text { text: "Check that the other screen shows the same pictures, in the same order:"; wrap: word-wrap; color: Theme.muted; }
-                HorizontalLayout {
-                    alignment: center;
-                    spacing: 4px;
-                    for e in root.verify-emojis: Rectangle {
+                // As many to a row as fit (all 7 on a wide screen, 4 and 3
+                // on a phone), each row centred.
+                Rectangle {
+                    property <int> count: root.verify-emojis.length;
+                    property <int> per: max(1, min(self.count, floor((self.width + 4px) / 62px)));
+                    height: ceil(self.count / self.per) * 78px - 4px;
+                    for e[i] in root.verify-emojis: Rectangle {
+                        property <int> row: floor(i / parent.per);
+                        property <int> in-row: min(parent.per, parent.count - self.row * parent.per);
+                        x: (parent.width - (self.in-row * 62px - 4px)) / 2 + mod(i, parent.per) * 62px;
+                        y: self.row * 78px;
                         width: 58px;
                         height: 74px;
                         border-radius: 8px;

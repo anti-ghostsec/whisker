@@ -178,6 +178,29 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: x build -p whisker --platform android --arch arm64 --release --format apk
 
+      # Signed in its own job (below), which builds nothing: no build
+      # script or dependency ever runs where the release key is.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-android-apk
+          path: target/x/release/android/whisker.apk
+          if-no-files-found: error
+
+  android-sign:
+    name: Android signing
+    needs: android
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          sparse-checkout: apps/whisker/android-release-cert.sha256
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned-android-apk
+          path: target/x/release/android
+
       # xbuild signs with its own built-in debug key. The APK is re-signed
       # with Whisker's release key, from the ANDROID_KEYSTORE_BASE64 (the
       # PKCS12 keystore, base64) and ANDROID_KEYSTORE_PASSWORD secrets (key
@@ -224,7 +247,7 @@ jobs:
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, windows, android]
+    needs: [linux, windows, android-sign]
     permissions:
       contents: write
     runs-on: ubuntu-24.04
@@ -234,6 +257,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
+          pattern: whisker-*
           merge-multiple: true
 
       # Only an APK signed with Whisker's release key is published.

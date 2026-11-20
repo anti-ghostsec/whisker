@@ -113,6 +113,11 @@ fn strip(data: &[u8], name: &str, video: bool) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let read = ok && std::fs::File::open(&dst).and_then(|mut f| f.read_to_end(&mut out)).is_ok();
     drop(dir);
+    // Android's muxer adds its own: the Android version (sometimes the
+    // make and model) and the time it wrote the file. Wiped, sizes kept.
+    if format != ffi::OutputFormat::AMEDIAMUXER_OUTPUT_FORMAT_WEBM {
+        crate::voice::scrub_mp4(&mut out);
+    }
     (read && !out.is_empty()).then_some(out)
 }
 

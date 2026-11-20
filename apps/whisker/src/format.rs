@@ -172,18 +172,37 @@ pub fn linked_markdown(text: &str) -> Option<String> {
     }
     let mut out = String::new();
     let mut at = 0;
+    let mut any = false;
     for r in ranges {
+        // Shown exactly as it will open: the parsed address (look-alike
+        // letters in the name as punycode, `xn--…`). The link target is
+        // escaped too, so Markdown can't turn `&#64;` or the like into
+        // something else when it's clicked.
+        let Some(url) = clean_link(&text[r.clone()]) else { continue };
         plain(&mut out, &text[at..r.start]);
-        let url = &text[r.clone()];
         out.push('[');
-        plain(&mut out, url);
+        plain(&mut out, &url);
         out.push_str("](<");
-        out.push_str(url);
+        for c in url.chars() {
+            if c.is_ascii_punctuation() {
+                out.push('\\');
+            }
+            out.push(c);
+        }
         out.push_str(">)");
         at = r.end;
+        any = true;
     }
     plain(&mut out, &text[at..]);
-    Some(out)
+    any.then_some(out)
+}
+
+/// A web address as it really is: parsed and written back out (the host
+/// in punycode when it has non-ASCII letters, which can look like others).
+/// `None` for one that isn't a plain http(s) address.
+pub fn clean_link(raw: &str) -> Option<String> {
+    let u = url::Url::parse(raw).ok()?;
+    matches!(u.scheme(), "http" | "https").then(|| u.as_str().to_owned()).filter(|_| u.host_str().is_some())
 }
 
 /// Web links in a message, for "Open link" in the right-click menu.
@@ -191,7 +210,11 @@ pub fn links(body: &str) -> Vec<String> {
     let mut found = Vec::new();
     for word in body.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '<' || c == '>') {
         if (word.starts_with("https://") || word.starts_with("http://")) && !found.iter().any(|f| f == word) {
-            found.push(word.trim_end_matches(['.', ',', '!', '?', ';', ':', '"', '\'', ']']).to_owned());
+            // As it will really open (punycode for look-alike letters).
+            let raw = word.trim_end_matches(['.', ',', '!', '?', ';', ':', '"', '\'', ']']);
+            if let Some(u) = clean_link(raw).filter(|u| !found.contains(u)) {
+                found.push(u);
+            }
         }
     }
     found.truncate(5);
@@ -205,14 +228,23 @@ mod merged_tests {
     #[test]
     fn links_become_markdown_links() {
         assert_eq!(linked_markdown("no links here"), None);
-        assert_eq!(linked_markdown("see https://a.org/x."), Some("see [https\\:\\/\\/a\\.org\\/x](<https://a.org/x>)\\.".to_owned()));
+        assert_eq!(linked_markdown("see https://a.org/x."), Some("see [https\\:\\/\\/a\\.org\\/x](<https\\:\\/\\/a\\.org\\/x>)\\.".to_owned()));
         // Everything else is shown as written: no Markdown, no HTML.
         let md = linked_markdown("*hi* <b> (https://b.org)").unwrap();
         assert!(md.starts_with("\\*hi\\* \\<b\\> \\("), "{md}");
-        assert!(md.ends_with("](<https://b.org>)\\)"), "{md}");
+        assert!(md.ends_with("](<https\\:\\/\\/b\\.org\\/>)\\)"), "{md}");
         assert_eq!(link_ranges("x https://w.org/a_(b) y").len(), 1);
         assert_eq!(&"x https://w.org/a_(b) y"[link_ranges("x https://w.org/a_(b) y")[0].clone()], "https://w.org/a_(b)");
         assert!(link_ranges("nohttps://x.org").is_empty());
+        // What's shown is what opens: no entity tricks, and look-alike
+        // letters in punycode.
+        let md = linked_markdown("https://bank.com&#64;evil.example").unwrap();
+        assert!(!md.contains("&#64;evil"), "{md}");
+        // Shown and opened the same: the parsed address.
+        assert!(md.contains(r"[https\:\/\/bank\.com\&\/\#64\;evil\.example](<https\:\/\/bank\.com\&\/\#64\;evil\.example>)"), "{md}");
+        let md = linked_markdown("https://аpple.com/").unwrap();
+        assert!(md.contains("xn\\-\\-"), "{md}");
+        assert!(!md.contains('а'), "{md}");
     }
 
     #[test]
@@ -236,6 +268,6 @@ mod merged_tests {
         assert_eq!(m[1].source, "q1\nq2");
         assert_eq!(m[2].kind, Kind::Code);
         assert_eq!(plain_inline("see [docs](https://x.org) now"), "see docs (https://x.org) now");
-        assert_eq!(links("go to https://a.org/x. or (https://b.org)"), vec!["https://a.org/x", "https://b.org"]);
+        assert_eq!(links("go to https://a.org/x. or (https://b.org)"), vec!["https://a.org/x", "https://b.org/"]);
     }
 }

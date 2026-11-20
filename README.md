@@ -24,13 +24,17 @@ operating system and the **Wisp** browser.
   + XChaCha20-Poly1305, the same setup as Enclave). You can make more than one vault, each
   with its own passphrase. Your main passphrase opens only the main vault. Alts in a hidden
   vault don't appear and aren't mentioned anywhere in the main vault until you unlock it
-  with its own passphrase. **Lock** closes all vaults. See [Hidden vaults on disk](#hidden-vaults-on-disk)
+  with its own passphrase. **Lock** closes all vaults and stops anything playing or
+  recording. See [Hidden vaults on disk](#hidden-vaults-on-disk)
   for what someone with your files can and can't tell.
 - **A proxy per account.** You can give each account its own proxy (for example a Tor SOCKS
   port), so a server can't link your alts by IP address. Everything that account does goes
   through it: its server, link previews, YouTube through your Invidious server (on any port),
   and its AI service, the setup's Test button included. A `socks5://` proxy is used as
-  `socks5h://`, so host names are looked up by the proxy, not by your network.
+  `socks5h://` (and `socks4://` as `socks4a://`), so host names are looked up by the proxy,
+  not by your network. Clicking a web link in an account with a proxy copies it instead of
+  opening it, since your browser wouldn't use that proxy: paste it into a browser that does
+  (Tor Browser, say).
 - **AI accounts.** Each AI signs in as its own Matrix account, separate from yours, with its
   own settings page. Paste the address of any AI API (OpenRouter, Groq, Mistral, DeepSeek,
   Gemini, OpenAI, Venice, LM Studio, llama.cpp, vLLM, Ollama, or any Anthropic-style API).
@@ -237,9 +241,10 @@ operating system and the **Wisp** browser.
   account → *Set up verification* does it for an account that has none yet). *Make a
   recovery key* turns on key backup; a later login can enter that key to verify itself and
   read older messages. Lost every session and the key? *Reset verification* starts over.
-  Your AI accounts and your other accounts in the same vault verify each other automatically
-  (but two people-accounts never do, and nothing is verified across vaults, so alts and
-  hidden vaults stay unlinked).
+  Your accounts verify the AI accounts in the same vault automatically, so the AI's messages
+  don't show as unverified. Only that way round: an AI never verifies your accounts (its
+  server would then hold signatures of all of them), two people-accounts never verify each
+  other, and nothing is verified across vaults, so alts and hidden vaults stay unlinked.
 - **Room info** (click the room name or **i**, opens in the side panel): description, pinned messages (where rooms
   usually keep their rules), who can join, history visibility, encryption, the member list
   (click anyone to see their profile), inviting people, and editing the name/description if
@@ -305,7 +310,8 @@ operating system and the **Wisp** browser.
   every device or narrow it to devices you've verified.
 - **Uploads without metadata.** With *Remove metadata* on (the default) pictures are
   redrawn (JPEG, PNG, WebP, GIF, TIFF, BMP) and video and audio are rewritten by ffmpeg
-  without tags. Files Whisker can't clean (HEIC, AVIF, RAW, PDF, Office documents and the
+  without tags (on Android, rewritten by the phone and then cleared of what the phone
+  adds: its Android version, sometimes its make and model, and the time). Files Whisker can't clean (HEIC, AVIF, RAW, PDF, Office documents and the
   like, or video when ffmpeg is missing) are held back with a message instead of being
   sent as they are; turn the setting off to send them anyway.
 - **Links you can click.** Web addresses in messages are shown as links; click one to open
@@ -313,9 +319,11 @@ operating system and the **Wisp** browser.
   rich text needed. (Text with a link in it can't be drag-selected; *Copy whole message*
   copies it.)
 - **Links show where they go.** A link whose text isn't its address shows the real site
-  next to it.
-- **Notifications from hidden vaults** only ever say "New message": who and where are
-  shown only for accounts in the first vault you unlocked.
+  next to it, and a clickable address is shown exactly as it will open: look-alike letters
+  in its site name are shown as `xn--…`.
+- **Notifications from hidden vaults** only ever say "New message" and aren't kept in the
+  desktop's notification history: who and where are shown only for accounts in the first
+  vault you unlocked.
 - **Android.** Screenshots and the recent-apps preview are blocked, and everything is
   kept in the app's `no_backup` folder, so it's left out of device backups.
 - **Owner-only files.** On Linux and Android the data folder and everything in it are

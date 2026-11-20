@@ -338,8 +338,23 @@ fn play_file(path: &std::path::Path, video: bool) {
     if video {
         cmd.arg("--loop-file=inf").arg("--mute=yes");
     }
-    if cmd.arg(path).spawn().is_err() {
-        open_file(path);
+    match cmd.arg(path).spawn() {
+        Ok(child) => EXTERNAL_PLAYERS.lock().unwrap().push(child),
+        Err(_) => open_file(path),
+    }
+}
+
+/// Players Whisker started (mpv): stopped when it locks.
+static EXTERNAL_PLAYERS: std::sync::Mutex<Vec<std::process::Child>> = std::sync::Mutex::new(Vec::new());
+
+/// Stops everything that plays or records: locking mustn't leave a hidden
+/// vault's video playing out loud, or the microphone open.
+fn stop_all_media(ui: &slint::Weak<AppWindow>) {
+    player::stop(ui);
+    voice::cancel();
+    for mut c in EXTERNAL_PLAYERS.lock().unwrap().drain(..) {
+        let _ = c.kill();
+        let _ = c.wait();
     }
 }
 
@@ -1094,6 +1109,9 @@ impl Ctl {
 
     async fn lock(&self) {
         self.locks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // First: sound and the microphone stop at once.
+        let ui = self.ui.clone();
+        let _ = tokio::task::spawn_blocking(move || stop_all_media(&ui)).await;
         let agents = std::mem::take(&mut self.st.lock().unwrap().agents);
         for a in agents.into_values() {
             a.abort();
@@ -1105,6 +1123,7 @@ impl Ctl {
         self.avatars.lock().unwrap().clear();
         self.ui(|u| {
             ui::with(|m| m.clear());
+            u.set_recording(false);
             u.set_screen(0);
             u.set_current_account(s(""));
             u.set_current_room(s(""));
@@ -2919,6 +2938,24 @@ impl Ctl {
             u.set_files_loading(loading);
             u.set_files_shown(true);
         });
+    }
+
+    /// Opens a web link in the browser, unless the open account uses a
+    /// proxy: the browser doesn't, so the site would see your real address
+    /// (for an account kept behind Tor, the one thing it's hiding). Then
+    /// the link is copied instead, to paste into Tor Browser or the like.
+    async fn open_web_link(&self, url: String) {
+        let account = self.st.lock().unwrap().account;
+        let proxied = match account {
+            Some(a) => self.mgr.details(a).await.and_then(|d| d.1).is_some(),
+            None => false,
+        };
+        if proxied {
+            self.ui(move |u| u.invoke_copy_text(s(url)));
+            self.status("Link copied, not opened: this account uses a proxy and your browser doesn't, so the site would see your real address. Paste it into a browser that uses the same proxy (Tor Browser for Tor).");
+        } else {
+            open_link(&url);
+        }
     }
 
     async fn load_older(&self) {
@@ -5225,7 +5262,8 @@ impl Ctl {
             return;
         }
         // A hidden vault's rooms and people must not reach the desktop's
-        // notification history (or a locked screen): just "New message".
+        // notification history (or a locked screen): just "New message",
+        // and not kept in that history at all.
         let hidden = me.is_some_and(|a| self.st.lock().unwrap().main_vault.as_ref().is_some_and(|m| m != &a.vault));
         let detail = if hidden && detail != notify::Detail::Off { notify::Detail::Nothing } else { detail };
         let Some(client) = self.mgr.client(account).await else { return };
@@ -5250,7 +5288,7 @@ impl Ctl {
         let Some((summary, text)) = notify::content(detail, &who, &room_name, direct, &text) else { return };
         // One notification per room: a newer message replaces it.
         let replaces = self.st.lock().unwrap().notified.get(&key).filter(|(_, t)| t.elapsed() < Duration::from_secs(300)).map_or(0, |n| n.0);
-        if let Ok(Some(id)) = tokio::task::spawn_blocking(move || notify::show(&summary, &text, replaces)).await {
+        if let Ok(Some(id)) = tokio::task::spawn_blocking(move || notify::show(&summary, &text, replaces, hidden)).await {
             self.st.lock().unwrap().notified.insert(key, (id, Instant::now()));
         }
     }
@@ -6940,7 +6978,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
                 let c2 = c.clone();
                 c.spawn(async move { c2.open_preview(target, via).await });
             }
-            None => open_link(&l),
+            None => {
+                let c2 = c.clone();
+                c.spawn(async move { c2.open_web_link(l.to_string()).await });
+            }
         });
     }
     {

@@ -1582,9 +1582,12 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Your AI accounts and the other accounts in the same vault mark each
-    /// other verified, so their messages don't show as unverified. Two
-    /// people-accounts never do: that would tie alts together. Nor do
+    /// Your people-accounts mark the AI accounts in the same vault verified,
+    /// so the AI's messages don't show as unverified to you. Only that way
+    /// round: a signature of someone else's identity stays private to the
+    /// signer's own server, but an AI signing several people-accounts would
+    /// put them all on the AI's server, showing they share an owner. Two
+    /// people-accounts never do either: that would tie alts together. Nor do
     /// accounts in different vaults: a cross-signing signature is uploaded
     /// to the server (and the other account's id lands in this one's key
     /// store), so an AI in the main vault vouching for an account in a
@@ -1648,6 +1651,8 @@ pub fn proxy_url(p: &str) -> String {
     let p = p.trim();
     match p.get(..9) {
         Some(head) if head.eq_ignore_ascii_case("socks5://") => format!("socks5h://{}", &p[9..]),
+        // Likewise socks4a: names resolved by the proxy, not locally.
+        Some(head) if head.eq_ignore_ascii_case("socks4://") => format!("socks4a://{}", &p[9..]),
         _ => p.to_owned(),
     }
 }
@@ -1723,13 +1728,14 @@ impl Drop for AbortOnDrop {
 }
 
 /// Which accounts vouch for which (indexes into `accounts`: kind and vault):
-/// an AI and another account, both in the same vault. Never two
+/// a people-account for an AI in the same vault. Never an AI for anyone
+/// (its server would hold signatures of all your accounts), never two
 /// people-accounts, never across vaults.
 fn vouch_pairs(accounts: &[(AccountKind, &str)]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for (i, (ka, va)) in accounts.iter().enumerate() {
         for (j, (kb, vb)) in accounts.iter().enumerate() {
-            if i != j && va == vb && (*ka == AccountKind::Agent || *kb == AccountKind::Agent) {
+            if i != j && va == vb && *ka == AccountKind::Human && *kb == AccountKind::Agent {
                 out.push((i, j));
             }
         }
@@ -1746,6 +1752,7 @@ mod vouch_tests {
         assert_eq!(proxy_url("socks5://127.0.0.1:9050"), "socks5h://127.0.0.1:9050");
         assert_eq!(proxy_url(" SOCKS5://h:1 "), "socks5h://h:1");
         assert_eq!(proxy_url("socks5h://h:1"), "socks5h://h:1");
+        assert_eq!(proxy_url("socks4://h:1"), "socks4a://h:1");
         assert_eq!(proxy_url("http://h:8080"), "http://h:8080");
     }
 
@@ -1755,7 +1762,11 @@ mod vouch_tests {
         // main: a person and an AI; hidden: an alt and its own AI.
         let accounts = [(Human, "main"), (Agent, "main"), (Human, "hidden"), (Agent, "hidden")];
         let pairs = vouch_pairs(&accounts);
-        assert_eq!(pairs, vec![(0, 1), (1, 0), (2, 3), (3, 2)]);
+        assert_eq!(pairs, vec![(0, 1), (2, 3)]);
+        // An AI never signs anyone: with two people in its vault, its
+        // server would see both.
+        let pairs = vouch_pairs(&[(Agent, "main"), (Human, "main"), (Human, "main")]);
+        assert_eq!(pairs, vec![(1, 0), (2, 0)]);
         // Two people never, even in one vault.
         assert!(vouch_pairs(&[(Human, "main"), (Human, "main")]).is_empty());
     }

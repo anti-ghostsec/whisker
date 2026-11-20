@@ -43,12 +43,16 @@ fn escape(s: &str) -> String {
 }
 
 /// Shows (or, with the id a previous call returned, replaces) a notification.
+/// A `transient` one isn't kept in the desktop's notification history.
 #[cfg(target_os = "linux")]
-pub fn show(summary: &str, body: &str, replaces: u32) -> Option<u32> {
+pub fn show(summary: &str, body: &str, replaces: u32, transient: bool) -> Option<u32> {
     use std::collections::HashMap;
     use zbus::zvariant::Value;
     let conn = zbus::blocking::Connection::session().ok()?;
-    let hints: HashMap<&str, Value> = HashMap::from([("category", Value::from("im.received")), ("desktop-entry", Value::from("whisker"))]);
+    let mut hints: HashMap<&str, Value> = HashMap::from([("category", Value::from("im.received")), ("desktop-entry", Value::from("whisker"))]);
+    if transient {
+        hints.insert("transient", Value::from(true));
+    }
     let reply = conn
         .call_method(
             Some("org.freedesktop.Notifications"),
@@ -63,7 +67,7 @@ pub fn show(summary: &str, body: &str, replaces: u32) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn show(_summary: &str, _body: &str, _replaces: u32) -> Option<u32> {
+pub fn show(_summary: &str, _body: &str, _replaces: u32, _transient: bool) -> Option<u32> {
     None
 }
 

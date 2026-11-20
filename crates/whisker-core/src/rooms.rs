@@ -87,6 +87,8 @@ async fn directly(client: &Client, server: &str, search: &str, since: Option<Str
             .ok()
             .and_then(|w| w.homeserver)
             .map(|h| h.base_url.trim_end_matches('/').to_owned())
+            // Never from https down to plain http.
+            .filter(|b| b.starts_with("https://") || origin.starts_with("http://"))
             .unwrap_or_else(|| origin.clone()),
         _ => origin.clone(),
     };

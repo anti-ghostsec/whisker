@@ -487,10 +487,18 @@ impl Relay {
     pub async fn serve(file: Arc<RemoteFile>) -> Result<Relay> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let secret = crate::vault::random_secret()[..32].to_owned();
-        let url = format!("http://{}/{secret}", listener.local_addr()?);
+        let here = listener.local_addr()?;
+        let url = format!("http://{here}/{secret}");
         let task = tokio::spawn(async move {
             let mut conns = tokio::task::JoinSet::new();
-            while let Ok((sock, _)) = listener.accept().await {
+            while let Ok((sock, peer)) = listener.accept().await {
+                // The address (secret and all) is on ffmpeg's command line,
+                // which other users of this computer can read: only this
+                // user's programs are answered.
+                if !same_user(here, peer) {
+                    tracing::warn!("relay: refused a connection from another user's program");
+                    continue;
+                }
                 let (file, secret) = (file.clone(), secret.clone());
                 conns.spawn(async move {
                     if let Err(e) = relay_one(sock, &file, &secret).await {
@@ -501,6 +509,36 @@ impl Relay {
         });
         Ok(Relay { url, task })
     }
+}
+
+/// Whether the program at `peer`, connected to our listener at `here`, runs
+/// as this user. On Linux the kernel's socket table (`/proc/net/tcp`) says
+/// whose each socket is. Elsewhere (and when it can't be read) yes: Android
+/// hides other apps' command lines, and the secret is all they'd need.
+fn same_user(here: std::net::SocketAddr, peer: std::net::SocketAddr) -> bool {
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    {
+        // SAFETY: getuid has no preconditions and can't fail.
+        let me = unsafe { libc::getuid() };
+        let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else { return true };
+        socket_owner(&table, peer.port(), here.port()).is_none_or(|uid| uid == me)
+    }
+    #[cfg(not(all(target_os = "linux", not(target_os = "android"))))]
+    {
+        let _ = (here, peer);
+        true
+    }
+}
+
+/// The owner (uid) of the socket going from local port `from` to remote
+/// port `to`, in a `/proc/net/tcp` table.
+#[cfg_attr(not(all(target_os = "linux", not(target_os = "android"))), allow(dead_code))]
+fn socket_owner(table: &str, from: u16, to: u16) -> Option<u32> {
+    table.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let port = |a: &str| a.rsplit_once(':').and_then(|(_, p)| u16::from_str_radix(p, 16).ok());
+        (port(f.get(1)?)? == from && port(f.get(2)?)? == to).then(|| f.get(7)?.parse().ok()).flatten()
+    })
 }
 
 /// Answers one request from ffmpeg with that piece of the file.
@@ -773,6 +811,16 @@ fn message_for(mxc: &MxcUri, file: &LinkedFile, details: &Details) -> MessageTyp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finds_whose_socket_it_is() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:D431 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1001        0 123 1
+   1: 0100007F:9C40 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 124 1";
+        assert_eq!(super::socket_owner(table, 0xD431, 0x9C40), Some(1001));
+        assert_eq!(super::socket_owner(table, 0x9C40, 0xD431), Some(1000));
+        assert_eq!(super::socket_owner(table, 1, 2), None);
+    }
+
     use super::*;
 
     #[test]

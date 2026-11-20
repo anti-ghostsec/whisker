@@ -3153,6 +3153,11 @@ impl Ctl {
         // Show it straight away (dimmed), then swap in the server's copy.
         let me = room.own_user_id().to_owned();
         let account = self.mgr.accounts().await.into_iter().find(|a| a.id == key.0);
+        // As the server's copy will show it: your name and picture in this
+        // room (always saved here), else your account's. The account's could
+        // still be loading, which left the name and picture blank until the
+        // server's copy came.
+        let mine = timeline::member_profile(&room, &me).await;
         let local = OwnedEventId::try_from(format!("{}{}", timeline::LOCAL_ECHO, &whisker_core::vault::random_secret()[..12]))
             .expect("valid local event id");
         // People picked from @-suggestions, still named in the text.
@@ -3160,8 +3165,8 @@ impl Ctl {
         let item = HistoryItem {
             event_id: local.clone(),
             sender: me,
-            sender_name: account.as_ref().and_then(|a| a.profile_name.clone()),
-            sender_avatar: account.and_then(|a| a.avatar),
+            sender_name: mine.0.or_else(|| account.as_ref().and_then(|a| a.profile_name.clone())),
+            sender_avatar: mine.1.or_else(|| account.and_then(|a| a.avatar)),
             body: text.clone(),
             ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch::now(),
             reply_to: reply_to.clone(),
@@ -5867,12 +5872,17 @@ impl Ctl {
         }
         let me = room.own_user_id().to_owned();
         let account = self.mgr.accounts().await.into_iter().find(|a| a.id == key.0);
+        // As the server's copy will show it: your name and picture in this
+        // room (always saved here), else your account's. The account's could
+        // still be loading, which left the name and picture blank until the
+        // server's copy came.
+        let mine = timeline::member_profile(&room, &me).await;
         let Ok(local) = OwnedEventId::try_from(format!("{}{}", timeline::LOCAL_ECHO, &whisker_core::vault::random_secret()[..12])) else { return };
         let item = HistoryItem {
             event_id: local.clone(),
             sender: me,
-            sender_name: account.as_ref().and_then(|a| a.profile_name.clone()),
-            sender_avatar: account.and_then(|a| a.avatar),
+            sender_name: mine.0.or_else(|| account.as_ref().and_then(|a| a.profile_name.clone())),
+            sender_avatar: mine.1.or_else(|| account.and_then(|a| a.avatar)),
             body: text.clone(),
             ts: MilliSecondsSinceUnixEpoch::now(),
             reply_to: None,

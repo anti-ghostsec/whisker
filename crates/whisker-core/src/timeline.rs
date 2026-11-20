@@ -112,8 +112,9 @@ pub struct HistoryItem {
     /// Room events: what exactly changed, one line per value (shown in
     /// developer mode; see `notices::changes`).
     pub details: Vec<String>,
-    /// A room event with no sentence of its own ("… sent m.room.x"):
-    /// shown in developer mode only.
+    /// A room event with no sentence of its own ("… sent m.room.x"), or a
+    /// hidden event (see `hidden_item`): shown in developer mode, or with
+    /// "Show hidden events".
     pub dev_only: bool,
 }
 
@@ -790,7 +791,15 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
                 }
                 continue;
             }
-            _ => continue,
+            // Doesn't read as the event it says it is: other apps show
+            // nothing, so it can hide text.
+            Err(_) => {
+                if let Some(item) = hidden_item(room, ev.raw(), &mut profiles).await {
+                    out.push(item);
+                }
+                continue;
+            }
+            Ok(_) => continue,
         };
         let (event_id, sender, ts, parsed) = match m {
             AnySyncMessageLikeEvent::Reaction(SyncMessageLikeEvent::Original(r)) => {
@@ -809,7 +818,12 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
                 let body = format!("{UNDECRYPTABLE} ({why})");
                 (m.event_id, m.sender, m.origin_server_ts, Parsed::New { body, is_text: false, reply_to: None, media: None, thread: None, pills: Vec::new() })
             }
-            _ => continue,
+            _ => {
+                if let Some(item) = hidden_item(room, ev.raw(), &mut profiles).await {
+                    out.push(item);
+                }
+                continue;
+            }
         };
         let (body, reply_to, media, thread, pills) = match parsed {
             // Keyed by who sent the edit: only the message's own sender's counts.
@@ -845,6 +859,61 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     }
     out.reverse();
     Ok((out, reactions, if at_start { None } else { msgs.end }, created, gone))
+}
+
+/// An event other apps don't show, for "Show hidden events": a message
+/// type they don't know (anyone can make one up and put text in it, and
+/// other apps then show nothing), or a message that doesn't read as what it
+/// says it is. Shown as a message with its type and text. Reactions,
+/// deletions, deleted events and the kinds shown anyway are left out.
+pub async fn hidden_item(
+    room: &Room,
+    raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>,
+    profiles: &mut HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)>,
+) -> Option<HistoryItem> {
+    let kind = raw.get_field::<String>("type").ok().flatten()?;
+    if raw.get_field::<serde_json::Value>("state_key").ok().flatten().is_some() || matches!(kind.as_str(), "m.reaction" | "m.room.redaction" | "m.room.encrypted") {
+        return None;
+    }
+    // Messages and stickers that read fine are shown as they are.
+    if matches!(kind.as_str(), "m.room.message" | "m.sticker") && matches!(raw.deserialize(), Ok(AnySyncTimelineEvent::MessageLike(_))) {
+        return None;
+    }
+    let event_id = raw.get_field::<OwnedEventId>("event_id").ok().flatten()?;
+    let sender = raw.get_field::<OwnedUserId>("sender").ok().flatten()?;
+    let ts = raw.get_field::<MilliSecondsSinceUnixEpoch>("origin_server_ts").ok().flatten()?;
+    let content = raw.get_field::<serde_json::Value>("content").ok().flatten().unwrap_or_default();
+    // Deleted: nothing left to see.
+    if content.as_object().is_none_or(|o| o.is_empty()) {
+        return None;
+    }
+    let text = match content.get("body").and_then(serde_json::Value::as_str) {
+        Some(b) => b.to_owned(),
+        None => content.to_string(),
+    };
+    let text: String = text.chars().take(2000).collect();
+    if !profiles.contains_key(&sender) {
+        profiles.insert(sender.clone(), member_profile(room, &sender).await);
+    }
+    let (sender_name, sender_avatar) = profiles[&sender].clone();
+    Some(HistoryItem {
+        event_id,
+        sender,
+        sender_name,
+        sender_avatar,
+        body: format!("Hidden event ({kind}): {text}"),
+        ts,
+        reply_to: None,
+        media: None,
+        edited: false,
+        notice: false,
+        member: None,
+        thread: None,
+        pills: Vec::new(),
+        shield: None,
+        details: Vec::new(),
+        dev_only: true,
+    })
 }
 
 /// A room (state) event from the timeline. Reads `prev_content` from the top

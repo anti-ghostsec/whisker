@@ -908,6 +908,18 @@ impl AccountManager {
             }
         });
 
+        // Events other apps don't show (made-up types, ones that don't read
+        // as what they say), for "Show hidden events".
+        let tx = self.events.clone();
+        client.add_event_handler(move |raw: matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnySyncTimelineEvent>, room: Room| {
+            let tx = tx.clone();
+            async move {
+                if let Some(item) = timeline::hidden_item(&room, &raw, &mut HashMap::new()).await {
+                    let _ = tx.send(ClientEvent::Notice { account, room_id: room.room_id().to_owned(), item: Box::new(item) });
+                }
+            }
+        });
+
         let sync_client = client.clone();
         let tx = self.events.clone();
         let keys_client = client.clone();

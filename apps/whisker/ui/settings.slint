@@ -238,6 +238,7 @@ component MenuToggle inherits HorizontalLayout {
 component GeneralPage inherits VerticalLayout {
     in-out property <int> theme;
     callback set-show-events(bool);
+    callback set-show-hidden(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -294,6 +295,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.show-events;
                 toggled => { root.set-show-events(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Show hidden events"; color: Theme.text; }
+                Text {
+                    text: "Events other apps don't show: made-up event types and messages that don't read as messages. They can carry text no one else sees; with this on they show up as messages marked \"Hidden event\".";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.show-hidden;
+                toggled => { root.set-show-hidden(self.checked); }
             }
         }
         HorizontalLayout {
@@ -1355,6 +1372,7 @@ export component SettingsPage inherits Rectangle {
     callback set-theme(int);
     callback set-auto-lock(int);
     callback set-show-events(bool);
+    callback set-show-hidden(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -1461,6 +1479,7 @@ export component SettingsPage inherits Rectangle {
                             set-theme(t) => { root.set-theme(t); }
                             set-auto-lock(i) => { root.set-auto-lock(i); }
                             set-show-events(b) => { root.set-show-events(b); }
+                            set-show-hidden(b) => { root.set-show-hidden(b); }
                             set-dev-mode(b) => { root.set-dev-mode(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-key-sharing(i) => { root.set-key-sharing(i); }

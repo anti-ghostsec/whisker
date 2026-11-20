@@ -50,6 +50,10 @@ pub struct AppSettings {
     /// no sentence of their own.
     #[serde(default)]
     pub developer_mode: bool,
+    /// Show events other apps don't (made-up event types, messages that
+    /// don't read as messages): they can carry text no one else sees.
+    #[serde(default)]
+    pub show_hidden: bool,
     /// Notifications: 0 off, 1 just "New message", 2 sender and room, 3 with text.
     #[serde(default = "two")]
     pub notify_level: i32,

@@ -44,6 +44,7 @@ export global Prefs {
     in-out property <string> clear-command: "/clear";
     // Joins, leaves, renames and other room events in the timeline.
     in-out property <bool> show-events: false;
+    in-out property <bool> show-hidden: false;
     // Room events in full detail (and the ones with no sentence of their own).
     in-out property <bool> dev-mode: false;
     // 0 off, 1 "New message" only, 2 sender and room, 3 with message text.
@@ -83,7 +84,7 @@ export global Prefs {
     // Which entries the message right-click menu shows.
     in-out property <bool> menu-react: true;
     in-out property <bool> menu-reply: true;
-    in-out property <bool> menu-thread: false;
+    in-out property <bool> menu-thread: true;
     in-out property <bool> menu-forward: true;
     in-out property <bool> menu-quote: false;
     in-out property <bool> menu-copy: true;

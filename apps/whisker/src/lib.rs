@@ -1402,7 +1402,7 @@ impl Ctl {
         let marks = self.st.lock().unwrap().marks.get(key).cloned().unwrap_or_default();
         let (show_events, dev_mode) = {
             let p = self.settings.lock().unwrap();
-            (p.show_events || p.developer_mode, p.developer_mode)
+            (p.show_events || p.developer_mode, p.developer_mode || p.show_hidden)
         };
         let st = self.st.lock().unwrap();
         let mut msgs = st.messages.get(key).cloned().unwrap_or_default();
@@ -5472,6 +5472,18 @@ impl Ctl {
         self.spawn(async move { c.show_messages().await });
     }
 
+    fn set_show_hidden(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.show_hidden = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_show_hidden(on);
+        }
+        let c = self.clone();
+        self.spawn(async move { c.show_messages().await });
+    }
+
     fn set_show_events(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.show_events = on;
@@ -6347,7 +6359,7 @@ impl Ctl {
                     let key = (account, room_id);
                     if self.st.lock().unwrap().older.contains_key(&key) {
                         self.merge(&key, vec![*item]);
-                        if self.current().as_ref() == Some(&key) && { let p = self.settings.lock().unwrap(); p.show_events || p.developer_mode } {
+                        if self.current().as_ref() == Some(&key) && { let p = self.settings.lock().unwrap(); p.show_events || p.developer_mode || p.show_hidden } {
                             self.append_last(&key).await;
                         }
                     }
@@ -6727,6 +6739,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     #[cfg(target_os = "android")]
     ui.on_to_background(droid::to_background);
     ui.global::<Prefs>().set_show_events(prefs.show_events);
+    ui.global::<Prefs>().set_show_hidden(prefs.show_hidden);
     ui.global::<Prefs>().set_dev_mode(prefs.developer_mode);
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_key_sharing(prefs.key_sharing.clamp(0, 2));
@@ -7028,6 +7041,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     }
     {
         let c = ctl.clone();
+        ui.on_set_show_hidden(move |b| c.set_show_hidden(b));
+    }
+    {
+        let c = ctl.clone();
         ui.on_set_dev_mode(move |b| c.set_dev_mode(b));
     }
     {
@@ -7249,7 +7266,7 @@ static VISION: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Shows the message menu entries that aren't in `hidden`.
 /// Message menu entries that are off until turned on in Settings.
-const MENU_OFF_BY_DEFAULT: &[&str] = &["thread", "quote", "open-media", "copy-link", "profile", "copy-id", "source"];
+const MENU_OFF_BY_DEFAULT: &[&str] = &["quote", "open-media", "copy-link", "profile", "copy-id", "source"];
 
 /// Whether a message menu entry shows. `hidden` holds the entries turned
 /// off, and "+entry" for ones that are off by default but turned on.

@@ -6011,6 +6011,12 @@ impl Ctl {
             match ev {
                 ClientEvent::AccountsChanged => self.refresh_accounts().await,
                 ClientEvent::Synced { account } => {
+                    // Back in touch: a "can't reach" from a moment ago is over.
+                    self.ui(|u| {
+                        if u.get_status() == OFFLINE {
+                            u.set_status(s(""));
+                        }
+                    });
                     let first = self.st.lock().unwrap().synced.insert(account);
                     if first {
                         self.refresh_accounts().await;
@@ -6366,6 +6372,9 @@ fn emoji_rows(list: &[&str]) -> ModelRc<EmojiRow> {
     ModelRc::new(VecModel::from(rows))
 }
 
+/// Shown while syncing fails to connect; cleared by the next sync that works.
+const OFFLINE: &str = "Can't reach the server right now; retrying.";
+
 /// Background errors, shortened for the status line: network errors quote
 /// the whole request URL (access filters and all), which says nothing useful.
 fn tidy_error(message: &str) -> String {
@@ -6375,7 +6384,7 @@ fn tidy_error(message: &str) -> String {
         m.replace_range(start..end, "");
     }
     if m.starts_with("error sending request") {
-        return "Can't reach the server right now; retrying.".to_owned();
+        return OFFLINE.to_owned();
     }
     m
 }

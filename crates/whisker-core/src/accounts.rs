@@ -873,12 +873,16 @@ impl AccountManager {
             // coming and going together, which ties alts to each other.
             let settings = SyncSettings::default().filter(filter.into()).set_presence(matrix_sdk::ruma::presence::PresenceState::Offline);
             // `sync_with_callback` only returns on an error; back off and keep going.
+            // Starts short again after syncing has worked, so one dropped
+            // connection now and then doesn't leave later ones waiting a minute.
             let mut delay = 1u64;
+            let worked = Arc::new(std::sync::atomic::AtomicBool::new(false));
             loop {
-                let (tx2, c2) = (tx.clone(), sync_client.clone());
+                let (tx2, c2, worked2) = (tx.clone(), sync_client.clone(), worked.clone());
                 let res = sync_client
                     .sync_with_callback(settings.clone(), move |resp| {
                         let (tx, c) = (tx2.clone(), c2.clone());
+                        worked2.store(true, std::sync::atomic::Ordering::Relaxed);
                         async move {
                             // Room events that just happened (in the timeline, not the
                             // room's full state) become notices: "Alice joined".
@@ -899,6 +903,9 @@ impl AccountManager {
                     .await;
                 if let Err(e) = res {
                     let _ = tx.send(ClientEvent::AccountError { account, message: e.to_string() });
+                }
+                if worked.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    delay = 1;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 delay = (delay * 2).min(60);

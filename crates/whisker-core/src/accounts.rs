@@ -931,17 +931,34 @@ impl AccountManager {
             mgr.vouch_own().await;
         });
 
-        // Fetch the profile in the background; the list updates when it lands.
+        // Fetch the profile in the background; the list updates when it
+        // lands. Asked again (less and less often) until the server answers:
+        // a request lost while all the accounts connect at once used to leave
+        // the account without its name and picture until it was edited.
         let (mgr, c) = (self.clone(), client);
         tokio::spawn(async move {
             let acc = c.account();
-            let name = acc.get_display_name().await.ok().flatten();
-            let avatar = acc.get_avatar_url().await.ok().flatten();
-            if let Some(l) = mgr.inner.write().await.live.get_mut(&account) {
-                l.profile_name = name;
-                l.avatar = avatar;
+            let mut wait = 5u64;
+            loop {
+                let (name, avatar) = tokio::join!(acc.get_display_name(), acc.get_avatar_url());
+                let answered = name.is_ok() && avatar.is_ok();
+                {
+                    let mut inner = mgr.inner.write().await;
+                    let Some(l) = inner.live.get_mut(&account) else { return };
+                    if let Ok(n) = name {
+                        l.profile_name = n;
+                    }
+                    if let Ok(a) = avatar {
+                        l.avatar = a;
+                    }
+                }
+                let _ = mgr.events.send(ClientEvent::AccountsChanged);
+                if answered {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                wait = (wait * 2).min(300);
             }
-            let _ = mgr.events.send(ClientEvent::AccountsChanged);
         });
     }
 

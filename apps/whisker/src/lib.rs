@@ -6343,7 +6343,9 @@ impl Uploads {
         let now: Vec<String> = self
             .active
             .values()
-            .map(|(n, p)| format!("{n} {p}%"))
+            // All of it sent: the server is still taking it in (and the
+            // message goes after), which can take a while for a big file.
+            .map(|(n, p)| if *p >= 100 { format!("{n}: the server is saving it") } else { format!("{n} {p}%") })
             .collect();
         match (self.total, now.is_empty()) {
             (1, false) => format!("Uploading {}…", now[0]),

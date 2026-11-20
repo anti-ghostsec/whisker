@@ -353,7 +353,7 @@ pub async fn rooms(client: &Client) -> Vec<RoomSummary> {
             room_id: room.room_id().to_owned(),
             name: room_name(&room).await,
             invite,
-            avatar: room.avatar_url(),
+            avatar: room_avatar(&room).await,
             topic: room.topic(),
             encrypted: room.encryption_state().is_encrypted(),
             unread: room.unread_notification_counts().notification_count,
@@ -565,6 +565,20 @@ pub async fn room_name(room: &Room) -> String {
         },
     };
     plain_name(&name)
+}
+
+/// A room's picture: its own, or for a chat with one other person (a DM,
+/// or a room of two) without one, theirs, as other clients show it.
+pub async fn room_avatar(room: &Room) -> Option<OwnedMxcUri> {
+    if let Some(a) = room.avatar_url() {
+        return Some(a);
+    }
+    let me = room.own_user_id().to_owned();
+    let mut other = room.direct_targets().iter().find_map(|t| t.as_user_id().filter(|u| u.as_str() != me.as_str()).map(ToOwned::to_owned));
+    if other.is_none() && room.active_members_count() <= 2 {
+        other = room.heroes().await.into_iter().map(|h| h.user_id).find(|u| *u != me);
+    }
+    member_profile(room, &other?).await.1
 }
 
 /// Display name and avatar of a room member, from the local store.

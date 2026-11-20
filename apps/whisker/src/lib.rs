@@ -134,6 +134,8 @@ struct State {
     last_activity: Option<Instant>,
     refresh_pending: bool,
     synced: HashSet<AccountId>,
+    /// Accounts whose last sync couldn't reach their server.
+    offline: HashSet<AccountId>,
     detected: HashMap<AccountId, Detected>,
     /// The last notification shown per room, so a new one replaces it.
     notified: HashMap<RoomKey, (u32, Instant)>,
@@ -6281,12 +6283,20 @@ impl Ctl {
             match ev {
                 ClientEvent::AccountsChanged => self.refresh_accounts().await,
                 ClientEvent::Synced { account } => {
-                    // Back in touch: a "can't reach" from a moment ago is over.
-                    self.ui(|u| {
-                        if u.get_status() == OFFLINE {
-                            u.set_status(s(""));
-                        }
-                    });
+                    // Back in touch: a "can't reach" from a moment ago is over,
+                    // unless it's the account being looked at that's still out.
+                    let still = {
+                        let mut st = self.st.lock().unwrap();
+                        st.offline.remove(&account);
+                        st.account.is_some_and(|a| st.offline.contains(&a))
+                    };
+                    if !still {
+                        self.ui(|u| {
+                            if u.get_status() == OFFLINE {
+                                u.set_status(s(""));
+                            }
+                        });
+                    }
                     let first = self.st.lock().unwrap().synced.insert(account);
                     if first {
                         self.refresh_accounts().await;
@@ -6401,7 +6411,20 @@ impl Ctl {
                     let c = self.clone();
                     self.spawn(async move { c.on_verification(account, user, flow_id, state).await });
                 }
-                ClientEvent::AccountError { message, .. } => self.status(tidy_error(&message)),
+                ClientEvent::AccountError { account, message } => {
+                    let message = tidy_error(&message);
+                    if message == OFFLINE {
+                        // Said only for the account being looked at: another
+                        // account's server (or proxy) being out of reach kept
+                        // putting it back while this one worked fine.
+                        self.st.lock().unwrap().offline.insert(account);
+                        if selected(account) {
+                            self.status(message);
+                        }
+                    } else {
+                        self.status(message);
+                    }
+                }
             }
         }
     }

@@ -749,6 +749,21 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     let mut out = Vec::new();
     let mut edits: HashMap<(OwnedEventId, OwnedUserId), String> = HashMap::new();
     let mut profiles: HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)> = HashMap::new();
+    // Names and pictures of this page's senders, as the server sends them
+    // along. Members are loaded lazily, so people who haven't spoken lately
+    // often aren't saved here yet; what's saved is used first.
+    for raw in &msgs.state {
+        use matrix_sdk::ruma::events::{AnyStateEvent, StateEvent};
+        let Ok(AnyStateEvent::RoomMember(StateEvent::Original(m))) = raw.deserialize() else { continue };
+        let Ok(user) = OwnedUserId::try_from(m.state_key.as_str()) else { continue };
+        let saved = member_profile(room, &user).await;
+        let p = if saved.0.is_some() || saved.1.is_some() {
+            saved
+        } else {
+            (m.content.displayname.as_deref().map(plain_name).filter(|n| !n.trim().is_empty()), m.content.avatar_url)
+        };
+        profiles.insert(user, p);
+    }
     // No `end` token, or a page with nothing on it, means the server has
     // nothing older: either the start of the room or the start of what we're
     // allowed to see (some servers hand out a token even then). A short page

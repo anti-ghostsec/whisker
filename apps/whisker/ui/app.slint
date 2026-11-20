@@ -2329,6 +2329,8 @@ export component AppWindow inherits Window {
         focus-on-click: false;
         init => { if Prefs.touch { self.focus(); } }
         capture-key-pressed(e) => {
+            // Any key counts as use for auto-lock, not only clicks.
+            root.activity();
             if e.text != Key.Back { return reject; }
             if !root.go-back() { root.to-background(); }
             self.focus();
@@ -2758,6 +2760,8 @@ export component AppWindow inherits Window {
                             changed content-height => { self.settle(); }
                             changed visible-height => { self.settle(); }
                             scrolled => {
+                                // Reading counts as use for auto-lock.
+                                root.activity();
                                 if Prefs.touch && abs(self.content-y - self.blur-from) > 24px { root.blur-request += 1; }
                                 root.stick-bottom = self.content-y <= self.visible-height - self.content-height + 40px;
                                 self.from-bottom = max(0px, self.content-height + self.content-y - self.visible-height);

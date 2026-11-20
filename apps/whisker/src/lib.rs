@@ -5514,6 +5514,8 @@ impl Ctl {
     /// The draft changed: offer @-mentions or :emoji: for the word being
     /// typed, and say we're typing if that's on.
     async fn draft_edited(&self, text: String) {
+        // Typing counts as use for auto-lock.
+        self.touch();
         // A finished `:name:` becomes its emoji straight away.
         let word = last_word(&text);
         if let Some(e) = word

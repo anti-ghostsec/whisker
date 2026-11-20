@@ -34,7 +34,7 @@ pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), Strin
     let started = Instant::now();
     while !stop.load(Ordering::SeqCst) && started.elapsed() < MAX_LENGTH {
         // SAFETY: `buf` holds `buf.len()` samples, one channel.
-        let n = unsafe { stream.read(buf.as_mut_ptr().cast(), buf.len() as i32, 100_000_000) };
+        let n = frames_done(unsafe { stream.read(buf.as_mut_ptr().cast(), buf.len() as i32, 100_000_000) });
         match n {
             Ok(0) => {}
             Ok(n) => {

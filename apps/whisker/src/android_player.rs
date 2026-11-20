@@ -28,6 +28,19 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// What an AAudio read or write did. The `ndk` crate reports every result
+/// but zero as an error, frame counts too, so a read or write that moved
+/// sound looks like a failure; the count is taken back out of it here.
+fn frames_done(r: Result<u32, ndk::audio::AudioError>) -> Result<u32, ndk::audio::AudioError> {
+    match r {
+        Err(e) => match i32::from(e) {
+            n if n >= 0 => Ok(n as u32),
+            _ => Err(e),
+        },
+        ok => ok,
+    }
+}
+
 /// Most frames a second shown (the decoder may make more; they're skipped).
 const FPS: f64 = 30.0;
 /// Widest and tallest frame drawn, in the message and in the large view.
@@ -964,7 +977,7 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
                 while done < frames && current(generation) {
                     let from = data[(done as usize) * 2 * channels.max(1) as usize..].as_ptr().cast();
                     // SAFETY: `from` points at `frames - done` whole frames of 16-bit sound in `data`.
-                    match unsafe { s.write(from, frames - done, 100_000_000) } {
+                    match frames_done(unsafe { s.write(from, frames - done, 100_000_000) }) {
                         Ok(n) => done += n as i32,
                         Err(_) => break,
                     }

@@ -1014,11 +1014,12 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
                 let raw = &out.buffer()[offset..(offset + size).min(out.buffer().len())];
                 // Below full level, the samples are scaled down here.
                 let level = if muted { 0 } else { crate::ui::volume() };
+                let gain = crate::ui::gain(level);
                 let scaled: Vec<u8>;
                 let data = if level < 100 {
                     scaled = raw
                         .chunks_exact(2)
-                        .flat_map(|b| ((i32::from(i16::from_le_bytes([b[0], b[1]])) * level as i32 / 100) as i16).to_le_bytes())
+                        .flat_map(|b| ((f64::from(i16::from_le_bytes([b[0], b[1]])) * gain) as i16).to_le_bytes())
                         .collect();
                     &scaled[..]
                 } else {

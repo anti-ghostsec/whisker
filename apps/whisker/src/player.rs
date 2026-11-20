@@ -293,7 +293,7 @@ fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subti
         cmd.args(["-map", "0:a:0"]);
         let level = crate::ui::volume();
         if level < 100 {
-            cmd.args(["-filter:a", &format!("volume={:.2}", f64::from(level) / 100.0)]);
+            cmd.args(["-filter:a", &format!("volume={:.5}", crate::ui::gain(level))]);
         }
         cmd.args(out);
     }
@@ -401,7 +401,7 @@ fn play_sound(ui: &Weak<AppWindow>, input: &OsStr, at: f64, muted: bool, generat
     cmd.args(["-re", "-i"]).arg(input).args(["-map", "0:a:0"]);
     let level = if muted { 0 } else { crate::ui::volume() };
     if level < 100 {
-        cmd.args(["-filter:a", &format!("volume={:.2}", f64::from(level) / 100.0)]);
+        cmd.args(["-filter:a", &format!("volume={:.5}", crate::ui::gain(level))]);
     }
     cmd.args(out);
     let Ok(child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return 0 };

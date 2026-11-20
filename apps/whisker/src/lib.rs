@@ -45,7 +45,13 @@ use whisker_core::{AccountId, AccountKind, AccountManager, AccountSummary, Clien
 
 slint::include_modules!();
 
+/// Messages kept per room while it isn't open.
 const KEEP_PER_ROOM: usize = 1000;
+/// The open room keeps everything scrolled back to (up to this many).
+const KEEP_OPEN_ROOM: usize = 50_000;
+/// After loading older messages fails (a server in the room down, say),
+/// scrolling up waits this long before asking again.
+const OLDER_RETRY: Duration = Duration::from_secs(30);
 const PAGE: u32 = 50;
 /// Opening a room draws this many of its newest messages at once, then the
 /// rest a few at a time, so a long room doesn't hold up the window.
@@ -61,6 +67,21 @@ const MAX_LINKED_PICTURE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_POSTER_VIDEO_BYTES: u64 = 200 * 1024 * 1024;
 
 type RoomKey = (AccountId, OwnedRoomId);
+
+/// The files found so far in the room whose panel is open, newest first.
+struct RoomFiles {
+    key: RoomKey,
+    items: Vec<HistoryItem>,
+    /// Where to look further back (`None` once the start is reached).
+    token: Option<String>,
+    /// Whether the server has been asked yet (before that, `token` is no answer).
+    asked: bool,
+}
+
+/// Files gathered per "Look further back": stops after this many new ones, or
+const FILES_PER_LOOK: usize = 30;
+/// this many pages of history.
+const FILES_PAGES_PER_LOOK: usize = 12;
 /// A character card and its PNG picture (if it came in one).
 type CardAndPicture = (whisker_agent::card::Card, Option<Vec<u8>>);
 
@@ -78,6 +99,10 @@ struct State {
     messages: HashMap<RoomKey, Vec<HistoryItem>>,
     /// Pagination token for older history, per room (None: reached the start).
     older: HashMap<RoomKey, Option<String>>,
+    /// When loading a room's older messages last failed.
+    older_failed: HashMap<RoomKey, Instant>,
+    /// The room panel's file list.
+    files: Option<RoomFiles>,
     /// While a room is opening: how many of its newest rows are drawn so far.
     row_limit: Option<usize>,
     /// Messages replied to that aren't loaded, fetched on their own: sender
@@ -227,6 +252,12 @@ fn fmt_when(ts: MilliSecondsSinceUnixEpoch) -> String {
         1..=6 => t.format("%a").to_string(),
         _ => t.format("%-d %b").to_string(),
     }
+}
+
+/// Whether a message goes in the room panel's file list: a file that was
+/// sent (not a link to one, and not a sticker-sized picture in the text).
+fn is_listed_file(m: &HistoryItem) -> bool {
+    m.media.as_ref().is_some_and(|x| !x.linked)
 }
 
 /// Divider text for a day: "Today", "Yesterday", "Monday 12 October".
@@ -1651,14 +1682,24 @@ impl Ctl {
     /// Adds messages to a room's cache; returns how many were new.
     fn merge(&self, key: &RoomKey, items: Vec<HistoryItem>) -> usize {
         let mut st = self.st.lock().unwrap();
+        // The open room keeps what was scrolled back to: trimming its
+        // oldest would throw away the page just loaded, and scrolling up
+        // would seem to stop.
+        let open = st.account == Some(key.0) && st.room.as_ref() == Some(&key.1);
+        let keep = if open { KEEP_OPEN_ROOM } else { KEEP_PER_ROOM };
         let list = st.messages.entry(key.clone()).or_default();
         let known: HashSet<_> = list.iter().map(|m| m.event_id.clone()).collect();
         let before = list.len();
         list.extend(items.into_iter().filter(|m| !known.contains(&m.event_id)));
         let added = list.len() - before;
         list.sort_by_key(|m| m.ts);
-        if list.len() > KEEP_PER_ROOM {
-            list.drain(..list.len() - KEEP_PER_ROOM);
+        let trimmed = list.len() > keep;
+        if trimmed {
+            list.drain(..list.len() - keep);
+        }
+        // Older history now starts after a gap: fetched afresh when the room opens.
+        if trimmed {
+            st.older.remove(key);
         }
         added
     }
@@ -1680,6 +1721,7 @@ impl Ctl {
             let Some(room) = c.mgr.client(key.0).await.and_then(|cl| cl.get_room(&key.1)) else { return };
             let Ok(page) = timeline::history(&room, None, PAGE).await else { return };
             c.mgr.note_history(key.0, &key.1, &page.items);
+            c.forget_deleted(&key, &page.gone);
             let changed: Vec<OwnedEventId> = {
                 let mut st = c.st.lock().unwrap();
                 let Some(list) = st.messages.get_mut(&key) else { return };
@@ -1879,12 +1921,16 @@ impl Ctl {
                     self.mgr.note_history(account, &room_id, &page.items);
                     self.merge(&key, page.items);
                     self.merge_reactions(&key, page.reactions);
+                    self.forget_deleted(&key, &page.gone);
                     self.st.lock().unwrap().older.insert(key.clone(), page.older);
                     if self.current().as_ref() == Some(&key) {
                         self.show_messages().await;
                     }
                 }
-                Err(e) => self.status(format!("Couldn't load history: {e}")),
+                // A server in the room being down mustn't fill the status
+                // line: new messages still come with syncing, and it's
+                // tried again next time the room opens.
+                Err(e) => tracing::info!("couldn't load history of {room_id}: {e:#}"),
             }
         }
         self.ui(|u| u.set_loading_history(false));
@@ -2630,6 +2676,9 @@ impl Ctl {
             let pins: Vec<PinnedItem> = pinned.iter().map(|(w, t)| PinnedItem { who: s(w), text: s(t) }).collect();
             u.set_pinned(ModelRc::new(VecModel::from(pins)));
             u.set_members(ModelRc::default());
+            u.set_files(ModelRc::default());
+            u.set_files_shown(false);
+            u.set_files_loading(false);
             u.set_members_loading(true);
             u.set_room_info_status(s(""));
             u.set_info_editing(false);
@@ -2763,20 +2812,149 @@ impl Ctl {
         }
     }
 
+    /// The room panel's file list: "load" starts it (with the files already
+    /// loaded in the chat), "more" looks further back through the room's history.
+    async fn room_files(&self, what: String) {
+        let Some((key, room)) = self.current_room().await else { return };
+        let (mut token, mut asked) = {
+            let mut st = self.st.lock().unwrap();
+            let fresh = what == "load" || st.files.as_ref().is_none_or(|f| f.key != key);
+            if fresh {
+                let items: Vec<HistoryItem> = st.messages.get(&key).map(|l| l.iter().filter(|m| is_listed_file(m)).cloned().collect()).unwrap_or_default();
+                st.files = Some(RoomFiles { key: key.clone(), items, token: None, asked: false });
+            }
+            let f = st.files.as_ref().expect("just set");
+            (f.token.clone(), f.asked)
+        };
+        self.show_files(true);
+        let mut found = 0;
+        let mut failed = None;
+        for _ in 0..FILES_PAGES_PER_LOOK {
+            if asked && token.is_none() {
+                break;
+            }
+            match timeline::history(&room, token.clone(), PAGE).await {
+                Ok(page) => {
+                    let next = page.older.filter(|t| Some(t) != token.as_ref());
+                    let mut st = self.st.lock().unwrap();
+                    let Some(f) = st.files.as_mut().filter(|f| f.key == key) else { return };
+                    for m in page.items.into_iter().filter(is_listed_file) {
+                        if !f.items.iter().any(|x| x.event_id == m.event_id) {
+                            f.items.push(m);
+                            found += 1;
+                        }
+                    }
+                    (f.token, f.asked) = (next.clone(), true);
+                    (token, asked) = (next, true);
+                }
+                Err(e) => {
+                    tracing::info!("couldn't look for files in {}: {e:#}", key.1);
+                    failed = Some(e);
+                    break;
+                }
+            }
+            if found >= FILES_PER_LOOK || self.current().as_ref() != Some(&key) {
+                break;
+            }
+        }
+        if let Some(e) = failed {
+            let note = format!("Couldn't look further back right now ({e}). A server in this room may be down; try again later.");
+            self.ui(move |u| u.set_files_note(s(note)));
+            self.show_files_list(false);
+        } else {
+            self.show_files(false);
+        }
+    }
+
+    fn show_files(&self, loading: bool) {
+        let (more, empty) = {
+            let st = self.st.lock().unwrap();
+            let Some(f) = st.files.as_ref() else { return };
+            (!f.asked || f.token.is_some(), f.items.is_empty())
+        };
+        let note = match (empty, more) {
+            (true, false) => "No files have been sent in this room.",
+            (true, true) => "No files found yet.",
+            (false, false) => "That's every file in the room.",
+            (false, true) => "",
+        };
+        self.ui(move |u| u.set_files_note(s(note)));
+        self.show_files_list(loading);
+    }
+
+    fn show_files_list(&self, loading: bool) {
+        let (rows, more) = {
+            let st = self.st.lock().unwrap();
+            let Some(f) = st.files.as_ref() else { return };
+            let mut items: Vec<&HistoryItem> = f.items.iter().collect();
+            items.sort_by_key(|m| std::cmp::Reverse(m.ts));
+            let rows: Vec<(String, String, String, &'static str, bool)> = items
+                .iter()
+                .filter_map(|m| {
+                    let media = m.media.as_ref()?;
+                    let (kind, image) = match media.kind {
+                        MediaKind::Image => ("IMG", true),
+                        MediaKind::Video => ("VIDEO", false),
+                        MediaKind::Audio => ("AUDIO", false),
+                        MediaKind::File => ("FILE", false),
+                    };
+                    let mut detail = vec![m.sender_label().to_owned(), seen_label(m.ts)];
+                    if let Some(n) = media.size {
+                        detail.push(ui::human_size(n));
+                    }
+                    Some((m.event_id.to_string(), timeline::plain_name(&media.name), detail.join(" · "), kind, image))
+                })
+                .collect();
+            (rows, !f.asked || f.token.is_some())
+        };
+        self.ui(move |u| {
+            let items: Vec<FileItem> = rows
+                .iter()
+                .map(|(id, name, detail, kind, image)| FileItem { id: s(id), name: s(name), detail: s(detail), kind: s(*kind), image: *image })
+                .collect();
+            u.set_files(ModelRc::new(VecModel::from(items)));
+            u.set_files_more(more);
+            u.set_files_loading(loading);
+            u.set_files_shown(true);
+        });
+    }
+
     async fn load_older(&self) {
         let Some((key, room)) = self.current_room().await else { return };
-        let Some(Some(token)) = self.st.lock().unwrap().older.get(&key).cloned() else { return };
-        self.ui(|u| u.set_loading_history(true));
-        match timeline::history(&room, Some(token), PAGE).await {
-            Ok(page) => {
-                let added = self.merge(&key, page.items);
-                self.merge_reactions(&key, page.reactions);
-                // Nothing new came back: there's nothing older to show.
-                self.st.lock().unwrap().older.insert(key.clone(), if added == 0 { None } else { page.older });
-                self.show_messages().await;
-            }
-            Err(e) => self.status(format!("Couldn't load older messages: {e}")),
+        let Some(Some(mut token)) = self.st.lock().unwrap().older.get(&key).cloned() else { return };
+        if self.st.lock().unwrap().older_failed.get(&key).is_some_and(|t| t.elapsed() < OLDER_RETRY) {
+            return;
         }
+        self.ui(|u| u.set_loading_history(true));
+        // Pages holding only what's already here (or only reactions and
+        // edits) are stepped over, so scrolling up doesn't stop at them.
+        for _ in 0..20 {
+            match timeline::history(&room, Some(token.clone()), PAGE).await {
+                Ok(page) => {
+                    let added = self.merge(&key, page.items);
+                    self.merge_reactions(&key, page.reactions);
+                    self.forget_deleted(&key, &page.gone);
+                    let next = page.older.filter(|t| *t != token);
+                    {
+                        let mut st = self.st.lock().unwrap();
+                        st.older_failed.remove(&key);
+                        st.older.insert(key.clone(), next.clone());
+                    }
+                    match next {
+                        Some(t) if added == 0 && self.current().as_ref() == Some(&key) => token = t,
+                        _ => break,
+                    }
+                }
+                // Quietly: a server in the room may be down. Scrolling up
+                // tries again after a while.
+                Err(e) => {
+                    tracing::info!("couldn't load older messages of {}: {e:#}", key.1);
+                    self.st.lock().unwrap().older_failed.insert(key.clone(), Instant::now());
+                    break;
+                }
+            }
+        }
+        self.show_messages().await;
         self.ui(|u| u.set_loading_history(false));
     }
 
@@ -3357,7 +3535,11 @@ impl Ctl {
     }
 
     fn find(&self, key: &RoomKey, id: &str) -> Option<HistoryItem> {
-        self.st.lock().unwrap().messages.get(key)?.iter().find(|m| m.event_id.as_str() == id).cloned()
+        let st = self.st.lock().unwrap();
+        let in_chat = st.messages.get(key).and_then(|l| l.iter().find(|m| m.event_id.as_str() == id));
+        // Or a file from the room panel's list, sent long before what's loaded.
+        let in_files = || st.files.as_ref().filter(|f| &f.key == key).and_then(|f| f.items.iter().find(|m| m.event_id.as_str() == id));
+        in_chat.or_else(in_files).cloned()
     }
 
     async fn message_action(&self, action: String, id: String) {
@@ -3483,6 +3665,11 @@ impl Ctl {
             "play" if m.media.is_none() => self.play_youtube(&key, m).await,
             "play" => self.play_media(&key, m).await,
             "view" => self.view_image(&key, m).await,
+            // From the room panel's file list: the message it came in.
+            "show-in-chat" => {
+                self.ui(|u| u.set_room_info_open(false));
+                self.jump_to(&key, &room, m.event_id.clone()).await;
+            }
             "forward" => self.open_forward(key, m.event_id).await,
             "thread" => self.open_thread(m.thread.clone().unwrap_or(m.event_id)).await,
             a if a.starts_with("react:") => self.toggle_reaction(&key, &room, &m.event_id, &a[6..]).await,
@@ -5253,9 +5440,9 @@ impl Ctl {
     }
 
     fn remove_message(&self, key: &RoomKey, id: &OwnedEventId) {
-        if let Some(list) = self.st.lock().unwrap().messages.get_mut(key) {
-            list.retain(|m| &m.event_id != id);
-        }
+        self.forget_deleted(key, std::slice::from_ref(id));
+        // The room list's preview may have been the deleted message.
+        self.schedule_rooms();
         if self.current().as_ref() == Some(key) {
             let c = self.clone();
             self.spawn(async move {
@@ -5263,6 +5450,37 @@ impl Ctl {
                 c.show_thread().await;
             });
         }
+    }
+
+    /// Drops every copy of deleted messages: in the chat, its reactions,
+    /// pictures and link cards, the file list, and quotes in replies to it
+    /// (which then say it was deleted).
+    fn forget_deleted(&self, key: &RoomKey, ids: &[OwnedEventId]) -> bool {
+        if ids.is_empty() {
+            return false;
+        }
+        let mut st = self.st.lock().unwrap();
+        let mut changed = false;
+        if let Some(list) = st.messages.get_mut(key) {
+            let n = list.len();
+            list.retain(|m| !ids.contains(&m.event_id));
+            changed |= list.len() != n;
+        }
+        if let Some(list) = st.reactions.get_mut(key) {
+            let n = list.len();
+            list.retain(|r| !ids.contains(&r.event_id) && !ids.contains(&r.target));
+            changed |= list.len() != n;
+        }
+        if let Some(f) = st.files.as_mut().filter(|f| &f.key == key) {
+            f.items.retain(|m| !ids.contains(&m.event_id));
+        }
+        for id in ids {
+            st.pictures.remove(id);
+            st.animations.remove(id);
+            st.link_cards.remove(id);
+            st.reply_cache.insert(id.clone(), Some(("↪".to_owned(), "a deleted message".to_owned())));
+        }
+        changed
     }
 
     /// Works out a room's read receipts again soon (at most every half
@@ -6601,6 +6819,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_verify_action, |a| verify_action);
     on!(on_profile_edit, |a, id, v| profile_edit);
     on!(on_open_room_info, open_room_info);
+    on!(on_room_files, |what| room_files);
     on!(on_room_invite, |users| room_invite);
     on!(on_room_edit, |n, t| room_edit);
     on!(on_room_avatar, |a| room_avatar);

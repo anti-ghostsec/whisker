@@ -635,6 +635,9 @@ pub struct Page {
     /// Emoji reactions seen on this page (to messages on it or elsewhere).
     pub reactions: Vec<Reaction>,
     pub older: Option<String>,
+    /// Messages (and reactions) on this page that were deleted: whatever
+    /// copy is already shown or kept must go too.
+    pub gone: Vec<OwnedEventId>,
 }
 
 /// One person's emoji reaction to a message.
@@ -657,10 +660,12 @@ pub struct Reaction {
 pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Page> {
     let mut out = Vec::new();
     let mut reactions = Vec::new();
+    let mut gone = Vec::new();
     let mut from = from;
     let mut saw_create = false;
     for _ in 0..5 {
-        let (mut items, mut r, older, created) = history_page(room, from.clone(), limit).await?;
+        let (mut items, mut r, older, created, mut g) = history_page(room, from.clone(), limit).await?;
+        gone.append(&mut g);
         saw_create |= created;
         reactions.append(&mut r);
         items.append(&mut out);
@@ -714,7 +719,7 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
             );
         }
     }
-    Ok(Page { items: out, reactions, older: from })
+    Ok(Page { items: out, reactions, older: from, gone })
 }
 
 /// One `/messages` request: its items, oldest first, and the token for the
@@ -727,12 +732,20 @@ fn hidden_history(when: &str) -> String {
     )
 }
 
+/// How long one page of history may take.
+const HISTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
 /// Also says whether the room's creation event was on it.
-async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(Vec<HistoryItem>, Vec<Reaction>, Option<String>, bool)> {
+#[allow(clippy::type_complexity)]
+async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(Vec<HistoryItem>, Vec<Reaction>, Option<String>, bool, Vec<OwnedEventId>)> {
     let mut opts = MessagesOptions::backward();
     opts.limit = UInt::from(limit);
     opts.from = from;
-    let msgs = room.messages(opts).await?;
+    // The SDK retries a server error for ever; a server in the room being
+    // down would leave this waiting (and "Loading…" up) indefinitely.
+    let msgs = tokio::time::timeout(HISTORY_TIMEOUT, room.messages(opts))
+        .await
+        .map_err(|_| anyhow::anyhow!("the server took too long to send older messages"))??;
     let mut out = Vec::new();
     let mut edits: HashMap<(OwnedEventId, OwnedUserId), String> = HashMap::new();
     let mut profiles: HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)> = HashMap::new();
@@ -744,9 +757,14 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     let mut at_start = msgs.end.is_none() || msgs.chunk.is_empty();
     let mut created = false;
     let mut reactions = Vec::new();
+    let mut gone = Vec::new();
     // Newest first: an edit is seen before the message it changes.
     for ev in &msgs.chunk {
         let m = match ev.raw().deserialize() {
+            Ok(AnySyncTimelineEvent::MessageLike(m)) if m.is_redacted() => {
+                gone.push(m.event_id().to_owned());
+                continue;
+            }
             Ok(AnySyncTimelineEvent::MessageLike(m)) => m,
             Ok(AnySyncTimelineEvent::State(_)) => {
                 let Some(st) = state_event(ev.raw()) else { continue };
@@ -811,7 +829,7 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
         });
     }
     out.reverse();
-    Ok((out, reactions, if at_start { None } else { msgs.end }, created))
+    Ok((out, reactions, if at_start { None } else { msgs.end }, created, gone))
 }
 
 /// A room (state) event from the timeline. Reads `prev_content` from the top

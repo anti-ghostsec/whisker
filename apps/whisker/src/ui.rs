@@ -102,6 +102,18 @@ pub fn volume() -> u32 {
     VOLUME.load(std::sync::atomic::Ordering::Relaxed).min(100)
 }
 
+/// How much a sound level (0–100) scales the sound by. Ears hear loudness
+/// on a log scale: a straight `level / 100` put almost all of the change in
+/// the bottom few percent (5% was only 26 dB down). This spreads 50 dB
+/// evenly over the slider instead, so each step sounds about the same.
+pub fn gain(level: u32) -> f64 {
+    match level.min(100) {
+        0 => 0.0,
+        100 => 1.0,
+        l => 10f64.powf(-50.0 * (1.0 - f64::from(l) / 100.0) / 20.0),
+    }
+}
+
 pub type PixelCache = Arc<Mutex<HashMap<OwnedMxcUri, Option<Pixels>>>>;
 
 pub struct Models {
@@ -486,6 +498,16 @@ impl Models {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn volume_steps_sound_even() {
+        assert_eq!(super::gain(0), 0.0);
+        assert_eq!(super::gain(100), 1.0);
+        // Half way is half the range down (25 dB), not 6 dB.
+        assert!((20.0 * super::gain(50).log10() + 25.0).abs() < 0.01);
+        // Every step is quieter than the one above.
+        assert!((1..100).all(|l| super::gain(l) < super::gain(l + 1)));
+    }
+
     use super::*;
 
     #[test]

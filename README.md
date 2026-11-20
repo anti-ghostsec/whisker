@@ -241,6 +241,11 @@ operating system and the **Wisp** browser.
   usually keep their rules), who can join, history visibility, encryption, the member list
   (click anyone to see their profile), inviting people, and editing the name/description if
   you're allowed.
+- **Files in a room:** Room info → *Show files* lists the pictures, videos, sound and files
+  sent there, newest first, with who sent them, when, and their size. Click a picture to
+  view it, anything else to jump to the message it came in; *Save* downloads it. *Look
+  further back* searches older history (encrypted rooms too, since it reads the decrypted
+  messages).
 - **Your profile**: change your display name and picture in Settings → your account.
 - **Select text by dragging, like in a web browser:** from the middle of one message, over
   names and whole messages, to the middle of another (hold the mouse above or below the list

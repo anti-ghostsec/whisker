@@ -259,6 +259,15 @@ export struct MemberItem {
     role: string,
 }
 
+/// A file sent in the room, for the room panel's list.
+export struct FileItem {
+    id: string,
+    name: string,
+    detail: string,
+    kind: string,
+    image: bool,
+}
+
 export struct PinnedItem {
     who: string,
     text: string,
@@ -2014,6 +2023,12 @@ export component AppWindow inherits Window {
     in property <RoomDetails> room-details;
     in property <[MemberItem]> members;
     in property <[PinnedItem]> pinned;
+    // The room panel's list of files sent in the room.
+    in property <[FileItem]> files;
+    in property <bool> files-shown;
+    in property <bool> files-loading;
+    in property <bool> files-more;
+    in property <string> files-note;
     in property <bool> members-loading;
     in-out property <string> room-info-status;
     in-out property <bool> create-open;
@@ -2104,6 +2119,7 @@ export component AppWindow inherits Window {
     callback profile-requested(string);
     callback profile-edit(string, string, string);
     callback open-room-info();
+    callback room-files(string);
     callback room-invite(string);
     callback room-edit(string, string);
     callback room-avatar(string);
@@ -3399,6 +3415,55 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 if root.room-info-status != "": Text { text: root.room-info-status; font-size: 12px; color: Theme.muted; wrap: char-wrap; }
+                                if !root.current-space && !root.info-editing: VerticalLayout {
+                                    spacing: 4px;
+                                    Text { text: "FILES"; font-size: 10px; font-weight: 800; color: Theme.muted; }
+                                    if !root.files-shown: HorizontalLayout {
+                                        alignment: start;
+                                        Btn { text: "Show files"; clicked => { root.activity(); root.room-files("load"); } }
+                                    }
+                                    for f in root.files: Rectangle {
+                                        height: 48px;
+                                        border-radius: 8px;
+                                        background: file-ta.has-hover ? Theme.hover : transparent;
+                                        // Pictures open in the viewer; anything else is shown where it was sent.
+                                        file-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.activity(); root.message-action(f.image ? "view" : "show-in-chat", f.id); }
+                                        }
+                                        HorizontalLayout {
+                                            padding-left: 6px;
+                                            padding-right: 6px;
+                                            spacing: 10px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Rectangle {
+                                                    width: 38px;
+                                                    height: 30px;
+                                                    border-radius: 6px;
+                                                    background: Theme.raised;
+                                                    Text { text: f.kind; font-size: 9px; font-weight: 800; color: Theme.muted; }
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                horizontal-stretch: 1;
+                                                Text { text: f.name; color: Theme.text; font-weight: 600; overflow: elide; }
+                                                Text { text: f.detail; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Btn { text: "Save"; clicked => { root.activity(); root.message-action("save", f.id); } }
+                                            }
+                                        }
+                                    }
+                                    if root.files-loading: Text { text: "Looking for files…"; font-size: 12px; color: Theme.muted; }
+                                    if root.files-shown && !root.files-loading && root.files-note != "": Text { text: root.files-note; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+                                    if root.files-shown && root.files-more && !root.files-loading: HorizontalLayout {
+                                        alignment: start;
+                                        Btn { text: "Look further back"; clicked => { root.activity(); root.room-files("more"); } }
+                                    }
+                                }
                                 Text { text: "MEMBERS"; font-size: 10px; font-weight: 800; color: Theme.muted; }
                                 if root.members-loading: Text { text: "Loading members…"; font-size: 12px; color: Theme.muted; }
                                 for mem in root.members: Rectangle {

@@ -801,11 +801,28 @@ impl AccountManager {
                 });
             }
         });
-        let tx = self.events.clone();
+        let (tx, latest) = (self.events.clone(), self.latest.clone());
         client.add_event_handler(move |ev: OriginalSyncRoomRedactionEvent, room: Room| {
-            let tx = tx.clone();
+            let (tx, latest) = (tx.clone(), latest.clone());
             async move {
                 if let Some(target) = ev.content.redacts.clone().or(ev.redacts.clone()) {
+                    // The room list's preview mustn't keep showing a deleted
+                    // message: the newest one left takes its place.
+                    let key = (account, room.room_id().to_owned());
+                    let was_latest = {
+                        let mut l = latest.lock().unwrap();
+                        let hit = l.get(&key).is_some_and(|m| m.event_id == target);
+                        if hit {
+                            l.remove(&key);
+                        }
+                        hit
+                    };
+                    if was_latest
+                        && let Ok(page) = timeline::history(&room, None, 5).await
+                        && let Some(last) = page.items.iter().rev().find(|i| !i.notice && i.event_id != target)
+                    {
+                        latest.lock().unwrap().entry(key).or_insert_with(|| last.clone());
+                    }
                     let _ = tx.send(ClientEvent::Redacted { account, room_id: room.room_id().to_owned(), target });
                 }
             }

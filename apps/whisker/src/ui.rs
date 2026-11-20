@@ -222,6 +222,11 @@ thread_local! {
     static EMOJI: RefCell<HashMap<String, Image>> = RefCell::new(HashMap::new());
 }
 
+/// A reaction that's a picture rather than an emoji: its `mxc://` address.
+pub fn custom_reaction(key: &str) -> Option<OwnedMxcUri> {
+    key.starts_with("mxc://").then(|| OwnedMxcUri::from(key))
+}
+
 /// The colour picture for an emoji (decoded once), or an empty image when
 /// there's none (the UI then falls back to the font).
 pub fn emoji_image(emoji: &str) -> Image {
@@ -353,6 +358,7 @@ impl Models {
         loaded(&r.item.sender_avatar).hash(&mut h);
         r.link_card.as_ref().map(|c| (c.state, &c.title, &c.description, c.picture.as_ref().map(|p| (p.width(), p.height())))).hash(&mut h);
         r.readers.iter().map(|x| loaded(&x.2)).collect::<Vec<_>>().hash(&mut h);
+        r.reactions.iter().map(|x| loaded(&custom_reaction(&x.0))).collect::<Vec<_>>().hash(&mut h);
         let sig = h.finish();
         let id = r.item.event_id.to_string();
         if let Some((_, item)) = self.built.get(&id).filter(|(old, _)| *old == sig) {
@@ -410,7 +416,18 @@ impl Models {
             thread_replies: r.thread.as_ref().map_or(0, |t| t.0 as i32),
             thread_last: s(r.thread.as_ref().map(|t| t.1.as_str()).unwrap_or_default()),
             reactions: ModelRc::new(VecModel::from(
-                r.reactions.iter().map(|(key, n, mine, who)| ReactionChip { key: s(key), count: *n as i32, mine: *mine, who: s(who), name: s(crate::emoji::describe(key)), picture: emoji_image(key) }).collect::<Vec<_>>(),
+                r.reactions
+                    .iter()
+                    .map(|(key, n, mine, who)| {
+                        // A custom emoji (Cinny and others send their own pictures).
+                        let custom = custom_reaction(key);
+                        let (name, picture) = match &custom {
+                            Some(m) => ("custom emoji".to_owned(), self.avatar(&Some(m.clone()), pixels)),
+                            None => (crate::emoji::describe(key).to_string(), emoji_image(key)),
+                        };
+                        ReactionChip { key: s(key), count: *n as i32, mine: *mine, who: s(who), name: s(name), picture, custom: custom.is_some() }
+                    })
+                    .collect::<Vec<_>>(),
             )),
             mine: r.mine,
             trust: match r.trust {

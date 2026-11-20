@@ -1490,7 +1490,13 @@ impl Ctl {
             rows.drain(..total - n);
         }
         self.fetch_trust(key.0, rows.iter().filter(|r| !r.mine && !r.item.notice).map(|r| r.item.sender.clone()));
-        self.fetch_avatars(key.0, rows.iter().filter_map(|r| r.item.sender_avatar.clone()).chain(rows.iter().flat_map(|r| r.readers.iter().filter_map(|x| x.2.clone()))));
+        self.fetch_avatars(
+            key.0,
+            rows.iter()
+                .filter_map(|r| r.item.sender_avatar.clone())
+                .chain(rows.iter().flat_map(|r| r.readers.iter().filter_map(|x| x.2.clone())))
+                .chain(rows.iter().flat_map(|r| r.reactions.iter().filter_map(|x| ui::custom_reaction(&x.0)))),
+        );
         let items: Vec<HistoryItem> = rows.iter().map(|r| r.item.clone()).collect();
         self.fetch_pictures(&key, &items);
         let (px, older) = (self.avatars.clone(), self.st.lock().unwrap().older.get(&key).cloned().flatten().is_some());

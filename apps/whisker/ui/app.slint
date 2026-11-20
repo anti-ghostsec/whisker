@@ -102,6 +102,9 @@ export struct ReactionChip {
     name: string,
     // The emoji as a colour picture (empty: draw the key as text).
     picture: image,
+    // A picture of the sender's own (the key is its mxc:// address), shown
+    // once it's loaded and never as its address.
+    custom: bool,
 }
 
 // A room in the "Forward to…" list.
@@ -1139,7 +1142,7 @@ component MessageRow inherits Rectangle {
                                     x: 7px;
                                     spacing: 4px;
                                     if r.picture.width > 0: Image { source: r.picture; width: 16px; height: 16px; y: (parent.height - self.height) / 2; }
-                                    if r.picture.width == 0: Text { text: r.key; font-size: 13px; vertical-alignment: center; }
+                                    if r.picture.width == 0: Text { text: r.custom ? "…" : r.key; font-size: 13px; vertical-alignment: center; }
                                     Text { text: r.count; font-size: 11px; font-weight: 700; color: r.mine ? Theme.accent : Theme.muted; vertical-alignment: center; }
                                 }
                                 chip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.act("react:" + r.key, root.item.id); } pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } } }

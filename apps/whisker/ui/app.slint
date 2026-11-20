@@ -4271,10 +4271,10 @@ export component AppWindow inherits Window {
                     property <int> per: max(1, min(self.count, floor((self.width + 4px) / 62px)));
                     height: ceil(self.count / self.per) * 78px - 4px;
                     for e[i] in root.verify-emojis: Rectangle {
-                        property <int> row: floor(i / parent.per);
-                        property <int> in-row: min(parent.per, parent.count - self.row * parent.per);
+                        property <int> line: floor(i / parent.per);
+                        property <int> in-row: min(parent.per, parent.count - self.line * parent.per);
                         x: (parent.width - (self.in-row * 62px - 4px)) / 2 + mod(i, parent.per) * 62px;
-                        y: self.row * 78px;
+                        y: self.line * 78px;
                         width: 58px;
                         height: 74px;
                         border-radius: 8px;

@@ -234,8 +234,97 @@ mod desktop {
     }
 }
 
+/// Strips what an MP4 recording says beyond the sound itself. The times it
+/// was made and changed are zeroed (movie, track and media headers), and any
+/// user data or metadata (`udta`, `meta`: Android's muxer puts the Android
+/// version there, and can put the phone's make and model) is wiped and
+/// turned into padding (`free`), so every size and offset in the file stays
+/// as it was and players read it the same.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn scrub_mp4(data: &mut [u8]) {
+    scrub_boxes(data, 0);
+}
+
+fn scrub_boxes(data: &mut [u8], depth: u32) {
+    let mut at = 0usize;
+    while data.len() - at >= 8 {
+        let left = (data.len() - at) as u64;
+        let (head, size) = match u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) {
+            0 => (8, left),
+            1 if left >= 16 => (16, u64::from_be_bytes(data[at + 8..at + 16].try_into().unwrap())),
+            1 => return,
+            n => (8, u64::from(n)),
+        };
+        if size < head || size > left {
+            return;
+        }
+        let end = at + size as usize;
+        let kind: [u8; 4] = data[at + 4..at + 8].try_into().unwrap();
+        let body = &mut data[at + head as usize..end];
+        match &kind {
+            b"moov" | b"trak" | b"mdia" | b"minf" if depth < 8 => scrub_boxes(body, depth + 1),
+            b"udta" | b"meta" => {
+                body.fill(0);
+                data[at + 4..at + 8].copy_from_slice(b"free");
+            }
+            // Version, flags, then the two times: 32 bits each, or 64 in version 1.
+            b"mvhd" | b"tkhd" | b"mdhd" if !body.is_empty() => {
+                let times = if body[0] == 1 { 4..20 } else { 4..12 };
+                if body.len() >= times.end {
+                    body[times].fill(0);
+                }
+            }
+            _ => {}
+        }
+        at = end;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(body);
+        b
+    }
+
+    #[test]
+    fn mp4_times_and_metadata_are_wiped_and_the_sound_kept() {
+        let mut mvhd = vec![0, 0, 0, 0];
+        mvhd.extend_from_slice(&[0xAA; 8]);
+        mvhd.extend_from_slice(&[0x11; 20]);
+        let mut tkhd = vec![1, 0, 0, 7];
+        tkhd.extend_from_slice(&[0xBB; 16]);
+        tkhd.extend_from_slice(&[0x22; 20]);
+        let mut mdhd = vec![0, 0, 0, 0];
+        mdhd.extend_from_slice(&[0xCC; 8]);
+        mdhd.extend_from_slice(&[0x33; 8]);
+        let udta = mp4_box(b"udta", b"com.android.version 14");
+        let meta = mp4_box(b"meta", b"\0\0\0\0Pixel");
+        let mdia = mp4_box(b"mdia", &mp4_box(b"mdhd", &mdhd));
+        let trak = mp4_box(b"trak", &[mp4_box(b"tkhd", &tkhd), mdia, udta.clone()].concat());
+        let moov = mp4_box(b"moov", &[mp4_box(b"mvhd", &mvhd), trak, udta, meta].concat());
+        let sound = mp4_box(b"mdat", &[0x5A; 64]);
+        let mut file = [mp4_box(b"ftyp", b"M4A \0\0\0\0"), moov, sound.clone()].concat();
+        let len = file.len();
+        super::scrub_mp4(&mut file);
+        assert_eq!(file.len(), len);
+        let has = |f: &[u8], n: &[u8]| f.windows(n.len()).any(|w| w == n);
+        assert!(!has(&file, &[0xAA; 8]) && !has(&file, &[0xBB; 16]) && !has(&file, &[0xCC; 8]));
+        assert!(has(&file, &[0x11; 20]) && has(&file, &[0x22; 20]) && has(&file, &[0x33; 8]));
+        assert!(!has(&file, b"udta") && !has(&file, b"meta") && !has(&file, b"android") && !has(&file, b"Pixel"));
+        assert!(file.ends_with(&sound));
+        assert!(file.starts_with(&mp4_box(b"ftyp", b"M4A \0\0\0\0")));
+    }
+
+    #[test]
+    fn broken_mp4_sizes_are_left_alone() {
+        for mut f in [vec![0, 0, 0, 1, b'm', b'o', b'o', b'v'], vec![0, 0, 0, 4, b'm', b'o', b'o', b'v', 1], vec![0xFF; 12], vec![]] {
+            super::scrub_mp4(&mut f);
+        }
+    }
+
     #[test]
     fn waveform_is_scaled_to_the_loudest() {
         let mut s = vec![0i16; 48_000];

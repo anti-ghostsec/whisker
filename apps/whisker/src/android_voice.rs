@@ -73,7 +73,10 @@ pub fn encode(samples: &[i16]) -> Option<(Vec<u8>, &'static str, &'static str)> 
     let ok = encode_to(samples, &path);
     let data = if ok { std::fs::read(&path).ok().filter(|d| !d.is_empty()) } else { None };
     drop(dir);
-    Some((data?, "audio/mp4", "m4a"))
+    let mut data = data?;
+    // Nothing but the sound leaves the phone: no time made, no Android version.
+    crate::voice::scrub_mp4(&mut data);
+    Some((data, "audio/mp4", "m4a"))
 }
 
 fn encode_to(samples: &[i16], path: &Path) -> bool {

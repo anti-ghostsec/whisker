@@ -1120,6 +1120,16 @@ pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>, ment
 /// (the SDK's own 30 seconds cut answers off halfway: "error decoding
 /// response body"), and given up on in the end instead of retried forever
 /// (so a message isn't stuck at "Sending…").
+/// Type of the hidden events Whisker sends: one other apps don't know, so
+/// they show nothing (encrypted like any message in an encrypted room).
+pub const HIDDEN_TYPE: &str = "org.whisker.hidden";
+
+/// Sends `text` as a hidden event: only apps that show hidden events see it.
+pub async fn send_hidden(room: &Room, text: &str) -> Result<OwnedEventId> {
+    let res = room.send_raw(HIDDEN_TYPE, serde_json::json!({ "body": text })).with_request_config(send_config()).await?;
+    Ok(res.response.event_id)
+}
+
 pub fn send_config() -> matrix_sdk::config::RequestConfig {
     matrix_sdk::config::RequestConfig::default().timeout(std::time::Duration::from_secs(90)).retry_limit(3).max_retry_time(std::time::Duration::from_secs(60))
 }

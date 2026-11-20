@@ -3042,6 +3042,19 @@ impl Ctl {
             self.post_sticker(&room, sticker).await;
             return;
         }
+        // "/hidden text": sent as an event other apps don't show.
+        if let Some(rest) = text.strip_prefix("/hidden ").map(str::trim).filter(|r| !r.is_empty())
+            && self.st.lock().unwrap().editing.is_none()
+        {
+            self.ui(|u| u.set_stick_bottom(true));
+            let shown = self.settings.lock().unwrap().show_hidden;
+            match timeline::send_hidden(&room, rest).await {
+                Ok(_) if shown => self.status(""),
+                Ok(_) => self.status("Sent as a hidden event: only apps that show hidden events see it (Settings → Show hidden events)."),
+                Err(e) => self.status(format!("Couldn't send the hidden event: {e:#}")),
+            }
+            return;
+        }
         // The clear command opens its confirmation instead of being posted.
         let clear = self.settings.lock().unwrap().clear_command.trim().to_owned();
         if !clear.is_empty() && text.eq_ignore_ascii_case(&clear) && self.st.lock().unwrap().editing.is_none() {

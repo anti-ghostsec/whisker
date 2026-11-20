@@ -87,6 +87,12 @@ static NOW: Mutex<Option<Playing>> = Mutex::new(None);
 static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Videos start over when they end.
 static LOOP: AtomicBool = AtomicBool::new(false);
+/// When the picture's first frame (of a start, or of each time round when
+/// looping) came up: (start, time round, the moment it stands for). The
+/// sound waits for it, so it never runs ahead of the picture.
+static CLOCK: Mutex<Option<(u64, u32, Instant)>> = Mutex::new(None);
+/// The last start whose picture stopped (the sound needn't wait for it).
+static VIDEO_GONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Turns playing videos over and over on or off.
 pub fn toggle_loop(ui: &Weak<AppWindow>) {
@@ -271,6 +277,7 @@ fn resume(ui: &Weak<AppWindow>) {
         let ui = ui.clone();
         std::thread::spawn(move || {
             let shown = play_picture(&ui, &src, info, at, start, max, generation);
+            VIDEO_GONE.store(generation, Ordering::Relaxed);
             finished(&ui, generation, shown);
         });
     }
@@ -564,6 +571,32 @@ fn wait_until(start: Instant, due: f64, generation: u64) -> bool {
     }
 }
 
+/// Waits for the sound's turn: with a picture, until that time round's
+/// first frame is ready (see [`CLOCK`]); alone, until `start`. False if replaced.
+fn wait_turn(follows: bool, start: Instant, generation: u64, round: u32) -> bool {
+    if !follows {
+        return wait_until(start, 0.0, generation);
+    }
+    let began = Instant::now();
+    loop {
+        if !current(generation) {
+            return false;
+        }
+        let clock = *CLOCK.lock().unwrap();
+        if let Some((g, r, at)) = clock
+            && g == generation
+            && r == round
+        {
+            return wait_until(at, 0.0, generation);
+        }
+        // No picture coming: the sound goes on its own.
+        if VIDEO_GONE.load(Ordering::Relaxed) == generation || began.elapsed() > Duration::from_secs(8) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// How long a decoder drawing to the image reader may go without a
 /// picture before the software decoder (into memory) is tried instead.
 const NO_PICTURE_GIVE_UP: Duration = Duration::from_secs(4);
@@ -665,7 +698,7 @@ impl Layout {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, at: f64, start: Instant, max: (u32, u32), generation: u64, output: Output) -> Outcome {
+fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, mut at: f64, mut start: Instant, max: (u32, u32), generation: u64, output: Output) -> Outcome {
     let Some(ex) = Extractor::open(path) else { return Outcome::NoPictures("the file can't be read".into()) };
     let Some(track) = info.video else { return Outcome::Shown(0) };
     let Some(mut format) = ex.format(track) else { return Outcome::NoPictures("no video format".into()) };
@@ -698,7 +731,7 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, at: f64, start: 
         return Outcome::NoPictures(format!("{name} wouldn't start: {e:?}"));
     }
     ex.select(track);
-    let at_us = (at * 1e6) as i64;
+    let mut at_us = (at * 1e6) as i64;
     ex.seek(at_us);
     let size = frame_size(info, max);
     let mut layout = Layout::of(&mut format, info.width, info.height);
@@ -710,6 +743,8 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, at: f64, start: 
     let mut last_drawn = f64::NEG_INFINITY;
     let began = Instant::now();
     let mut outcome = None;
+    // Times round (when looping), and whether this time's first frame is still to come.
+    let (mut loops, mut first_due) = (0u32, true);
     loop {
         if !current(generation) {
             break;
@@ -744,9 +779,16 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, at: f64, start: 
         // Frames before where it starts (decoded from the key frame before it),
         // more than FPS a second, and late ones are skipped (though one is
         // drawn every half second, so a slow phone still shows something).
-        let late = start.elapsed().as_secs_f64() > t - at + 0.1;
         // (Drawn to a reader, a picture's buffer may say it holds nothing.)
         let empty = out.info().size() <= 0 && (end || output == Output::Memory);
+        // The clock starts with the first frame ready, not before (the
+        // decoder takes a moment), and the sound starts with it.
+        if first_due && pts >= at_us && !empty {
+            first_due = false;
+            start = Instant::now().checked_sub(Duration::from_secs_f64((t - at).max(0.0))).unwrap_or_else(Instant::now);
+            *CLOCK.lock().unwrap() = Some((generation, loops, start));
+        }
+        let late = start.elapsed().as_secs_f64() > t - at + 0.1;
         let skip = pts < at_us || empty || t - last_drawn < 1.0 / FPS || (late && t - last_drawn < 0.5);
         if skip {
             let _ = codec.release_output_buffer(out, false);
@@ -796,6 +838,14 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, at: f64, start: 
             }
         }
         if end {
+            // Looping: straight back to the start in the same decoder, so
+            // it goes round without stopping to load.
+            if shown > 0 && LOOP.load(Ordering::Relaxed) && current(generation) && codec.flush().is_ok() {
+                ex.seek(0);
+                (at, at_us, more, first_due, last_drawn) = (0.0, 0, true, true, f64::NEG_INFINITY);
+                loops += 1;
+                continue;
+            }
             break;
         }
     }
@@ -922,7 +972,9 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
     let mut more = true;
     let mut played = 0u64;
     let mut last_shown = 0.0f64;
-    if !wait_until(start, 0.0, generation) {
+    let follows = info.video.is_some();
+    let mut loops = 0u32;
+    if !wait_turn(follows, start, generation, loops) {
         return 0;
     }
     loop {
@@ -1010,6 +1062,15 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
         }
         let _ = codec.release_output_buffer(out, false);
         if end {
+            if played > 0 && LOOP.load(Ordering::Relaxed) && current(generation) && codec.flush().is_ok() {
+                ex.seek(0);
+                more = true;
+                loops += 1;
+                if !wait_turn(follows, Instant::now(), generation, loops) {
+                    break;
+                }
+                continue;
+            }
             break;
         }
     }

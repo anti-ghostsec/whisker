@@ -529,6 +529,9 @@ component VideoBar inherits Rectangle {
     // Narrow (upright phone videos): the seek bar gets a row of its own,
     // above the buttons, or it's too short to click.
     property <bool> stacked: self.width < 320px;
+    // Narrower still: tighter, and the length goes (the seek bar shows it),
+    // so the buttons all fit.
+    property <bool> tight: self.width < 250px;
     height: self.stacked ? 54px : 30px;
     background: #000000a0;
     // Clicks on the bar itself don't pause.
@@ -547,9 +550,9 @@ component VideoBar inherits Rectangle {
     HorizontalLayout {
         y: root.stacked ? 24px : 0px;
         height: 30px;
-        padding-left: 8px;
-        padding-right: 8px;
-        spacing: 8px;
+        padding-left: root.tight ? 5px : 8px;
+        padding-right: root.tight ? 5px : 8px;
+        spacing: root.tight ? 5px : 8px;
         Rectangle {
             width: 16px;
             if Player.playing: HorizontalLayout {
@@ -566,7 +569,7 @@ component VideoBar inherits Rectangle {
         Clock { seconds: Player.position; }
         if !root.stacked: SeekTrack { horizontal-stretch: 1; }
         if root.stacked: Rectangle { horizontal-stretch: 1; }
-        Clock { seconds: Player.duration; }
+        if !root.tight: Clock { seconds: Player.duration; }
         Rectangle {
             width: 18px;
             // Repeat: lit while videos start over at the end.

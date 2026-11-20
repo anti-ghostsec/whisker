@@ -350,7 +350,10 @@ static EXTERNAL_PLAYERS: std::sync::Mutex<Vec<std::process::Child>> = std::sync:
 /// Stops everything that plays or records: locking mustn't leave a hidden
 /// vault's video playing out loud, or the microphone open.
 fn stop_all_media(ui: &slint::Weak<AppWindow>) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     player::stop(ui);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = ui;
     voice::cancel();
     for mut c in EXTERNAL_PLAYERS.lock().unwrap().drain(..) {
         let _ = c.kill();

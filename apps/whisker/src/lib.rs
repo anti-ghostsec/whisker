@@ -4021,8 +4021,8 @@ impl Ctl {
     async fn play_media_here(&self, key: &RoomKey, event_id: OwnedEventId, media: timeline::Media) {
         let Some(client) = self.mgr.client(key.0).await else { return };
         self.status("Loading…");
-        // Played in the window: videos, and on phones sound too.
-        let in_window = media.kind == MediaKind::Video || (cfg!(target_os = "android") && media.kind == MediaKind::Audio);
+        // Played in the window: videos, and sound (voice messages) too.
+        let in_window = matches!(media.kind, MediaKind::Video | MediaKind::Audio);
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _ = in_window;
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -4044,7 +4044,7 @@ impl Ctl {
                         return;
                     }
                     if self.play_streaming(file, event_id.to_string()).await {
-                        self.status(if media.kind == MediaKind::Audio { "Playing. Tap it again to pause." } else { "" });
+                        self.status(if media.kind == MediaKind::Audio { "Playing, muted: tap the speaker to turn the sound on." } else { "" });
                         return;
                     }
                 }
@@ -4091,7 +4091,7 @@ impl Ctl {
                     let played = tokio::task::spawn_blocking(move || player::play(ui, id, path)).await.unwrap_or(false);
                     if played {
                         if media.kind == MediaKind::Audio {
-                            self.status("Playing. Tap it again to pause.");
+                            self.status("Playing, muted: tap the speaker to turn the sound on.");
                         }
                         return;
                     }

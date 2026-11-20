@@ -5,7 +5,8 @@
 //! muting, subtitles and the large view restart ffmpeg at the right place.
 //!
 //! A video plays either from a downloaded file or while it streams, read
-//! through a [`Relay`] (the login never leaves Whisker).
+//! through a [`Relay`] (the login never leaves Whisker). Sound alone (voice
+//! messages, music) plays the same way, with no picture.
 
 use crate::{AppWindow, Player};
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, Weak};
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use whisker_core::files::Relay;
-use whisker_core::timeline::{Subtitles, VideoInfo, probe_video};
+use whisker_core::timeline::{Subtitles, VideoInfo, probe_media};
 
 /// Frames a second shown.
 const FPS: u32 = 30;
@@ -82,12 +83,18 @@ pub fn play_stream(ui: Weak<AppWindow>, id: String, relay: Relay) -> bool {
 
 fn start(ui: Weak<AppWindow>, id: String, input: OsString, relay: Option<Relay>) -> bool {
     stop(&ui);
-    let Some(info) = probe_video(&input) else { return false };
+    let Some(info) = probe_media(&input) else { return false };
+    // Sound alone needs somewhere to go.
+    let sound_only = info.width == 0;
+    if sound_only && sound_output().is_none() {
+        return false;
+    }
     let duration = info.duration.map_or(0.0, |d| d.as_secs_f64());
     let has_subtitles = info.subtitles.is_some();
     // Text subtitles are read from the whole file before the first frame:
     // when streaming, they're there to turn on, not on at the start.
     let shown = has_subtitles && !(relay.is_some() && info.subtitles == Some(Subtitles::Text));
+    // Everything starts muted (no sudden loud sound); the speaker turns it on.
     let playing = Playing { id: id.clone(), input, _relay: relay, info, at: 0.0, muted: true, subtitles: shown, large: false, playing: false, child: None, generation: 0 };
     *NOW.lock().unwrap() = Some(playing);
     let _ = ui.upgrade_in_event_loop(move |u| {
@@ -318,6 +325,10 @@ fn resume(ui: &Weak<AppWindow>) {
 /// Starts ffmpeg and shows its frames until it ends or is replaced.
 #[allow(clippy::too_many_arguments)]
 fn run(ui: Weak<AppWindow>, input: OsString, at: f64, info: VideoInfo, muted: bool, subtitles: Option<Subtitles>, max: (u32, u32), generation: u64) {
+    if info.width == 0 {
+        let played = play_sound(&ui, &input, at, muted, generation);
+        return ended(&ui, generation, played);
+    }
     let size = frame_size(&info, max);
     let sound = if info.audio && !muted { sound_output() } else { None };
     let current = || NOW.lock().unwrap().as_ref().is_some_and(|p| p.generation == generation);
@@ -343,7 +354,13 @@ fn run(ui: Weak<AppWindow>, input: OsString, at: f64, info: VideoInfo, muted: bo
         Some(mut out) => show_frames(&ui, &mut out, size, at, generation),
         None => 0,
     };
-    // Played out (not replaced): back to the preview, ready to play again.
+    ended(&ui, generation, shown);
+}
+
+/// After ffmpeg stopped: played out (not replaced), it's back to the
+/// preview, ready to play again (or starts over, when looping).
+fn ended(ui: &Weak<AppWindow>, generation: u64, shown: u64) {
+    let ui = ui.clone();
     let finished = {
         let mut now = NOW.lock().unwrap();
         match now.as_mut() {
@@ -369,6 +386,65 @@ fn run(ui: Weak<AppWindow>, input: OsString, at: f64, info: VideoInfo, muted: bo
             p.set_loading(false);
             p.set_position(0.0);
             p.set_frame(Image::default());
+        });
+    }
+}
+
+/// Sound alone: ffmpeg plays it to the system, and the position moves
+/// along with the clock (`muted`: silently). Returns how many tenths of a
+/// second it played.
+fn play_sound(ui: &Weak<AppWindow>, input: &OsStr, at: f64, muted: bool, generation: u64) -> u64 {
+    let Some(out) = sound_output() else { return 0 };
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{at:.3}")]);
+    cmd.args(whisker_core::timeline::ffmpeg_guard(input));
+    cmd.args(["-re", "-i"]).arg(input).args(["-map", "0:a:0"]);
+    let level = if muted { 0 } else { crate::ui::volume() };
+    if level < 100 {
+        cmd.args(["-filter:a", &format!("volume={:.2}", f64::from(level) / 100.0)]);
+    }
+    cmd.args(out);
+    let Ok(child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return 0 };
+    {
+        let mut now = NOW.lock().unwrap();
+        match now.as_mut() {
+            Some(p) if p.generation == generation => p.child = Some(child),
+            _ => {
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                return 0;
+            }
+        }
+    }
+    let began = std::time::Instant::now();
+    let mut ticks = 0u64;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let position = at + began.elapsed().as_secs_f64();
+        {
+            let mut now = NOW.lock().unwrap();
+            match now.as_mut() {
+                Some(p) if p.generation == generation => {
+                    if p.child.as_mut().is_none_or(|c| !matches!(c.try_wait(), Ok(None))) {
+                        return ticks;
+                    }
+                    p.at = position;
+                }
+                _ => return ticks,
+            }
+        }
+        ticks += 1;
+        let first = ticks == 1;
+        if first {
+            SHOWN.store(generation, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = ui.upgrade_in_event_loop(move |u| {
+            let p = u.global::<Player>();
+            p.set_position(position as f32);
+            if first {
+                p.set_loading(false);
+            }
         });
     }
 }

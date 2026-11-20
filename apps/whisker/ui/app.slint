@@ -691,6 +691,8 @@ component MessageRow inherits Rectangle {
     // Taps do nothing when they end a hold.
     function act(a: string, id: string) { if !root.held { root.action(a, id); } }
     function go(l: string) { if !root.held { root.link(l); } }
+    // Sound playing (or loading) in this message, in the window: a voice message, say.
+    property <bool> sounding: root.item.media == 3 && Player.id == root.item.id;
     // Text selected in the message, for the menu's Copy.
     property <string> selection;
     // Lit for a moment: a click on a reply to it just scrolled here.
@@ -904,6 +906,15 @@ component MessageRow inherits Rectangle {
                             background: Theme.raised;
                             border-width: 1px;
                             border-color: Theme.border;
+                            // Under the contents, so the seek line above it gets its own taps.
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                // Videos and audio play; other files save.
+                                clicked => { root.act(root.item.media == 2 || root.item.media == 3 ? "play" : "save", root.item.id); }
+                                pointer-event(e) => { root.press(e);
+                                    if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
+                                }
+                            }
                             HorizontalLayout {
                                 padding: 8px;
                                 spacing: 10px;
@@ -911,23 +922,83 @@ component MessageRow inherits Rectangle {
                                     width: 36px;
                                     border-radius: 6px;
                                     background: Theme.accent-soft;
-                                    Text {
-                                        text: root.item.media == 2 || root.item.media == 3 ? "▶" : "FILE";
+                                    if root.sounding && Player.loading: Dots {}
+                                    if !(root.sounding && Player.loading): Text {
+                                        text: root.sounding && Player.playing ? "❚❚" : root.item.media == 2 || root.item.media == 3 ? "▶" : "FILE";
                                         font-size: root.item.media == 2 || root.item.media == 3 ? 16px : 9px; font-weight: 800; color: Theme.accent;
                                     }
                                 }
                                 VerticalLayout {
                                     alignment: center;
+                                    spacing: 4px;
                                     Text { text: root.item.media-name; color: Theme.text; overflow: elide; font-weight: 600; }
-                                    Text { text: root.item.media-info; color: Theme.muted; font-size: 11px; }
-                                }
-                            }
-                            TouchArea {
-                                mouse-cursor: pointer;
-                                // Videos and audio play; other files save.
-                                clicked => { root.act(root.item.media == 2 || root.item.media == 3 ? "play" : "save", root.item.id); }
-                                pointer-event(e) => { root.press(e);
-                                    if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); }
+                                    if !root.sounding: Text { text: root.item.media-info; color: Theme.muted; font-size: 11px; }
+                                    // Where it's got to: tap the line to jump there.
+                                    if root.sounding: HorizontalLayout {
+                                        spacing: 8px;
+                                        Rectangle {
+                                            horizontal-stretch: 1;
+                                            height: 14px;
+                                            Rectangle {
+                                                height: 4px;
+                                                border-radius: 2px;
+                                                background: Theme.border;
+                                                Rectangle {
+                                                    x: 0;
+                                                    width: parent.width * (Player.duration > 0 ? min(1, Player.position / Player.duration) : 0);
+                                                    border-radius: 2px;
+                                                    background: Theme.accent;
+                                                }
+                                            }
+                                            TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { if !root.held { Player.seek(self.mouse-x / max(1px, self.width)); } }
+                                                pointer-event(e) => { root.press(e); }
+                                            }
+                                        }
+                                        Clock { seconds: Player.position; color: Theme.muted; }
+                                        Text { text: "/"; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                                        Clock { seconds: Player.duration; color: Theme.muted; }
+                                        // It starts muted: the speaker opens the level and Unmute.
+                                        Rectangle {
+                                            width: 22px;
+                                            Text { text: Player.muted ? "🔇" : "🔊"; font-size: 13px; }
+                                            TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { if !root.held { sound-popup.show(); } }
+                                                pointer-event(e) => { root.press(e); }
+                                            }
+                                            sound-popup := PopupWindow {
+                                                x: (parent.width - 44px) / 2;
+                                                y: -186px;
+                                                width: 44px;
+                                                height: 180px;
+                                                close-policy: close-on-click-outside;
+                                                Rectangle {
+                                                    border-radius: 10px;
+                                                    background: #000000d0;
+                                                    VerticalLayout {
+                                                        padding-top: 6px;
+                                                        padding-bottom: 6px;
+                                                        alignment: center;
+                                                        Text { text: Player.muted ? "off" : Player.volume + "%"; color: white; font-size: 10px; horizontal-alignment: center; }
+                                                        HorizontalLayout {
+                                                            alignment: center;
+                                                            VolumeSlider {
+                                                                value: Player.muted ? 0 : Player.volume;
+                                                                committed(v) => { Player.set-volume(v); }
+                                                            }
+                                                        }
+                                                        Rectangle {
+                                                            height: 22px;
+                                                            Text { text: Player.muted ? "Unmute" : "Mute"; color: Player.muted ? Theme.accent : white; font-size: 10px; font-weight: 600; }
+                                                            TouchArea { mouse-cursor: pointer; clicked => { Player.mute(); } }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

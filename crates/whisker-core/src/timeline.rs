@@ -1431,6 +1431,30 @@ pub fn sniff_media(bytes: &[u8]) -> Option<&'static str> {
 /// Size, length, sound and subtitles, via ffprobe (when installed). `input`
 /// is a file, or an address ffprobe can read.
 pub fn probe_video(input: impl AsRef<std::ffi::OsStr>) -> Option<VideoInfo> {
+    parse_probe(&probe_text(input.as_ref())?)
+}
+
+/// Like [`probe_video`], but sound alone (a voice message, a song) does too:
+/// then the width and height are 0.
+pub fn probe_media(input: impl AsRef<std::ffi::OsStr>) -> Option<VideoInfo> {
+    let text = probe_text(input.as_ref())?;
+    parse_probe(&text).or_else(|| parse_sound(&text))
+}
+
+/// A file with only sound, from ffprobe's lines.
+fn parse_sound(text: &str) -> Option<VideoInfo> {
+    if !text.lines().any(|l| l.trim() == "codec_type=audio") {
+        return None;
+    }
+    let duration = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("duration=")?.parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .map(std::time::Duration::from_secs_f64);
+    Some(VideoInfo { width: 0, height: 0, duration, audio: true, subtitles: None })
+}
+
+fn probe_text(input: &std::ffi::OsStr) -> Option<String> {
     use std::process::{Command, Stdio};
     let probe = Command::new("ffprobe")
         .args(ffmpeg_guard(input.as_ref()))
@@ -1440,7 +1464,7 @@ pub fn probe_video(input: impl AsRef<std::ffi::OsStr>) -> Option<VideoInfo> {
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    parse_probe(&String::from_utf8_lossy(&probe.stdout))
+    Some(String::from_utf8_lossy(&probe.stdout).into_owned())
 }
 
 /// Reads ffprobe's `key=value` lines. The size is the one the video is

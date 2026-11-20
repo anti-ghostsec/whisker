@@ -106,8 +106,9 @@ pub fn play_remote(ui: Weak<AppWindow>, id: String, file: Arc<RemoteFile>, rt: t
 fn start(ui: Weak<AppWindow>, id: String, src: Src) -> bool {
     stop(&ui);
     let Some(info) = probe(&src) else { return false };
-    *NOW.lock().unwrap() = Some(Playing { id: id.clone(), src, info, at: 0.0, muted: info.video.is_some(), large: false, playing: false, generation: 0 });
-    let muted = info.video.is_some();
+    // Everything starts muted (no sudden loud sound); the speaker turns it on.
+    *NOW.lock().unwrap() = Some(Playing { id: id.clone(), src, info, at: 0.0, muted: true, large: false, playing: false, generation: 0 });
+    let muted = true;
     let _ = ui.upgrade_in_event_loop(move |u| {
         let p = u.global::<Player>();
         p.set_id(id.into());
@@ -247,7 +248,7 @@ fn resume(ui: &Weak<AppWindow>) {
         // With a picture, the picture's thread says when it's over.
         let leads = info.video.is_none();
         std::thread::spawn(move || {
-            let played = play_sound(&src, info, at, start, generation, leads.then_some(&ui));
+            let played = play_sound(&src, info, at, start, generation, muted, leads.then_some(&ui));
             if leads {
                 finished(&ui, generation, played);
             }
@@ -888,7 +889,9 @@ impl Planes<'_> {
 /// Decodes the sound from `at` and plays it, starting at `start`. With
 /// `ui` (sound only, no picture) it also moves the position along. Returns
 /// how many pieces it played.
-fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, ui: Option<&Weak<AppWindow>>) -> u64 {
+/// `muted` (sound alone, which still has to move the position along): silence.
+#[allow(clippy::too_many_arguments)]
+fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, muted: bool, ui: Option<&Weak<AppWindow>>) -> u64 {
     let Some(ex) = Extractor::open(path) else { return 0 };
     let Some(track) = info.audio else { return 0 };
     let Some(mut format) = ex.format(track) else { return 0 };
@@ -945,7 +948,7 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
             if let Some(s) = &stream {
                 let raw = &out.buffer()[offset..(offset + size).min(out.buffer().len())];
                 // Below full level, the samples are scaled down here.
-                let level = crate::ui::volume();
+                let level = if muted { 0 } else { crate::ui::volume() };
                 let scaled: Vec<u8>;
                 let data = if level < 100 {
                     scaled = raw

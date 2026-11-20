@@ -311,8 +311,10 @@ impl Piece {
 const BLOCK: u64 = 512 * 1024;
 /// Blocks kept (about 20 MB).
 const KEEP_BLOCKS: usize = 40;
-/// Blocks fetched ahead of what's read, so playing doesn't wait on them.
-const READ_AHEAD: u64 = 4;
+/// Blocks fetched ahead of what's read, so playing doesn't wait on them
+/// (8 MB: several seconds of a phone video; 2 MB ran out every couple
+/// of seconds, and the picture stopped and jumped).
+const READ_AHEAD: u64 = 16;
 
 #[derive(Default)]
 struct Blocks {
@@ -502,7 +504,7 @@ impl Relay {
 }
 
 /// Answers one request from ffmpeg with that piece of the file.
-async fn relay_one(mut sock: tokio::net::TcpStream, file: &RemoteFile, secret: &str) -> Result<()> {
+async fn relay_one(mut sock: tokio::net::TcpStream, file: &Arc<RemoteFile>, secret: &str) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut head = Vec::new();
     let mut buf = [0u8; 2048];
@@ -554,6 +556,34 @@ async fn relay_one(mut sock: tokio::net::TcpStream, file: &RemoteFile, secret: &
     out.push_str("\r\n");
     if method == "HEAD" {
         sock.write_all(out.as_bytes()).await?;
+        return Ok(());
+    }
+    // A file read in parts goes through the kept blocks, fetched ahead:
+    // ffmpeg jumps between a video's picture and sound parts, and asking
+    // the server afresh each time kept it waiting.
+    if file.seekable() {
+        let size = file.size.unwrap_or(0);
+        let end = to.map_or(size, |t| (t + 1).min(size));
+        // The first block before the answer, so a failure can still say so.
+        let first = (BLOCK - from % BLOCK).min(end.saturating_sub(from)) as usize;
+        let data = match file.read_at(from, first).await {
+            Ok(d) => d,
+            Err(e) => {
+                sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                return Err(e);
+            }
+        };
+        sock.write_all(out.as_bytes()).await?;
+        sock.write_all(&data).await?;
+        let mut at = from + data.len() as u64;
+        while at < end {
+            let data = file.read_at(at, (BLOCK - at % BLOCK).min(end - at) as usize).await?;
+            if data.is_empty() {
+                break;
+            }
+            sock.write_all(&data).await?;
+            at += data.len() as u64;
+        }
         return Ok(());
     }
     let mut piece = match file.fetch(from, to).await {

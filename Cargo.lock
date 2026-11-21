@@ -8501,7 +8501,7 @@ dependencies = [
 
 [[package]]
 name = "whisker"
-version = "0.38.0"
+version = "0.39.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8530,7 +8530,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-agent"
-version = "0.38.0"
+version = "0.39.0"
 dependencies = [
  "anyhow",
  "image",
@@ -8548,7 +8548,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-agentd"
-version = "0.38.0"
+version = "0.39.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -8564,7 +8564,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-core"
-version = "0.38.0"
+version = "0.39.0"
 dependencies = [
  "aes",
  "anyhow",

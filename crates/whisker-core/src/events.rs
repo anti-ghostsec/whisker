@@ -8,6 +8,9 @@ use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, Ow
 pub enum ClientEvent {
     /// An account was added, removed, relabelled, or a vault locked/unlocked.
     AccountsChanged,
+    /// An account's server moved and the account now uses its new address
+    /// (a new client: anything holding the old one should fetch it again).
+    Moved { account: AccountId },
     /// A message arrived in a room one of our accounts is in. `body` is
     /// readable text (images, files and undecryptable messages get a label).
     Message {

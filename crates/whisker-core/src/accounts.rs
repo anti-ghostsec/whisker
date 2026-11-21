@@ -755,6 +755,83 @@ impl AccountManager {
         Ok(client)
     }
 
+    /// Records that `record`'s server is at `now` (the old address kept in
+    /// [`AccountRecord::homeservers_used`]), in `record` and the vault.
+    async fn save_move(&self, vault: &str, record: &mut AccountRecord, now: String) -> Result<()> {
+        tracing::info!("{} moved from {} to {now}", record.user_id, record.homeserver);
+        let old = std::mem::replace(&mut record.homeserver, now);
+        crate::moves::remember(&mut record.homeservers_used, &old);
+        record.homeservers_used.retain(|u| *u != record.homeserver.trim_end_matches('/'));
+        let (id, hs, used) = (record.id, record.homeserver.clone(), record.homeservers_used.clone());
+        self.mutate_profile(vault, |p| {
+            if let Some(r) = p.accounts.iter_mut().find(|r| r.id == id) {
+                r.homeserver = hs;
+                r.homeservers_used = used;
+            }
+        })
+        .await
+    }
+
+    /// An account whose server can't be reached: if it has moved (and the
+    /// new address checks out, see [`crate::moves`]), carries on there with
+    /// the same session and keys, no sign-in. Says
+    /// [`ClientEvent::Moved`] when it did.
+    ///
+    /// Boxed: it starts a sync that may call it again.
+    pub fn follow_move(&self, account: AccountId) -> futures_util::future::BoxFuture<'_, ()> {
+        Box::pin(self.follow_move_inner(account))
+    }
+
+    async fn follow_move_inner(&self, account: AccountId) {
+        let Some((vault, mut record)) = self.inner.read().await.live.get(&account).map(|a| (a.vault.clone(), a.record.clone())) else { return };
+        let Some(server) = record.user_id.split_once(':').map(|s| s.1.to_owned()) else { return };
+        let named = discover(&record).await;
+        let token = record.session.tokens.access_token.clone();
+        let mut found = None;
+        for c in crate::moves::candidates(named.as_deref(), &server, &record.homeserver, &record.homeservers_used) {
+            if crate::moves::confirm(&c, &record.user_id, &token, record.proxy.as_deref()).await {
+                found = Some(c);
+                break;
+            }
+        }
+        let Some(now) = found else { return };
+        // Locked, or signed out, while this was checking.
+        if !self.inner.read().await.live.contains_key(&account) {
+            return;
+        }
+        if let Err(e) = self.save_move(&vault, &mut record, now).await {
+            tracing::warn!("couldn't save {account}'s new server address: {e:#}");
+            return;
+        }
+        // The SDK can't change a client's address, so a new client on the
+        // same store and session: the old one's sync stops first, so the
+        // two never handle keys at once.
+        let client = match self.build_client(account, &record.homeserver, &record.store_passphrase, record.proxy.as_deref()).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("couldn't move {account} to its new server address: {e:#}");
+                return;
+            }
+        };
+        if let Some(sync) = self.inner.write().await.live.get_mut(&account).and_then(|a| a.sync.take()) {
+            sync.abort();
+        }
+        if let Err(e) = client.restore_session(record.session.clone()).await {
+            tracing::warn!("couldn't move {account} to its new server address: {e:#}");
+            let _ = self.events.send(ClientEvent::AccountError { account, message: format!("couldn't move to the server's new address: {e}") });
+            return;
+        }
+        let profile = self.inner.read().await.live.get(&account).map(|a| (a.profile_name.clone(), a.avatar.clone()));
+        self.go_live(&vault, record, client).await;
+        if let Some((name, avatar)) = profile
+            && let Some(a) = self.inner.write().await.live.get_mut(&account)
+        {
+            a.profile_name = a.profile_name.take().or(name);
+            a.avatar = a.avatar.take().or(avatar);
+        }
+        let _ = self.events.send(ClientEvent::Moved { account });
+    }
+
     async fn restore(&self, vault: &str, mut record: AccountRecord) -> Result<()> {
         // Saved by an older version as socks5:// (names looked up outside the proxy).
         if let Some(p) = &record.proxy
@@ -771,18 +848,16 @@ impl AccountManager {
         }
         // Servers move (the saved URL can go dead), so ask the server name
         // where it lives now, but don't let a slow answer hold up unlocking.
-        if let Some(now) = discover(&record).await
-            && now != record.homeserver.trim_end_matches('/')
+        // Only a checked answer is used (see `crate::moves`).
+        if let Some(server) = record.user_id.split_once(':').map(|s| s.1.to_owned())
+            && let named @ Some(_) = discover(&record).await
         {
-            tracing::info!("{} moved from {} to {now}", record.user_id, record.homeserver);
-            record.homeserver = now;
-            let (id, hs) = (record.id, record.homeserver.clone());
-            self.mutate_profile(vault, |p| {
-                if let Some(r) = p.accounts.iter_mut().find(|r| r.id == id) {
-                    r.homeserver = hs;
+            for now in crate::moves::candidates(named.as_deref(), &server, &record.homeserver, &record.homeservers_used) {
+                if crate::moves::confirm(&now, &record.user_id, &record.session.tokens.access_token, record.proxy.as_deref()).await {
+                    self.save_move(vault, &mut record, now).await?;
+                    break;
                 }
-            })
-            .await?;
+            }
         }
         let client = self
             .build_client(record.id, &record.homeserver, &record.store_passphrase, record.proxy.as_deref())
@@ -923,6 +998,7 @@ impl AccountManager {
         let sync_client = client.clone();
         let tx = self.events.clone();
         let keys_client = client.clone();
+        let mgr = self.clone();
         let sync = tokio::spawn(async move {
             // Room keys often arrive just after the messages they unlock:
             // say so, so those messages can be shown again. Stops with the sync.
@@ -952,6 +1028,8 @@ impl AccountManager {
             // connection now and then doesn't leave later ones waiting a minute.
             let mut delay = 1u64;
             let worked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Unreachable since when, and when its address was last checked.
+            let (mut down_since, mut checked): (Option<std::time::Instant>, Option<std::time::Instant>) = (None, None);
             loop {
                 let (tx2, c2, worked2) = (tx.clone(), sync_client.clone(), worked.clone());
                 let res = sync_client
@@ -976,11 +1054,24 @@ impl AccountManager {
                         }
                     })
                     .await;
-                if let Err(e) = res {
-                    let _ = tx.send(ClientEvent::AccountError { account, message: e.to_string() });
-                }
                 if worked.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     delay = 1;
+                    down_since = None;
+                }
+                if let Err(e) = res {
+                    if unreachable(&e) {
+                        // Unreachable a while: it may have moved. Checked
+                        // apart from this loop, which a move replaces.
+                        let since = *down_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= crate::moves::CHECK_AFTER && checked.is_none_or(|t| t.elapsed() >= crate::moves::CHECK_EVERY) {
+                            checked = Some(std::time::Instant::now());
+                            let mgr = mgr.clone();
+                            tokio::spawn(async move { mgr.follow_move(account).await });
+                        }
+                    } else {
+                        down_since = None;
+                    }
+                    let _ = tx.send(ClientEvent::AccountError { account, message: e.to_string() });
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 delay = (delay * 2).min(60);
@@ -1099,6 +1190,7 @@ impl AccountManager {
             session,
             store_passphrase,
             position,
+            homeservers_used: Vec::new(),
         };
         self.mutate_profile(req.vault, |p| p.accounts.push(record.clone())).await?;
         self.go_live(req.vault, record, client.clone()).await;
@@ -1667,6 +1759,12 @@ pub fn proxy_url(p: &str) -> String {
         Some(head) if head.eq_ignore_ascii_case("socks4://") => format!("socks4a://{}", &p[9..]),
         _ => p.to_owned(),
     }
+}
+
+/// No answer at all (refused, timed out, no route, TLS failed), as opposed
+/// to the server answering with an error.
+fn unreachable(e: &matrix_sdk::Error) -> bool {
+    matches!(e, matrix_sdk::Error::Http(h) if matches!(**h, matrix_sdk::HttpError::Reqwest(_)))
 }
 
 /// Where `record`'s server says its client API lives now (from

@@ -6307,6 +6307,15 @@ impl Ctl {
             let selected = |a: AccountId| self.st.lock().unwrap().account == Some(a);
             match ev {
                 ClientEvent::AccountsChanged => self.refresh_accounts().await,
+                // Its server moved and it carries on at the new address (a
+                // new client): the room list comes from that one now.
+                ClientEvent::Moved { account } => {
+                    tracing::info!("account {account} follows its server to a new address");
+                    self.refresh_accounts().await;
+                    if selected(account) {
+                        self.refresh_rooms().await;
+                    }
+                }
                 ClientEvent::Synced { account } => {
                     // Back in touch: a "can't reach" from a moment ago is over,
                     // unless it's the account being looked at that's still out.
@@ -6693,7 +6702,9 @@ fn emoji_rows(list: &[&str]) -> ModelRc<EmojiRow> {
 }
 
 /// Shown while syncing fails to connect; cleared by the next sync that works.
-const OFFLINE: &str = "Can't reach the server right now; retrying.";
+/// The server isn't answering: Whisker keeps trying, and checks whether it
+/// has moved to a new address (see `whisker_core::moves`).
+const OFFLINE: &str = "Reconnecting…";
 
 /// Background errors, shortened for the status line: network errors quote
 /// the whole request URL (access filters and all), which says nothing useful.

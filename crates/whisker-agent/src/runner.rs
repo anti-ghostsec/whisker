@@ -255,7 +255,7 @@ impl AgentRunner {
 
     pub async fn run(mut self) -> Result<()> {
         let mut rx = self.mgr.subscribe();
-        let client = self.mgr.client(self.cfg.account).await.ok_or_else(|| anyhow!("agent account is not logged in"))?;
+        let mut client = self.mgr.client(self.cfg.account).await.ok_or_else(|| anyhow!("agent account is not logged in"))?;
         let me = client.user_id().ok_or_else(|| anyhow!("agent account has no user id"))?.to_owned();
         // Pick up where it left off.
         self.vault = self.mgr.accounts().await.into_iter().find(|a| a.id == self.cfg.account).map(|a| a.vault);
@@ -314,6 +314,14 @@ impl AgentRunner {
                 // must not keep steering the AI from its memory.
                 ClientEvent::Redacted { account, room_id, target } if account == self.cfg.account => {
                     self.forget_message(&room_id, &target);
+                    continue;
+                }
+                // Its server moved: a new client, at the new address.
+                ClientEvent::Moved { account } if account == self.cfg.account => {
+                    if let Some(c) = self.mgr.client(account).await {
+                        client = c;
+                        self.accept_invites(&client, &me);
+                    }
                     continue;
                 }
                 ClientEvent::Edited { account, room_id, target, sender, body } if account == self.cfg.account => {

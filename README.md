@@ -35,6 +35,14 @@ operating system and the **Wisp** browser.
   not by your network. Clicking a web link in an account with a proxy copies it instead of
   opening it, since your browser wouldn't use that proxy: paste it into a browser that does
   (Tor Browser, say).
+- **Servers that move.** If a server changes its address (a new port, or behind a relay
+  now, or not any more), Whisker follows it with no sign-in again: when the server hasn't
+  answered for about 25 seconds, and once on unlock, it asks the server name
+  (`/.well-known/matrix/client`) where it is now, or tries the server name itself and the
+  addresses the account used before. It shows *Reconnecting…* meanwhile. A new address is
+  used only if it's https, on the server name's own host or one under it (or a host the
+  account already used), and confirms the account's session is its own; otherwise the
+  account's sign-in is never sent there.
 - **AI accounts.** Each AI signs in as its own Matrix account, separate from yours, with its
   own settings page. Paste the address of any AI API (OpenRouter, Groq, Mistral, DeepSeek,
   Gemini, OpenAI, Venice, LM Studio, llama.cpp, vLLM, Ollama, or any Anthropic-style API).

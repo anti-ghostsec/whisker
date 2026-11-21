@@ -79,6 +79,11 @@ pub struct AccountRecord {
     /// Place in the account list (lower first).
     #[serde(default)]
     pub position: u32,
+    /// Addresses this account's server was reached at before it moved
+    /// (newest first): tried when it can't be reached and won't say where
+    /// it is now. See [`crate::moves`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub homeservers_used: Vec<String>,
 }
 
 impl AccountRecord {

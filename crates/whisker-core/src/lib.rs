@@ -9,6 +9,7 @@ pub mod events;
 pub mod files;
 pub mod link_preview;
 pub mod media_fetch;
+pub mod moves;
 pub mod moderation;
 pub mod notices;
 pub mod profile;

@@ -335,8 +335,37 @@ fn decode(bytes: &[u8], max_w: u32, max_h: u32, square: bool) -> Option<Pixels> 
     } else {
         img
     };
-    let img = img.to_rgba8();
+    let mut img = img.to_rgba8();
+    if square {
+        round(&mut img);
+    }
     Some(Pixels::clone_from_slice(img.as_raw(), img.width(), img.height()))
+}
+
+/// Cuts a square picture (an avatar) to a circle with a smooth edge, so it
+/// looks the same whatever draws it: the window's own round clipping isn't
+/// smoothed everywhere (Windows), and the coloured circle under it showed
+/// through at the edge as a thin ring.
+fn round(img: &mut image::RgbaImage) {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let (cx, cy, r) = (w / 2.0, h / 2.0, w.min(h) / 2.0);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+        let cover = (r - d + 0.5).clamp(0.0, 1.0);
+        if cover < 1.0 {
+            p.0[3] = (p.0[3] as f32 * cover).round() as u8;
+        }
+    }
+}
+
+/// Whether a picture is at least `px` on its shorter side (a server's
+/// "small copy" can be much smaller than asked for).
+fn at_least(bytes: &[u8], px: u32) -> bool {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok())
+        .is_none_or(|(w, h)| w.min(h) >= px)
 }
 
 /// An SVG (or SVGZ) picture drawn to fit `max_w` × `max_h`. Nothing it
@@ -4874,26 +4903,36 @@ impl Ctl {
             ),
             Err(_) => (name0.unwrap_or(name), avatar0),
         };
-        let px = match &avatar_mxc {
+        // The server's small copy; when that's too small for the card
+        // (blocky at this size), the picture itself if it isn't huge.
+        let bytes = match &avatar_mxc {
             Some(m) => match timeline::thumbnail(&client, m, 256).await {
-                Ok(b) => {
-                    let (big, small) = tokio::task::spawn_blocking(move || (decode(&b, 256, 256, true), decode(&b, AVATAR_PX, AVATAR_PX, true))).await.unwrap_or((None, None));
-                    // The same picture next to their messages, if it hadn't loaded there.
-                    if let Some(small) = small {
-                        let mut cache = self.avatars.lock().unwrap();
-                        if !matches!(cache.get(m), Some(Some(_))) {
-                            cache.insert(m.clone(), Some(small));
-                            drop(cache);
-                            self.loading.lock().unwrap().remove(m.as_str());
-                            let c = self.clone();
-                            self.spawn(async move { c.show_messages().await });
-                        }
-                    }
-                    big
-                }
+                Ok(b) if !at_least(&b, 200) => match timeline::download(&client, &MediaSource::Plain(m.clone()), None).await {
+                    Ok(full) if full.len() <= 8 * 1024 * 1024 => Some(full),
+                    _ => Some(b),
+                },
+                Ok(b) => Some(b),
                 Err(_) => None,
             },
             None => None,
+        };
+        let px = match (&avatar_mxc, bytes) {
+            (Some(m), Some(b)) => {
+                let (big, small) = tokio::task::spawn_blocking(move || (decode(&b, 256, 256, true), decode(&b, AVATAR_PX, AVATAR_PX, true))).await.unwrap_or((None, None));
+                // The same picture next to their messages, if it hadn't loaded there.
+                if let Some(small) = small {
+                    let mut cache = self.avatars.lock().unwrap();
+                    if !matches!(cache.get(m), Some(Some(_))) {
+                        cache.insert(m.clone(), Some(small));
+                        drop(cache);
+                        self.loading.lock().unwrap().remove(m.as_str());
+                        let c = self.clone();
+                        self.spawn(async move { c.show_messages().await });
+                    }
+                }
+                big
+            }
+            _ => None,
         };
         let has_dm = client.get_dm_room(&user).is_some();
         // 2 verified, 1 can be verified, 0 nothing to verify.
@@ -7732,6 +7771,17 @@ async fn clear_rights(room: &matrix_sdk::Room) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avatars_are_cut_round_with_a_soft_edge() {
+        let mut img = image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 100, 50, 255]));
+        round(&mut img);
+        assert_eq!(img.get_pixel(0, 0).0[3], 0, "corner");
+        assert_eq!(img.get_pixel(32, 32).0[3], 255, "middle");
+        assert_eq!(img.get_pixel(0, 32).0[3], 255, "edge midpoint");
+        // Somewhere along the edge it's partly see-through (smoothed).
+        assert!((0..64).any(|x| (1..255).contains(&img.get_pixel(x, 6).0[3])));
+    }
 
     #[test]
     fn draws_svg_pictures_without_fetching() {

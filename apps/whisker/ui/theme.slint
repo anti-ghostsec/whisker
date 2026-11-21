@@ -109,8 +109,11 @@ export component Avatar inherits Rectangle {
     width: size;
     height: size;
     border-radius: self.width / 2;
-    clip: true;
-    background: robot ? #4a4f5c : Theme.hues[Math.mod(hue, 8)];
+    // A picture comes already cut to a smooth circle (see `round` in
+    // lib.rs): nothing is drawn under it (its colour showed at the edge as
+    // a ring) and it isn't clipped again (not smoothed everywhere).
+    clip: root.image.width == 0;
+    background: root.image.width > 0 ? transparent : robot ? #4a4f5c : Theme.hues[Math.mod(hue, 8)];
     if root.image.width == 0: Text {
         text: root.robot ? "AI" : root.initial;
         color: white;

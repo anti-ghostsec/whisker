@@ -525,7 +525,11 @@ async fn space_children(space: &Room) -> Vec<OwnedRoomId> {
         return kids.clone();
     }
     let kids = read_space_children(space).await;
-    CACHE.lock().unwrap().insert(space.room_id().to_owned(), (Instant::now(), kids.clone()));
+    // Nothing yet is usually the space's state not synced yet (just after
+    // unlocking): not kept, or the space shows no rooms for the next 20 s.
+    if !kids.is_empty() {
+        CACHE.lock().unwrap().insert(space.room_id().to_owned(), (Instant::now(), kids.clone()));
+    }
     kids
 }
 

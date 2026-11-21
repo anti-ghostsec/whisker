@@ -2,6 +2,13 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 fn main() -> anyhow::Result<()> {
+    // Right-click menus drawn by Whisker (dark or light with its theme), not
+    // Windows' own grey ones.
+    #[cfg(windows)]
+    // SAFETY: first thing in main, before any other thread exists.
+    unsafe {
+        std::env::set_var("SLINT_NO_MUDA", "1")
+    };
     // Nothing is logged unless asked for (RUST_LOG=warn): warnings name
     // accounts (hidden ones too) and rooms, and a desktop session often
     // keeps an app's output in its journal on disk.

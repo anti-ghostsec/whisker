@@ -168,6 +168,8 @@ export component IconBtn inherits Rectangle {
     in property <string> icon;
     // Draw a padlock instead of a text glyph (emoji fonts aren't everywhere).
     in property <bool> padlock;
+    // Draw a gear (the ⚙ glyph is missing from some phones' fonts).
+    in property <bool> gear;
     in property <length> size: 36px;
     in property <bool> active;
     callback clicked;
@@ -175,7 +177,7 @@ export component IconBtn inherits Rectangle {
     height: size;
     border-radius: 10px;
     background: active ? Theme.accent-soft : ta.has-hover ? Theme.hover : transparent;
-    if !root.padlock: Text { text: root.icon; font-size: root.size * 0.48; color: root.active ? Theme.accent : Theme.muted; }
+    if !root.padlock && !root.gear: Text { text: root.icon; font-size: root.size * 0.48; color: root.active ? Theme.accent : Theme.muted; }
     if root.padlock: Path {
         width: root.size * 0.5;
         height: root.size * 0.5;
@@ -184,6 +186,15 @@ export component IconBtn inherits Rectangle {
         stroke: Theme.muted;
         stroke-width: 2px;
         commands: "M 7 11 V 8 A 5 5 0 0 1 17 8 V 11 M 5 11 H 19 V 21 H 5 Z";
+    }
+    if root.gear: Path {
+        width: root.size * 0.52;
+        height: root.size * 0.52;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        stroke: root.active ? Theme.accent : Theme.muted;
+        stroke-width: 1.8px;
+        commands: "M 19.26 9.74 L 21.82 10.13 L 21.82 13.87 L 19.26 14.26 L 18.73 15.54 L 20.27 17.62 L 17.62 20.27 L 15.54 18.73 L 14.26 19.26 L 13.87 21.82 L 10.13 21.82 L 9.74 19.26 L 8.46 18.73 L 6.38 20.27 L 3.73 17.62 L 5.27 15.54 L 4.74 14.26 L 2.18 13.87 L 2.18 10.13 L 4.74 9.74 L 5.27 8.46 L 3.73 6.38 L 6.38 3.73 L 8.46 5.27 L 9.74 4.74 L 10.13 2.18 L 13.87 2.18 L 14.26 4.74 L 15.54 5.27 L 17.62 3.73 L 20.27 6.38 L 18.73 8.46 Z M 15.2 12 A 3.2 3.2 0 1 0 8.8 12 A 3.2 3.2 0 1 0 15.2 12 Z";
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
 }

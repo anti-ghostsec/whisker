@@ -2403,7 +2403,7 @@ export component AppWindow inherits Window {
                             TouchArea { mouse-cursor: pointer; clicked => { root.filter-tag(root.tag-filter); } }
                         }
                     }
-                    HorizontalLayout { alignment: center; IconBtn { icon: "⚙"; clicked => { root.activity(); root.open-settings(""); } } }
+                    HorizontalLayout { alignment: center; IconBtn { gear: true; clicked => { root.activity(); root.open-settings(""); } } }
                     HorizontalLayout { alignment: center; IconBtn { padlock: true; clicked => { root.lock(); } } }
                 }
             }

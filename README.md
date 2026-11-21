@@ -360,7 +360,8 @@ operating system and the **Wisp** browser.
 - **Notifications from hidden vaults** only ever say "New message" and aren't kept in the
   desktop's notification history: who and where are shown only for accounts in the first
   vault you unlocked.
-- **Android.** Screenshots and the recent-apps preview are blocked, and everything is
+- **Android.** Screenshots, screen recording and the recent-apps preview are blocked
+  (Settings → *Allow screenshots* turns that off for when you need one), and everything is
   kept in the app's `no_backup` folder, so it's left out of device backups.
 - **Owner-only files.** On Linux and Android the data folder and everything in it are
   readable by your user only (folders 0700, files 0600), including installs made by

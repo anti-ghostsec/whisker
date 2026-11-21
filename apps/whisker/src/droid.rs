@@ -16,6 +16,16 @@ type R<T> = jni::errors::Result<T>;
 
 static APP: OnceLock<slint::android::AndroidApp> = OnceLock::new();
 
+/// Lets screenshots, screen recording and the recent-apps picture show
+/// Whisker, or blanks them (Android's secure window).
+pub fn allow_screenshots(allowed: bool) {
+    use slint::android::android_activity::WindowManagerFlags;
+    if let Some(app) = APP.get() {
+        let secure = WindowManagerFlags::SECURE;
+        if allowed { app.set_window_flags(WindowManagerFlags::empty(), secure) } else { app.set_window_flags(secure, WindowManagerFlags::empty()) }
+    }
+}
+
 /// Remembers the running app, for the calls below.
 pub fn set_app(app: &slint::android::AndroidApp) {
     let _ = APP.set(app.clone());

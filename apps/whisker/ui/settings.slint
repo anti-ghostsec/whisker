@@ -239,6 +239,7 @@ component GeneralPage inherits VerticalLayout {
     in-out property <int> theme;
     callback set-show-events(bool);
     callback set-show-hidden(bool);
+    callback set-allow-screenshots(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -311,6 +312,23 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.show-hidden;
                 toggled => { root.set-show-hidden(self.checked); }
+            }
+        }
+        // Only Android stops screenshots.
+        if Prefs.touch: HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Allow screenshots"; color: Theme.text; }
+                Text {
+                    text: "Off, screenshots and screen recordings of Whisker come out blank, and the recent-apps list shows no picture of your chats. Turn it on when you want to screenshot something; anything you capture can then end up in your gallery or cloud backups.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.allow-screenshots;
+                toggled => { root.set-allow-screenshots(self.checked); }
             }
         }
         HorizontalLayout {
@@ -1373,6 +1391,7 @@ export component SettingsPage inherits Rectangle {
     callback set-auto-lock(int);
     callback set-show-events(bool);
     callback set-show-hidden(bool);
+    callback set-allow-screenshots(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -1480,6 +1499,7 @@ export component SettingsPage inherits Rectangle {
                             set-auto-lock(i) => { root.set-auto-lock(i); }
                             set-show-events(b) => { root.set-show-events(b); }
                             set-show-hidden(b) => { root.set-show-hidden(b); }
+                            set-allow-screenshots(b) => { root.set-allow-screenshots(b); }
                             set-dev-mode(b) => { root.set-dev-mode(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-key-sharing(i) => { root.set-key-sharing(i); }

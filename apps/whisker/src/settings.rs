@@ -54,6 +54,10 @@ pub struct AppSettings {
     /// don't read as messages): they can carry text no one else sees.
     #[serde(default)]
     pub show_hidden: bool,
+    /// Android: let screenshots, screen recording and the recent-apps
+    /// picture show Whisker (off: the screen stays blank in all of them).
+    #[serde(default)]
+    pub allow_screenshots: bool,
     /// Notifications: 0 off, 1 just "New message", 2 sender and room, 3 with text.
     #[serde(default = "two")]
     pub notify_level: i32,

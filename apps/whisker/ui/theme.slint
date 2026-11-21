@@ -45,6 +45,9 @@ export global Prefs {
     // Joins, leaves, renames and other room events in the timeline.
     in-out property <bool> show-events: false;
     in-out property <bool> show-hidden: false;
+    // Android: screenshots, screen recording and the recent-apps picture
+    // show Whisker (off: they're blank).
+    in-out property <bool> allow-screenshots: false;
     // Room events in full detail (and the ones with no sentence of their own).
     in-out property <bool> dev-mode: false;
     // 0 off, 1 "New message" only, 2 sender and room, 3 with message text.

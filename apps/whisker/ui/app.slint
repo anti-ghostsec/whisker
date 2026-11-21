@@ -2262,6 +2262,7 @@ export component AppWindow inherits Window {
     }
     callback set-show-events(bool);
     callback set-show-hidden(bool);
+    callback set-allow-screenshots(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -3615,6 +3616,7 @@ export component AppWindow inherits Window {
             set-auto-lock(i) => { root.set-auto-lock(i); }
             set-show-events(b) => { root.set-show-events(b); }
             set-show-hidden(b) => { root.set-show-hidden(b); }
+            set-allow-screenshots(b) => { root.set-allow-screenshots(b); }
             set-dev-mode(b) => { root.set-dev-mode(b); }
             set-notify-level(i) => { root.set-notify-level(i); }
             set-key-sharing(i) => { root.set-key-sharing(i); }

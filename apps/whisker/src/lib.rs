@@ -5785,6 +5785,18 @@ impl Ctl {
         self.spawn(async move { c.show_messages().await });
     }
 
+    fn set_allow_screenshots(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.allow_screenshots = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_allow_screenshots(on);
+        }
+        #[cfg(target_os = "android")]
+        droid::allow_screenshots(on);
+    }
+
     fn set_show_events(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.show_events = on;
@@ -7157,6 +7169,9 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.on_to_background(droid::to_background);
     ui.global::<Prefs>().set_show_events(prefs.show_events);
     ui.global::<Prefs>().set_show_hidden(prefs.show_hidden);
+    ui.global::<Prefs>().set_allow_screenshots(prefs.allow_screenshots);
+    #[cfg(target_os = "android")]
+    droid::allow_screenshots(prefs.allow_screenshots);
     ui.global::<Prefs>().set_dev_mode(prefs.developer_mode);
     ui.global::<Prefs>().set_notify_level(prefs.notify_level);
     ui.global::<Prefs>().set_key_sharing(prefs.key_sharing.clamp(0, 2));
@@ -7454,6 +7469,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     }
     {
         let c = ctl.clone();
+        ui.on_set_allow_screenshots(move |b| c.set_allow_screenshots(b));
+    }
+    {
+        let c = ctl.clone();
         ui.on_set_dev_mode(move |b| c.set_dev_mode(b));
     }
     {
@@ -7639,7 +7658,8 @@ fn android_main(app: slint::android::AndroidApp) {
         share::deliver(shares);
     }
     // No screenshots, screen recording or picture in the recent-apps list:
-    // chats stay on the screen only.
+    // chats stay on the screen only (until the settings, read once it runs,
+    // say screenshots are allowed).
     {
         use slint::android::android_activity::WindowManagerFlags;
         app.set_window_flags(WindowManagerFlags::SECURE, WindowManagerFlags::empty());

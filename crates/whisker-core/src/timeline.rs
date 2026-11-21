@@ -112,9 +112,9 @@ pub struct HistoryItem {
     /// Room events: what exactly changed, one line per value (shown in
     /// developer mode; see `notices::changes`).
     pub details: Vec<String>,
-    /// A room event with no sentence of its own ("… sent m.room.x"), or a
-    /// hidden event (see `hidden_item`): shown in developer mode, or with
-    /// "Show hidden events".
+    /// A room event with no sentence of its own ("… sent m.room.x"), shown
+    /// in developer mode, or a hidden event (see `hidden_item` and
+    /// [`HistoryItem::is_hidden_event`]), shown only with "Show hidden events".
     pub dev_only: bool,
 }
 
@@ -149,6 +149,11 @@ pub struct MemberChange {
 }
 
 impl HistoryItem {
+    /// An event other apps don't show (see `hidden_item`).
+    pub fn is_hidden_event(&self) -> bool {
+        self.dev_only && self.body.starts_with("Hidden event (")
+    }
+
     pub fn sender_label(&self) -> &str {
         self.sender_name.as_deref().unwrap_or(self.sender.localpart())
     }
@@ -887,11 +892,15 @@ pub async fn hidden_item(
     if content.as_object().is_none_or(|o| o.is_empty()) {
         return None;
     }
-    let text = match content.get("body").and_then(serde_json::Value::as_str) {
-        Some(b) => b.to_owned(),
-        None => content.to_string(),
+    let (media, thread) = hidden_parts(&content);
+    let text = match (&media, content.get("body").and_then(serde_json::Value::as_str)) {
+        // A file: its caption, if it has one, over the file itself.
+        (Some((body, _)), _) => if is_caption(body) { body.clone() } else { String::new() },
+        (None, Some(b)) => b.to_owned(),
+        (None, None) => content.to_string(),
     };
     let text: String = text.chars().take(2000).collect();
+    let media = media.map(|m| m.1);
     if !profiles.contains_key(&sender) {
         profiles.insert(sender.clone(), member_profile(room, &sender).await);
     }
@@ -901,14 +910,14 @@ pub async fn hidden_item(
         sender,
         sender_name,
         sender_avatar,
-        body: format!("Hidden event ({kind}): {text}"),
+        body: if text.is_empty() { format!("Hidden event ({kind})") } else { format!("Hidden event ({kind}): {text}") },
         ts,
         reply_to: None,
-        media: None,
+        media,
         edited: false,
         notice: false,
         member: None,
-        thread: None,
+        thread,
         pills: Vec::new(),
         shield: None,
         details: Vec::new(),
@@ -1125,9 +1134,51 @@ pub async fn send_text(room: &Room, text: &str, reply_to: Option<&EventId>, ment
 pub const HIDDEN_TYPE: &str = "org.whisker.hidden";
 
 /// Sends `text` as a hidden event: only apps that show hidden events see it.
-pub async fn send_hidden(room: &Room, text: &str) -> Result<OwnedEventId> {
-    let res = room.send_raw(HIDDEN_TYPE, serde_json::json!({ "body": text })).with_request_config(send_config()).await?;
+/// `media`: an uploaded file it carries (as a picture message would, `text`
+/// its caption). `thread`: the thread it's in (root, latest message there).
+pub async fn send_hidden(room: &Room, text: &str, media: Option<MessageType>, thread: Option<(&EventId, &EventId)>) -> Result<OwnedEventId> {
+    let mut content = hidden_content(text, media)?;
+    if let Some((root, latest)) = thread {
+        content["m.relates_to"] = serde_json::json!({
+            "rel_type": "m.thread",
+            "event_id": root,
+            "is_falling_back": true,
+            "m.in_reply_to": { "event_id": latest },
+        });
+    }
+    let res = room.send_raw(HIDDEN_TYPE, content).with_request_config(send_config()).await?;
     Ok(res.response.event_id)
+}
+
+/// A hidden event's content: `{"body": text}`, or a file message's fields.
+fn hidden_content(text: &str, media: Option<MessageType>) -> Result<serde_json::Value> {
+    Ok(match media {
+        Some(m) => serde_json::to_value(RoomMessageEventContent::new(crate::upload::with_caption(m, text)))?,
+        None => serde_json::json!({ "body": text }),
+    })
+}
+
+/// What a hidden event carries beyond text: its file, if it has one (with
+/// the caption or the stand-in text), and the thread it's in.
+fn hidden_parts(content: &serde_json::Value) -> (Option<(String, Media)>, Option<OwnedEventId>) {
+    let thread = content
+        .get("m.relates_to")
+        .filter(|r| r.get("rel_type").and_then(|t| t.as_str()) == Some("m.thread"))
+        .and_then(|r| r.get("event_id")?.as_str())
+        .and_then(|id| OwnedEventId::try_from(id).ok());
+    let media = content
+        .get("msgtype")
+        .and_then(|_| {
+            let mut c = content.clone();
+            // Parsed as a plain message: the thread is read above.
+            c.as_object_mut()?.remove("m.relates_to");
+            serde_json::from_value::<RoomMessageEventContent>(c).ok()
+        })
+        .and_then(|c| match parse(&c) {
+            Parsed::New { body, media: Some(m), .. } => Some((body, m)),
+            _ => None,
+        });
+    (media, thread)
 }
 
 pub fn send_config() -> matrix_sdk::config::RequestConfig {
@@ -1757,6 +1808,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn hidden_events_carry_pictures_and_threads() {
+        use matrix_sdk::ruma::events::room::message::ImageMessageEventContent;
+        let img = MessageType::Image(ImageMessageEventContent::plain("cat.png".into(), "mxc://h.example/abc".into()));
+        let mut c = hidden_content("look", Some(img)).unwrap();
+        c["m.relates_to"] = serde_json::json!({"rel_type": "m.thread", "event_id": "$root:h.example", "m.in_reply_to": {"event_id": "$last:h.example"}});
+        let (media, thread) = hidden_parts(&c);
+        let (caption, media) = media.unwrap();
+        assert_eq!(caption, "look");
+        assert_eq!(media.name, "cat.png");
+        assert_eq!(thread.unwrap().as_str(), "$root:h.example");
+        // Text only, outside a thread.
+        let (m, t) = hidden_parts(&hidden_content("hi", None).unwrap());
+        assert!(m.is_none() && t.is_none());
+    }
 
     #[test]
     fn makes_video_posters() {

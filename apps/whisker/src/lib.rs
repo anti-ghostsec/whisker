@@ -263,7 +263,8 @@ fn fmt_when(ts: MilliSecondsSinceUnixEpoch) -> String {
 /// Whether a message goes in the room panel's file list: a file that was
 /// sent (not a link to one, and not a sticker-sized picture in the text).
 fn is_listed_file(m: &HistoryItem) -> bool {
-    m.media.as_ref().is_some_and(|x| !x.linked)
+    // Hidden ones stay out of the room's file list.
+    !m.is_hidden_event() && m.media.as_ref().is_some_and(|x| !x.linked)
 }
 
 /// Divider text for a day: "Today", "Yesterday", "Monday 12 October".
@@ -1404,12 +1405,16 @@ impl Ctl {
         let client = self.mgr.client(key.0).await;
         let me: Option<OwnedUserId> = client.as_ref().and_then(|c| c.user_id().map(ToOwned::to_owned));
         let marks = self.st.lock().unwrap().marks.get(key).cloned().unwrap_or_default();
-        let (show_events, dev_mode) = {
+        let (show_events, dev_mode, show_hidden) = {
             let p = self.settings.lock().unwrap();
-            (p.show_events || p.developer_mode, p.developer_mode || p.show_hidden)
+            (p.show_events || p.developer_mode, p.developer_mode, p.show_hidden)
         };
         let st = self.st.lock().unwrap();
         let mut msgs = st.messages.get(key).cloned().unwrap_or_default();
+        // Hidden events only with "Show hidden events" (developer mode
+        // doesn't show them), and nothing about them otherwise: not in a
+        // thread's count or its latest line either.
+        msgs.retain(|m| if m.is_hidden_event() { show_hidden } else { !m.dev_only || dev_mode });
         // Thread replies: how many each thread has, and the newest.
         let mut threads: HashMap<OwnedEventId, (usize, String)> = HashMap::new();
         for m in &msgs {
@@ -1426,9 +1431,6 @@ impl Ctl {
         drop_repeat_joins(&mut msgs);
         if !show_events {
             msgs.retain(|m| !m.notice);
-        }
-        if !dev_mode {
-            msgs.retain(|m| !m.dev_only);
         }
         let by_id: HashMap<&OwnedEventId, &HistoryItem> = msgs.iter().map(|m| (&m.event_id, m)).collect();
         let names: HashMap<&OwnedUserId, &str> = msgs.iter().map(|m| (&m.sender, m.sender_label())).collect();
@@ -3020,6 +3022,12 @@ impl Ctl {
                 Vec::new()
             }
         };
+        // "/hidden" with files waiting: they go as hidden events, the rest
+        // of the text their caption.
+        let (hidden, text) = match text.strip_prefix("/hidden") {
+            Some(rest) if !files.is_empty() && (rest.is_empty() || rest.starts_with(' ')) => (true, rest.trim().to_owned()),
+            _ => (false, text),
+        };
         if !files.is_empty() {
             let reply_to = self.st.lock().unwrap().reply_to.take();
             self.ui(|u| {
@@ -3031,7 +3039,7 @@ impl Ctl {
                 let r = room.clone();
                 tokio::spawn(async move { r.typing_notice(false).await });
             }
-            self.send_files(room, files, text, reply_to).await;
+            self.send_files(room, files, text, reply_to, hidden).await;
             return;
         }
         if text.is_empty() {
@@ -3052,7 +3060,7 @@ impl Ctl {
         {
             self.ui(|u| u.set_stick_bottom(true));
             let shown = self.settings.lock().unwrap().show_hidden;
-            match timeline::send_hidden(&room, rest).await {
+            match timeline::send_hidden(&room, rest, None, None).await {
                 Ok(_) if shown => self.status(""),
                 Ok(_) => self.status("Sent as a hidden event: only apps that show hidden events see it (Settings → Show hidden events)."),
                 Err(e) => self.status(format!("Couldn't send the hidden event: {e:#}")),
@@ -3496,6 +3504,7 @@ impl Ctl {
         paths: Vec<PathBuf>,
         caption: String,
         reply_to: Option<OwnedEventId>,
+        hidden: bool,
     ) {
         let opts = self.settings.lock().unwrap().upload.clone();
         let ticket = self.uploads_start();
@@ -3548,6 +3557,11 @@ impl Ctl {
                 Ok(Err(e)) if e.to_string() == "cancelled" => {
                     stopped += 1;
                     continue;
+                }
+                // Hidden: an event other apps don't show, carrying the file.
+                Ok(Ok(message)) if hidden => {
+                    let caption = if i + 1 == count { caption.as_str() } else { "" };
+                    timeline::send_hidden(&room, caption, Some(message), None).await.map(drop)
                 }
                 Ok(Ok(message)) => {
                     let message = if i + 1 == count {
@@ -5652,6 +5666,22 @@ impl Ctl {
             return;
         }
         let latest = self.rows_for(&key, Some(&root)).await.last().map(|r| r.item.event_id.clone()).unwrap_or_else(|| root.clone());
+        // Hidden in the thread: "/hidden text", or anything in a thread
+        // that starts with a hidden event (so the whole thread stays hidden).
+        let root_hidden = self.find(&key, root.as_str()).is_some_and(|m| m.is_hidden_event());
+        let asked = text.strip_prefix("/hidden ").map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned);
+        if root_hidden || asked.is_some() {
+            let text = asked.unwrap_or(text);
+            self.ui(|u| u.set_stick_bottom(true));
+            let shown = self.settings.lock().unwrap().show_hidden;
+            match timeline::send_hidden(&room, &text, None, Some((&root, &latest))).await {
+                Ok(_) if shown => self.status(""),
+                Ok(_) => self.status("Sent as a hidden event: only apps that show hidden events see it (Settings → Show hidden events)."),
+                Err(e) => self.status(format!("Couldn't send the hidden event: {e:#}")),
+            }
+            self.show_thread().await;
+            return;
+        }
         let me = room.own_user_id().to_owned();
         let account = self.mgr.accounts().await.into_iter().find(|a| a.id == key.0);
         let Ok(local) = OwnedEventId::try_from(format!("{}{}", timeline::LOCAL_ECHO, &whisker_core::vault::random_secret()[..12])) else { return };

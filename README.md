@@ -331,6 +331,13 @@ operating system and the **Wisp** browser.
   adds: its Android version, sometimes its make and model, and the time). Files Whisker can't clean (HEIC, AVIF, RAW, PDF, Office documents and the
   like, or video when ffmpeg is missing) are held back with a message instead of being
   sent as they are; turn the setting off to send them anyway.
+- **Hidden events.** Start a message with `/hidden` to send it as an event other apps don't
+  show (encrypted like any message in an encrypted room). It can carry pictures and files:
+  type `/hidden` (and a caption, if you like) with files attached. In a thread, `/hidden`
+  sends a hidden reply, and a thread started on a hidden event stays hidden: everything
+  sent in it from Whisker is hidden too. They're shown, marked "Hidden event", only with
+  Settings → *Show hidden events* (not by developer mode), and never in a room's file list
+  or a thread's count when that's off.
 - **Links you can click.** Web addresses in messages are shown as links; click one to open
   it. Ones you type are sent as real links too, so every app shows them that way, with no
   rich text needed. (Text with a link in it can't be drag-selected; *Copy whole message*

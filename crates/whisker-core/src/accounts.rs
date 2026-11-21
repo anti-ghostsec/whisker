@@ -310,7 +310,17 @@ impl AccountManager {
     }
 
     fn run_dir(&self, id: AccountId) -> PathBuf {
-        let name = self.run_names.lock().unwrap().entry(id).or_insert_with(|| random_secret()[..16].to_owned()).clone();
+        let name = self
+            .run_names
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_insert_with(|| {
+                let name = random_secret()[..16].to_owned();
+                stores::in_use(&name);
+                name
+            })
+            .clone();
         self.runtime.join(name)
     }
 
@@ -740,7 +750,9 @@ impl AccountManager {
         };
         for id in ids {
             let dir = self.run_dir(id);
-            self.run_names.lock().unwrap().remove(&id);
+            if let Some(name) = self.run_names.lock().unwrap().remove(&id) {
+            stores::let_go(&name);
+        }
             let _ = tokio::task::spawn_blocking(move || stores::shred_dir(&dir)).await;
         }
         let _ = self.events.send(ClientEvent::AccountsChanged);
@@ -1464,7 +1476,9 @@ impl AccountManager {
         }
         let _ = self.events.send(ClientEvent::AccountsChanged);
         let (running, legacy) = (self.run_dir(id), self.legacy_store_dir(id));
-        self.run_names.lock().unwrap().remove(&id);
+        if let Some(name) = self.run_names.lock().unwrap().remove(&id) {
+            stores::let_go(&name);
+        }
         tokio::spawn(async move {
             if let Some(live) = live {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(20), live.client.logout()).await;

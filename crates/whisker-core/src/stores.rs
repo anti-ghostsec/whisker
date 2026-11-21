@@ -47,6 +47,20 @@ pub fn runtime_root(data_dir: &Path) -> PathBuf {
     data_dir.join("run")
 }
 
+/// Names of the running-store folders this process has handed out and not
+/// yet let go of: a claim leaves them alone.
+static IN_USE: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Marks a running-store folder (by name) as in use by this process.
+pub fn in_use(name: &str) {
+    IN_USE.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned());
+}
+
+/// Lets go of a folder marked with [`in_use`].
+pub fn let_go(name: &str) {
+    IN_USE.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+}
+
 /// Claims the running-stores folder for this process and empties it of
 /// what an earlier run left behind (after a crash, or a kill): a folder per
 /// account there would count the accounts of every vault that was open,
@@ -62,21 +76,16 @@ pub fn claim(root: &Path) -> Option<std::fs::File> {
     }
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join(LOCK)).ok()?;
     lock.try_lock().ok()?;
-    // Once per process: what's there at a later claim in the same process
-    // (another manager, as tests start one each) is stores this process is
-    // running, not an earlier run's leftovers. Wiping them zeroed databases
-    // still in use.
-    {
-        static WIPED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-        let mut wiped = WIPED.lock().unwrap_or_else(|e| e.into_inner());
-        if wiped.iter().any(|w| w == root) {
-            return Some(lock);
-        }
-        wiped.push(root.to_path_buf());
-    }
+    let busy = IN_USE.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
         let p = e.path();
         if p.file_name().is_some_and(|n| n == LOCK) {
+            continue;
+        }
+        // Stores this process is running (another manager's, as tests start
+        // one each) aren't an earlier run's leftovers: wiping them zeroed
+        // databases still in use.
+        if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| busy.contains(n)) {
             continue;
         }
         // Not through a symlink: only what's in the folder itself goes.

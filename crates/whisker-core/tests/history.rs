@@ -150,8 +150,40 @@ async fn forwards_a_copy_without_the_reply() {
         .expect(1)
         .mount(server.server())
         .await;
-    let id = timeline::forward(&from, event_id!("$pic"), &to, None).await.unwrap();
+    let id = timeline::forward(&from, event_id!("$pic"), &to, None, &Default::default()).await.unwrap();
     assert_eq!(id, "$copy");
+}
+
+#[tokio::test]
+async fn an_encrypted_file_is_not_forwarded_into_a_plain_room() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let from = server.sync_joined_room(&client, room_id!("!from:localhost")).await;
+    let to = server.sync_joined_room(&client, room_id!("!to:localhost")).await;
+    plain_room(&server).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*from.*/event/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "m.room.message", "event_id": "$secret", "sender": "@bob:localhost", "origin_server_ts": 5,
+            "room_id": "!from:localhost",
+            "content": {"msgtype": "m.image", "body": "cat.png", "file": {
+                "url": "mxc://localhost/secret", "v": "v2",
+                "key": {"kty": "oct", "key_ops": ["encrypt", "decrypt"], "alg": "A256CTR", "k": "qcHVMSgYg-71CauWBezXI5qkaRb0LuIy-Wx5kIaHMIA", "ext": true},
+                "iv": "X85+XgHN+HEAAAAAAAAAAA", "hashes": {"sha256": "5qG4fFnbbVdlAB1Q72JDKwCagV6Dbkx9uds4rSak37c"}}}
+        })))
+        .mount(server.server())
+        .await;
+    // Nothing is sent: the key would be readable by anyone in that room.
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*to.*/send/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$leak"})))
+        .expect(0)
+        .mount(server.server())
+        .await;
+    let e = timeline::forward(&from, event_id!("$secret"), &to, None, &Default::default()).await.unwrap_err();
+    assert!(format!("{e:#}").contains("isn't"), "{e:#}");
+    let e = whisker_core::files::share_file_of(&from, event_id!("$secret"), &to, None, &Default::default()).await.unwrap_err();
+    assert!(format!("{e:#}").contains("isn't"), "{e:#}");
 }
 
 #[tokio::test]

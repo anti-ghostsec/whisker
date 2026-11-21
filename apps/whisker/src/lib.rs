@@ -169,10 +169,18 @@ struct State {
     /// Files picked to send with the next message (its text is their
     /// caption), in the open room.
     pending_files: Vec<PathBuf>,
-    /// Your stickers, with the vault each is kept in.
+    /// The open account's stickers, with the vault they're kept in. Only
+    /// that vault's: an account in another vault (a hidden alt, say) sending
+    /// a file this one uploaded would link the two.
     stickers: Vec<(VaultId, Sticker)>,
-    /// Your custom emoji (plain files), likewise.
+    /// The open account's custom emoji (plain files), likewise.
     emoji: Vec<(VaultId, Sticker)>,
+    /// Every unlocked vault's stickers and emoji.
+    vault_stickers: HashMap<VaultId, (Vec<Sticker>, Vec<Sticker>)>,
+    /// The vault each signed-in account is kept in.
+    account_vaults: HashMap<AccountId, VaultId>,
+    /// The vault `stickers` and `emoji` are from now.
+    sticker_vault: Option<VaultId>,
     /// The save dialog is saving a custom emoji, not a sticker.
     sticker_as_emoji: bool,
     /// The picture being saved as a sticker, while its name is asked.
@@ -316,7 +324,10 @@ fn decode(bytes: &[u8], max_w: u32, max_h: u32, square: bool) -> Option<Pixels> 
     limits.max_image_height = Some(16_384);
     limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
-    let img = reader.decode().ok()?;
+    let img = match reader.decode() {
+        Ok(img) => img,
+        Err(_) => image::DynamicImage::ImageRgba8(svg(bytes, max_w, max_h)?),
+    };
     let img = if square {
         img.resize_to_fill(max_w, max_h, image::imageops::FilterType::Triangle)
     } else if img.width() > max_w || img.height() > max_h {
@@ -326,6 +337,38 @@ fn decode(bytes: &[u8], max_w: u32, max_h: u32, square: bool) -> Option<Pixels> 
     };
     let img = img.to_rgba8();
     Some(Pixels::clone_from_slice(img.as_raw(), img.width(), img.height()))
+}
+
+/// An SVG (or SVGZ) picture drawn to fit `max_w` × `max_h`. Nothing it
+/// names is fetched: no web addresses and no files on this device (only
+/// pictures inside the SVG itself are drawn), and text uses the fonts
+/// already installed.
+fn svg(bytes: &[u8], max_w: u32, max_h: u32) -> Option<image::RgbaImage> {
+    use resvg::{tiny_skia, usvg};
+    static FONTS: std::sync::OnceLock<std::sync::Arc<fontdb::Database>> = std::sync::OnceLock::new();
+    let fonts = FONTS.get_or_init(|| {
+        let mut db = fontdb::Database::new();
+        #[cfg(target_os = "android")]
+        db.load_fonts_dir("/system/fonts");
+        #[cfg(not(target_os = "android"))]
+        db.load_system_fonts();
+        std::sync::Arc::new(db)
+    });
+    let mut opt = usvg::Options::default();
+    opt.fontdb = fonts.clone();
+    opt.image_href_resolver.resolve_string = Box::new(|_: &str, _: &usvg::Options| None);
+    let tree = usvg::Tree::from_data(bytes, &opt).ok()?;
+    let size = tree.size();
+    let (w, h) = (size.width(), size.height());
+    if !(w > 0.0 && h > 0.0) {
+        return None;
+    }
+    // Vector: drawn at the size it's shown, up to 4× its own.
+    let scale = (max_w as f32 / w).min(max_h as f32 / h).min(4.0);
+    let (pw, ph) = (((w * scale).round() as u32).clamp(1, max_w.max(1)), ((h * scale).round() as u32).clamp(1, max_h.max(1)));
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
+    resvg::render(&tree, tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h), &mut pixmap.as_mut());
+    image::RgbaImage::from_raw(pw, ph, pixmap.take_demultiplied())
 }
 
 /// Opens a web link in the system browser. Only http(s) and mailto.
@@ -1075,19 +1118,13 @@ impl Ctl {
             if let Some(words) = self.mgr.extra::<Vec<String>>(v, spell::VAULT_KEY).await {
                 spell::add_custom(words);
             }
-            if let Some(list) = self.mgr.extra::<Vec<Sticker>>(v, stickers::VAULT_KEY).await {
-                let mut st = self.st.lock().unwrap();
-                st.stickers.retain(|(from, _)| from != v);
-                st.stickers.extend(list.into_iter().map(|x| (v.clone(), x)));
-            }
-            if let Some(list) = self.mgr.extra::<Vec<Sticker>>(v, stickers::EMOJI_KEY).await {
-                let mut st = self.st.lock().unwrap();
-                st.emoji.retain(|(from, _)| from != v);
-                st.emoji.extend(list.into_iter().map(|x| (v.clone(), x)));
-            }
+            let kept = self.mgr.extra::<Vec<Sticker>>(v, stickers::VAULT_KEY).await.unwrap_or_default();
+            let emoji = self.mgr.extra::<Vec<Sticker>>(v, stickers::EMOJI_KEY).await.unwrap_or_default();
+            self.st.lock().unwrap().vault_stickers.insert(v.clone(), (kept, emoji));
             handles.extend(whisker_agent::start_vault(&self.mgr, v).await);
         }
-        self.emoji_changed();
+        self.note_account_vaults().await;
+        self.sticker_vault_changed(true);
         {
             let mut st = self.st.lock().unwrap();
             for (account, h) in handles {
@@ -1199,6 +1236,8 @@ impl Ctl {
             }
             st.account
         };
+        self.note_account_vaults().await;
+        self.sticker_vault_changed(false);
         let mut rows = Vec::new();
         for a in &list {
             let unread = match self.mgr.client(a.id).await {
@@ -3261,15 +3300,27 @@ impl Ctl {
                     },
                 };
                 let Some(from) = from.and_then(|id| client.get_room(&id)) else { return false };
-                match files::share_file_of(&from, &event, room, reply_to).await {
+                let opts = self.settings.lock().unwrap().upload.clone();
+                self.status("Sending the file…");
+                match files::share_file_of(&from, &event, room, reply_to, &opts).await {
                     Ok(Some(_)) => {
                         self.status("");
                         true
                     }
-                    Ok(None) => false,
-                    Err(e) => {
-                        tracing::warn!("couldn't share the file of {event}: {e:#}");
+                    Ok(None) => {
+                        self.status("");
                         false
+                    }
+                    Err(e) => {
+                        // Not sent as the link either: say why, and give the text back.
+                        self.status(format!("Not sent: {e:#}"));
+                        let text = format!("https://matrix.to/#/{}/{event}", from.room_id());
+                        self.ui(move |u| {
+                            if u.get_draft().is_empty() {
+                                u.set_draft(s(text));
+                            }
+                        });
+                        true
                     }
                 }
             }
@@ -3386,15 +3437,13 @@ impl Ctl {
         }
         {
             let mut st = self.st.lock().unwrap();
-            st.stickers.retain(|(_, x)| x.name != sticker.name);
+            st.vault_stickers.entry(vault).or_default().0 = list;
             st.sticker_pics.remove(&sticker.name);
-            st.stickers.push((vault, sticker.clone()));
-            st.stickers.sort_by(|a, b| a.1.name.cmp(&b.1.name));
             st.sticker_from = None;
         }
         self.ui(|u| u.set_sticker_save_open(false));
         self.status(format!("Saved as :{}: (type it to send it)", sticker.name));
-        self.show_stickers();
+        self.sticker_vault_changed(true);
     }
 
     /// Saves `media` as a custom emoji called `name`: a plain file (an
@@ -3440,14 +3489,39 @@ impl Ctl {
         }
         {
             let mut st = self.st.lock().unwrap();
-            st.emoji.retain(|(_, x)| x.name != emoji.name);
+            st.vault_stickers.entry(vault).or_default().1 = list;
             st.sticker_pics.remove(&format!("emoji:{}", emoji.name));
-            st.emoji.push((vault, emoji.clone()));
-            st.emoji.sort_by(|a, b| a.1.name.cmp(&b.1.name));
             st.sticker_from = None;
         }
         self.ui(|u| u.set_sticker_save_open(false));
         self.status(format!("Saved as the emoji :{}: (type it in a message, or react with it)", emoji.name));
+        self.sticker_vault_changed(true);
+    }
+
+    /// Notes which vault each signed-in account is kept in.
+    async fn note_account_vaults(&self) {
+        let map: HashMap<AccountId, VaultId> = self.mgr.accounts().await.into_iter().map(|a| (a.id, a.vault)).collect();
+        self.st.lock().unwrap().account_vaults = map;
+    }
+
+    /// Shows only the open account's vault's stickers and emoji, when that
+    /// vault changed (or always, with `force`, after the lists did).
+    fn sticker_vault_changed(&self, force: bool) {
+        {
+            let mut st = self.st.lock().unwrap();
+            let vault = st.account.and_then(|a| st.account_vaults.get(&a).cloned());
+            if !force && vault == st.sticker_vault {
+                return;
+            }
+            let (kept, emoji) = vault.as_ref().and_then(|v| st.vault_stickers.get(v).cloned()).unwrap_or_default();
+            st.stickers = vault.iter().flat_map(|v| kept.iter().map(move |x| (v.clone(), x.clone()))).collect();
+            st.emoji = vault.iter().flat_map(|v| emoji.iter().map(move |x| (v.clone(), x.clone()))).collect();
+            if vault != st.sticker_vault {
+                // Pictures are kept by name, and names repeat across vaults.
+                st.sticker_pics.clear();
+            }
+            st.sticker_vault = vault;
+        }
         self.emoji_changed();
     }
 
@@ -3486,9 +3560,9 @@ impl Ctl {
                 if let Err(e) = self.mgr.set_extra(&vault, stickers::EMOJI_KEY, &list).await {
                     return self.status(format!("Couldn't remove it: {e:#}"));
                 }
+                self.st.lock().unwrap().vault_stickers.entry(vault).or_default().1 = list;
             }
-            self.st.lock().unwrap().emoji.retain(|(_, x)| x.name != name);
-            return self.emoji_changed();
+            return self.sticker_vault_changed(true);
         }
         let vault = self.st.lock().unwrap().stickers.iter().find(|(_, x)| x.name == name).map(|(v, _)| v.clone());
         if let Some(vault) = vault {
@@ -3497,9 +3571,9 @@ impl Ctl {
             if let Err(e) = self.mgr.set_extra(&vault, stickers::VAULT_KEY, &list).await {
                 return self.status(format!("Couldn't remove it: {e:#}"));
             }
+            self.st.lock().unwrap().vault_stickers.entry(vault).or_default().0 = list;
         }
-        self.st.lock().unwrap().stickers.retain(|(_, x)| x.name != name);
-        self.show_stickers();
+        self.sticker_vault_changed(true);
     }
 
     async fn open_stickers(&self) {
@@ -3585,6 +3659,7 @@ impl Ctl {
         if want.is_empty() {
             return;
         }
+        let from = self.st.lock().unwrap().sticker_vault.clone();
         // Marked as loading (no picture yet) so they're asked for once.
         for (k, _) in &want {
             self.st.lock().unwrap().sticker_pics.insert(k.clone(), None);
@@ -3598,7 +3673,12 @@ impl Ctl {
                     Ok(b) => tokio::task::spawn_blocking(move || decode(&b, 96, 96, false)).await.ok().flatten(),
                     Err(_) => None,
                 };
-                c.st.lock().unwrap().sticker_pics.insert(k, px);
+                let mut st = c.st.lock().unwrap();
+                // Not one from a vault switched away from meanwhile.
+                if st.sticker_vault != from {
+                    return;
+                }
+                st.sticker_pics.insert(k, px);
             }
             c.show_stickers();
             c.show_quick_reactions();
@@ -4062,8 +4142,8 @@ impl Ctl {
         };
         let Some(client) = self.mgr.client(account).await else { return };
         // Sent by another account: the message is read with its own account
-        // and sent with the other (files keep working: their address, and for
-        // encrypted ones the key, travel in the message).
+        // and sent with the other (a plain file's address travels in the
+        // message; an encrypted file goes as a fresh copy with its own key).
         let Some(sending) = self.mgr.client(sender).await else { return };
         let (Some(from), Some(to)) = (client.get_room(&from_id), OwnedRoomId::try_from(target.as_str()).ok().and_then(|id| sending.get_room(&id))) else { return };
         // An edited text message goes as its newest text.
@@ -4080,7 +4160,8 @@ impl Ctl {
             }
         };
         self.ui(mark(true, target.clone()));
-        match timeline::forward(&from, &event_id, &to, edited.as_deref()).await {
+        let opts = self.settings.lock().unwrap().upload.clone();
+        match timeline::forward(&from, &event_id, &to, edited.as_deref(), &opts).await {
             Ok(_) => {
                 let name = timeline::room_name(&to).await;
                 self.ui(move |u| u.set_forward_status(s(format!("Forwarded to {name}."))));
@@ -4315,6 +4396,7 @@ impl Ctl {
             st.account = Some(account);
             st.room = None;
         }
+        self.sticker_vault_changed(false);
         let room_id = target.clone();
         self.ui(move |u| {
             u.set_share_busy(false);
@@ -7630,6 +7712,23 @@ async fn clear_rights(room: &matrix_sdk::Room) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draws_svg_pictures_without_fetching() {
+        // A file on this device named by the SVG isn't drawn (or read).
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="10">
+            <rect width="20" height="10" fill="#ff0000"/>
+            <image xlink:href="/etc/hostname" width="20" height="10"/>
+            <image xlink:href="https://example.org/x.png" width="20" height="10"/></svg>"##;
+        let px = decode(svg, 100, 100, false).unwrap();
+        assert_eq!((px.width(), px.height()), (80, 40));
+        let p = px.as_slice()[0];
+        assert_eq!((p.r, p.g, p.b, p.a), (255, 0, 0, 255));
+        // Squared for an avatar, and junk is still nothing.
+        let sq = decode(svg, 32, 32, true).unwrap();
+        assert_eq!((sq.width(), sq.height()), (32, 32));
+        assert!(decode(b"not a picture", 100, 100, false).is_none());
+    }
 
     #[test]
     fn reads_room_links() {

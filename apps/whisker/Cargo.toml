@@ -19,6 +19,10 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+# SVG pictures (Slint already builds these): drawn here, never fetching
+# anything an SVG names.
+resvg = { version = "0.49", default-features = false, features = ["text", "raster-images", "svgz"] }
+fontdb = { version = "0.24", default-features = false, features = ["std", "fs"] }
 chrono.workspace = true
 matrix-sdk.workspace = true
 directories.workspace = true

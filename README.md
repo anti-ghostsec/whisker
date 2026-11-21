@@ -136,10 +136,11 @@ operating system and the **Wisp** browser.
   window; if it's locked, the share waits until you unlock. Starting a different (newer)
   build while an older one is open closes the old one, so the new one takes over. On
   Android it's in the system Share menu.
-- **Forward** any message from its right-click menu to one or more of your rooms. Images
-  and files are re-posted as the same file (nothing is downloaded or uploaded again);
-  replies lose their reply link. Forwarding from an encrypted room into an unencrypted
-  one makes that file readable to the new room.
+- **Forward** any message from its right-click menu to one or more of your rooms. Plain
+  images and files are re-posted as the same file (nothing is downloaded or uploaded
+  again); an encrypted one goes as a fresh copy with its own key, so the two rooms share
+  neither the key nor the file, and it isn't sent into a room that isn't encrypted at all
+  (anyone could read it there). Replies lose their reply link.
 - **File links:** *Copy file link* on a picture, video or file's menu copies its address
   (`mxc://server/id`). Paste one on its own and send it, and it goes out as that picture,
   video or file without being uploaded again; Whisker asks the server only for its type and
@@ -147,7 +148,8 @@ operating system and the **Wisp** browser.
   app as text) shows the file itself. Media download addresses
   (`https://…/_matrix/…/download/server/id`) work too. An encrypted file's address can't
   open it without the message's key, so its link is a matrix.to link to the message: sending
-  that re-posts the file, for people who can see the original room. A video's link goes with
+  that sends the file, as a fresh copy with its own key (the same rules as Forward: never
+  into a room that isn't encrypted). A video's link goes with
   its size and length, read from just the parts of the video that hold them, and a small preview
   frame is uploaded so other apps show a picture (Settings can turn that off). Whisker reads the
   video through a private relay on this computer, so your login never reaches ffmpeg.
@@ -158,7 +160,8 @@ operating system and the **Wisp** browser.
   to try again. Servers that list the newer logged-in media addresses but turn some files down
   there ("Unrecognized request"), as some matrix-media-repo setups do, get asked at the older
   address instead.
-- **Images and videos:** right-click the picture or video itself to save it; the full-size
+- **Images and videos:** SVG pictures are shown too (drawn here; nothing an SVG names is
+  fetched, from the web or from your device). Right-click the picture or video itself to save it; the full-size
   viewer has Save / Forward / Close buttons and its own right-click menu, and zooms with two
   fingers, a trackpad pinch, the mouse wheel or a double tap (drag to look around). **GIFs and
   animated WebP play and loop**, in the timeline and the viewer. Videos show their preview
@@ -334,7 +337,9 @@ operating system and the **Wisp** browser.
 - **Stickers and custom emoji.** Right-click a picture and pick *Save as sticker…* (sent
   on its own by typing `:name:`) or *Save as emoji…* (`:name:` inside a message becomes the
   picture inline, and your emoji are under *React*). Both lists are kept in your vault, not
-  on the server. Custom emoji have to be plain files (that's how every app reads them), so
+  on the server, and each vault has its own: an account only sees and sends the ones saved
+  in its vault, so a hidden alt's stickers never show up for your main account (sending
+  the same file would link the two). Custom emoji have to be plain files (that's how every app reads them), so
   saving an encrypted picture as one uploads an unencrypted copy, without its metadata,
   after saying so. Other apps show your inline emoji; Whisker itself shows `:name:` in the
   text for now, and the picture in reactions.

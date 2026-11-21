@@ -87,10 +87,10 @@ impl LinkedFile {
     }
 }
 
-/// Pictures we can show, videos and sound by their type; the rest are files.
+/// Pictures we can show (SVG too), videos and sound by their type; the rest
+/// are files.
 pub fn kind_of(mime: Option<&str>) -> MediaKind {
     match mime.unwrap_or_default() {
-        "image/svg+xml" => MediaKind::File,
         m if m.starts_with("image/") => MediaKind::Image,
         m if m.starts_with("video/") => MediaKind::Video,
         m if m.starts_with("audio/") => MediaKind::Audio,
@@ -738,10 +738,18 @@ pub async fn send_linked(room: &Room, mxc: &MxcUri, file: &LinkedFile, details: 
     Ok(room.send(content).with_request_config(config).await?.response.event_id)
 }
 
-/// Re-posts the file of message `event` in `from` into `to`, as the same
-/// file (an encrypted one keeps its key). `None` when that message has no
-/// file, or isn't one this device can read.
-pub async fn share_file_of(from: &Room, event: &EventId, to: &Room, reply_to: Option<&EventId>) -> Result<Option<OwnedEventId>> {
+/// Re-posts the file of message `event` in `from` into `to`: a plain file as
+/// the same file, an encrypted one as a fresh copy with its own key (never
+/// its key, and never into a room that isn't encrypted; see
+/// [`copy_encrypted`]). `None` when that message has no file, or isn't one
+/// this device can read.
+pub async fn share_file_of(
+    from: &Room,
+    event: &EventId,
+    to: &Room,
+    reply_to: Option<&EventId>,
+    opts: &crate::upload::UploadOptions,
+) -> Result<Option<OwnedEventId>> {
     use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
     let ev = from.event(event, None).await.context("couldn't fetch that message")?;
     let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)))) = ev.raw().deserialize() else {
@@ -750,12 +758,63 @@ pub async fn share_file_of(from: &Room, event: &EventId, to: &Room, reply_to: Op
     if !matches!(m.content.msgtype, MessageType::Image(_) | MessageType::Video(_) | MessageType::Audio(_) | MessageType::File(_)) {
         return Ok(None);
     }
+    if has_encrypted_media(&m.content.msgtype) {
+        let msg = copy_encrypted(from, &m.content.msgtype, to, opts).await?;
+        return Ok(Some(crate::upload::post_reply(to, msg, reply_to).await?));
+    }
     let mut content = RoomMessageEventContent::new(m.content.msgtype);
     if let Some(r) = reply_to {
         content.relates_to = Some(Relation::Reply(Reply::new(InReplyTo::new(r.to_owned()))));
     }
     let config = crate::timeline::send_config();
     Ok(Some(to.send(content).with_request_config(config).await?.response.event_id))
+}
+
+/// Whether a message's file (or its preview picture) is encrypted, so
+/// posting the message as it is would hand its key to another room.
+pub fn has_encrypted_media(m: &MessageType) -> bool {
+    crate::timeline::media_of(m).is_some_and(|x| {
+        matches!(x.source, MediaSource::Encrypted(_)) || matches!(x.thumbnail, Some(MediaSource::Encrypted(_)))
+    })
+}
+
+/// A fresh copy of an encrypted message's file for `to`: downloaded from
+/// `from`, what metadata can be taken out taken out, and uploaded again
+/// with a new key, so the
+/// two rooms don't share a key or a file address. Refused when `to` isn't
+/// encrypted: the file would be readable there by anyone, which isn't what
+/// the room it came from promised its sender.
+pub async fn copy_encrypted(from: &Room, m: &MessageType, to: &Room, opts: &crate::upload::UploadOptions) -> Result<MessageType> {
+    let Some(media) = crate::timeline::media_of(m) else { bail!("that message has no file") };
+    let encrypted = to.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false);
+    if !encrypted {
+        bail!("that file is encrypted and this room isn't, so it wasn't sent here (anyone could read it). Send it to an encrypted room, or save it and send it yourself");
+    }
+    let bytes = crate::timeline::download_in(&from.client(), from.room_id(), &media.source, None)
+        .await
+        .context("couldn't get the file")?;
+    let (name, opts) = (media.name.clone(), opts.clone());
+    let prepared = tokio::task::spawn_blocking(move || crate::upload::prepare(&name, bytes, &opts, None)).await?;
+    // What couldn't be cleaned (a PDF's author, say) is its sender's, as
+    // it was in the room it came from: it goes on as it is.
+    let mut msg = crate::upload::upload(to, prepared, true, |_| {}).await?;
+    // A caption (the text when it isn't just the file's name) goes along.
+    let body = m.body();
+    if body != media.name && !body.trim().is_empty() {
+        msg = crate::upload::with_caption(msg, body);
+    }
+    Ok(msg)
+}
+
+/// Whether a file is an SVG picture, by its type or else its name.
+pub fn is_svg(mime: Option<&str>, name: &str) -> bool {
+    match mime {
+        Some(m) if m != "application/octet-stream" => m.eq_ignore_ascii_case("image/svg+xml"),
+        _ => {
+            let n = name.to_ascii_lowercase();
+            n.ends_with(".svg") || n.ends_with(".svgz")
+        }
+    }
 }
 
 fn message_for(mxc: &MxcUri, file: &LinkedFile, details: &Details) -> MessageType {
@@ -949,7 +1008,11 @@ mod tests {
         assert_eq!(name_for(&mxc, &png), "abc.png");
         assert_eq!(png.kind(), MediaKind::Image);
         assert_eq!(kind_of(Some("video/mp4")), MediaKind::Video);
-        assert_eq!(kind_of(Some("image/svg+xml")), MediaKind::File);
+        assert_eq!(kind_of(Some("image/svg+xml")), MediaKind::Image);
+        assert!(is_svg(Some("image/svg+xml"), "x"));
+        assert!(is_svg(None, "Logo.SVG"));
+        assert!(is_svg(Some("application/octet-stream"), "a.svgz"));
+        assert!(!is_svg(Some("image/png"), "a.svg"));
         assert_eq!(kind_of(None), MediaKind::File);
         match message_for(&mxc, &png, &Details { size: Some((800, 800)), ..Default::default() }) {
             MessageType::Image(i) => {

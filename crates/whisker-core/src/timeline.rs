@@ -229,7 +229,7 @@ pub fn parse_sticker(c: &matrix_sdk::ruma::events::sticker::StickerEventContent)
     Parsed::New { body: "Sent a sticker".into(), is_text: false, reply_to, media: Some(media), thread, pills: Vec::new() }
 }
 
-fn media_of(m: &MessageType) -> Option<Media> {
+pub(crate) fn media_of(m: &MessageType) -> Option<Media> {
     let u = |v: Option<UInt>| v.map(u64::from);
     Some(match m {
         MessageType::Image(c) => Media {
@@ -265,8 +265,9 @@ fn media_of(m: &MessageType) -> Option<Media> {
             height: None,
             linked: false,
         },
+        // An SVG is sent as a file by most apps; it's shown as a picture.
         MessageType::File(c) => Media {
-            kind: MediaKind::File,
+            kind: if crate::files::is_svg(c.info.as_ref().and_then(|i| i.mimetype.as_deref()), c.filename()) { MediaKind::Image } else { MediaKind::File },
             source: c.source.clone(),
             thumbnail: c.info.as_ref().and_then(|i| i.thumbnail_source.clone()),
             name: c.filename().to_owned(),
@@ -1382,10 +1383,18 @@ pub async fn react(room: &Room, target: &EventId, key: &str) -> Result<OwnedEven
     Ok(room.send(content).with_request_config(config).await?.response.event_id)
 }
 
-/// Posts a copy of a message from `from` into `to`. Media is re-posted as
-/// the same file (no download or upload); replies and mentions are dropped,
-/// and an edited message goes as its newest text.
-pub async fn forward(from: &Room, event_id: &EventId, to: &Room, edited_body: Option<&str>) -> Result<OwnedEventId> {
+/// Posts a copy of a message from `from` into `to`. A plain file is
+/// re-posted as the same file (no download or upload); an encrypted one as
+/// a fresh copy with its own key (see [`crate::files::copy_encrypted`]).
+/// Replies and mentions are dropped, and an edited message goes as its
+/// newest text.
+pub async fn forward(
+    from: &Room,
+    event_id: &EventId,
+    to: &Room,
+    edited_body: Option<&str>,
+    opts: &crate::upload::UploadOptions,
+) -> Result<OwnedEventId> {
     let content = match edited_body {
         Some(body) => RoomMessageEventContent::text_plain(body),
         None => {
@@ -1403,6 +1412,10 @@ pub async fn forward(from: &Room, event_id: &EventId, to: &Room, edited_body: Op
             // A reply carries a quote of what it answers; send just its own text.
             if let (true, MessageType::Text(t)) = (reply, &content.msgtype) {
                 content = RoomMessageEventContent::text_plain(strip_reply_fallback(&t.body));
+            }
+            if crate::files::has_encrypted_media(&content.msgtype) {
+                let msg = crate::files::copy_encrypted(from, &content.msgtype, to, opts).await?;
+                return crate::upload::post(to, msg).await;
             }
             content
         }

@@ -167,6 +167,8 @@ export struct Suggestion {
 export struct StickerItem {
     name: string,
     picture: image,
+    // One of your custom emoji (clicking puts :name: in the message).
+    emoji: bool,
 }
 
 // An emoji in the picker, with its colour picture.
@@ -749,6 +751,7 @@ component MessageRow inherits Rectangle {
                 if root.selection != "" || TextTools.spanning: MenuSeparator {}
                 if root.item.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.item.id); } }
                 if root.item.media == 1: MenuItem { title: "Save as sticker…"; activated => { root.action("save-sticker", root.item.id); } }
+                if root.item.media == 1: MenuItem { title: "Save as emoji…"; activated => { root.action("save-emoji", root.item.id); } }
                 if Prefs.menu-open-media && (root.item.media == 2 || root.item.media == 3): MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
                 if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
                 if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
@@ -1823,6 +1826,7 @@ component MessageSheet inherits Rectangle {
                         if root.item.media > 0: SheetRow { text: "Share…"; clicked => { root.run("share"); } }
                         if root.item.media == 1: SheetRow { text: "Save image"; clicked => { root.run("save"); } }
                         if root.item.media == 1: SheetRow { text: "Save as sticker"; clicked => { root.run("save-sticker"); } }
+                        if root.item.media == 1: SheetRow { text: "Save as emoji"; clicked => { root.run("save-emoji"); } }
                         if root.item.media == 2: SheetRow { text: "Save video"; clicked => { root.run("save"); } }
                         if root.item.media == 3: SheetRow { text: "Save audio"; clicked => { root.run("save"); } }
                         if root.item.media > 3: SheetRow { text: "Save file"; clicked => { root.run("save"); } }
@@ -1910,6 +1914,9 @@ export component AppWindow inherits Window {
     in-out property <bool> sticker-save-open;
     in-out property <string> sticker-name;
     in property <string> sticker-error;
+    // The save dialog is for a custom emoji, and what to know first.
+    in property <bool> sticker-as-emoji;
+    in property <string> sticker-note;
     callback save-sticker(string);
     in-out property <bool> stickers-open;
     in property <[StickerItem]> stickers;
@@ -3666,11 +3673,14 @@ export component AppWindow inherits Window {
 
         if root.sticker-save-open: Overlay {
             dismiss => { root.sticker-save-open = false; }
-            Text { text: "Save as sticker"; font-size: 18px; font-weight: 800; color: Theme.text; }
+            Text { text: root.sticker-as-emoji ? "Save as emoji" : "Save as sticker"; font-size: 18px; font-weight: 800; color: Theme.text; }
             Text {
-                text: "Give it a short name. Typing :name: then sends it, in any room. Your stickers are kept in your vault, not on the server.";
+                text: root.sticker-as-emoji
+                    ? "Give it a short name. Type :name: in a message to put it in the text, or pick it under React. Your list of emoji is kept in your vault, not on the server."
+                    : "Give it a short name. Typing :name: then sends it, in any room. Your stickers are kept in your vault, not on the server.";
                 color: Theme.muted; font-size: 12px; wrap: word-wrap;
             }
+            if root.sticker-note != "": Text { text: root.sticker-note; color: Theme.text; font-size: 12px; wrap: word-wrap; }
             sname := Input {
                 text <=> root.sticker-name;
                 placeholder: "name (letters, numbers, - or _)";
@@ -3688,9 +3698,9 @@ export component AppWindow inherits Window {
         if root.stickers-open: Overlay {
             card-width: 460px;
             dismiss => { root.stickers-open = false; }
-            Text { text: "Stickers"; font-size: 18px; font-weight: 800; color: Theme.text; }
+            Text { text: "Stickers and emoji"; font-size: 18px; font-weight: 800; color: Theme.text; }
             if root.stickers.length == 0: Text {
-                text: "No stickers yet. Right-click a picture in a chat and pick \"Save as sticker…\".";
+                text: "No stickers or emoji yet. Right-click a picture in a chat and pick \"Save as sticker…\" or \"Save as emoji…\".";
                 color: Theme.muted; font-size: 12px; wrap: word-wrap;
             }
             if root.stickers.length > 0: Text {
@@ -3704,7 +3714,7 @@ export component AppWindow inherits Window {
                         height: 72px;
                         border-radius: 8px;
                         background: xta.has-hover ? Theme.hover : transparent;
-                        xta := TouchArea { mouse-cursor: pointer; clicked => { root.send-sticker(x.name); } }
+                        xta := TouchArea { mouse-cursor: pointer; clicked => { root.send-sticker(x.emoji ? "emoji:" + x.name : x.name); } }
                         HorizontalLayout {
                             padding: 6px;
                             spacing: 12px;
@@ -3714,8 +3724,8 @@ export component AppWindow inherits Window {
                                 if x.picture.width > 0: Image { source: x.picture; width: 60px; height: 60px; image-fit: contain; }
                                 if x.picture.width == 0: Text { text: "…"; color: Theme.muted; }
                             }
-                            Text { text: ":" + x.name + ":"; color: Theme.text; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                            VerticalLayout { alignment: center; IconBtn { icon: "✕"; size: 28px; clicked => { root.remove-sticker(x.name); } } }
+                            Text { text: ":" + x.name + ":" + (x.emoji ? "  · emoji" : ""); color: Theme.text; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                            VerticalLayout { alignment: center; IconBtn { icon: "✕"; size: 28px; clicked => { root.remove-sticker(x.emoji ? "emoji:" + x.name : x.name); } } }
                         }
                     }
                 }

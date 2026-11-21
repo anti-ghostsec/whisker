@@ -1275,8 +1275,25 @@ fn text_content(formatted: &str, plain: &str) -> RoomMessageEventContentWithoutR
     let mut content = RoomMessageEventContentWithoutRelation::text_markdown(autolink(formatted));
     if let MessageType::Text(t) = &mut content.msgtype {
         t.body = plain.to_owned();
+        // Your custom emoji (`:name:`) as inline pictures; the plain text
+        // keeps `:name:` for apps that only show text.
+        let emoji = CUSTOM_EMOJI.read().unwrap().clone();
+        let html = t.formatted.as_ref().map_or_else(|| crate::stickers::plain_html(&t.body), |f| f.body.clone());
+        if let Some(html) = crate::stickers::inline_emoji(&html, &emoji) {
+            t.formatted = Some(matrix_sdk::ruma::events::room::message::FormattedBody::html(html));
+        }
     }
     content
+}
+
+/// Your custom emoji, (name, plain mxc address), used by messages sent from
+/// here: see [`set_custom_emoji`].
+static CUSTOM_EMOJI: std::sync::RwLock<Vec<(String, String)>> = std::sync::RwLock::new(Vec::new());
+
+/// The custom emoji (name, plain mxc address) that `:name:` turns into in
+/// messages sent, and that reactions with that picture are named by.
+pub fn set_custom_emoji(list: Vec<(String, String)>) {
+    *CUSTOM_EMOJI.write().unwrap() = list;
 }
 
 /// Bare `http(s)://` addresses as Markdown autolinks (`<…>`), so the
@@ -1351,6 +1368,15 @@ pub async fn edit_caption(room: &Room, target: &EventId, caption: &str) -> Resul
 pub async fn react(room: &Room, target: &EventId, key: &str) -> Result<OwnedEventId> {
     use matrix_sdk::ruma::events::reaction::ReactionEventContent;
     use matrix_sdk::ruma::events::relation::Annotation;
+    // A custom emoji: its picture, named the way other apps (Cinny) read it.
+    if key.starts_with("mxc://") {
+        let name = CUSTOM_EMOJI.read().unwrap().iter().find(|(_, m)| m == key).map(|(n, _)| format!(":{n}:"));
+        let mut content = serde_json::json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": target, "key": key } });
+        if let Some(n) = name {
+            content["shortcode"] = n.into();
+        }
+        return Ok(room.send_raw("m.reaction", content).with_request_config(send_config()).await?.response.event_id);
+    }
     let content = ReactionEventContent::new(Annotation::new(target.to_owned(), key.to_owned()));
     let config = send_config();
     Ok(room.send(content).with_request_config(config).await?.response.event_id)

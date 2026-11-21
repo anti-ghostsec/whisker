@@ -171,6 +171,10 @@ struct State {
     pending_files: Vec<PathBuf>,
     /// Your stickers, with the vault each is kept in.
     stickers: Vec<(VaultId, Sticker)>,
+    /// Your custom emoji (plain files), likewise.
+    emoji: Vec<(VaultId, Sticker)>,
+    /// The save dialog is saving a custom emoji, not a sticker.
+    sticker_as_emoji: bool,
     /// The picture being saved as a sticker, while its name is asked.
     sticker_from: Option<timeline::Media>,
     /// Stickers' pictures, small (`None`: couldn't be loaded).
@@ -285,6 +289,19 @@ fn seen_label(ts: MilliSecondsSinceUnixEpoch) -> String {
         1 => t.format("yesterday %H:%M").to_string(),
         _ => t.format("%-d %B %Y").to_string(),
     }
+}
+
+/// The React menu's usual few.
+fn quick_reactions() -> Vec<QuickReaction> {
+    emoji::QUICK
+        .iter()
+        .zip(emoji::QUICK_LABELS)
+        .map(|(e, label)| QuickReaction {
+            emoji: s(*e),
+            label: s(label),
+            icon: emoji::picture(e).and_then(|png| decode(png, 32, 32, false)).map(Image::from_rgba8).unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn split_tags(t: &str) -> Vec<String> {
@@ -1063,8 +1080,14 @@ impl Ctl {
                 st.stickers.retain(|(from, _)| from != v);
                 st.stickers.extend(list.into_iter().map(|x| (v.clone(), x)));
             }
+            if let Some(list) = self.mgr.extra::<Vec<Sticker>>(v, stickers::EMOJI_KEY).await {
+                let mut st = self.st.lock().unwrap();
+                st.emoji.retain(|(from, _)| from != v);
+                st.emoji.extend(list.into_iter().map(|x| (v.clone(), x)));
+            }
             handles.extend(whisker_agent::start_vault(&self.mgr, v).await);
         }
+        self.emoji_changed();
         {
             let mut st = self.st.lock().unwrap();
             for (account, h) in handles {
@@ -1130,6 +1153,9 @@ impl Ctl {
         spell::clear_custom();
         whisker_core::stores::shred_dir(&media_dir(self.mgr.data_dir()));
         *self.st.lock().unwrap() = State::default();
+        // Your emoji leave with the vault: from messages and the React menu.
+        timeline::set_custom_emoji(Vec::new());
+        self.show_quick_reactions();
         self.avatars.lock().unwrap().clear();
         self.ui(|u| {
             ui::with(|m| m.clear());
@@ -3332,6 +3358,9 @@ impl Ctl {
     /// Saves the picture whose menu was used as a sticker called `name`.
     async fn save_sticker(&self, name: String) {
         let Some(media) = self.st.lock().unwrap().sticker_from.clone() else { return };
+        if self.st.lock().unwrap().sticker_as_emoji {
+            return self.save_emoji(name, media).await;
+        }
         let sticker = match Sticker::from_media(&name, &media) {
             Ok(x) => x,
             Err(e) => {
@@ -3363,7 +3392,99 @@ impl Ctl {
         self.show_stickers();
     }
 
+    /// Saves `media` as a custom emoji called `name`: a plain file (an
+    /// encrypted picture is uploaded again as a plain copy, its metadata
+    /// taken out).
+    async fn save_emoji(&self, name: String, mut media: timeline::Media) {
+        let fail = |m: String| self.ui(move |u| u.set_sticker_error(s(m)));
+        if stickers::clean_name(&name).is_none() {
+            return fail("Use letters, numbers, - or _ for the name.".into());
+        }
+        let Some(vault) = self.spell_vault().await else { return fail("Unlock an account first.".into()) };
+        if matches!(media.source, MediaSource::Encrypted(_)) {
+            let Some(account) = self.st.lock().unwrap().account else { return };
+            let Some(client) = self.mgr.client(account).await else { return };
+            self.ui(|u| u.set_sticker_error(s("Uploading a plain copy…")));
+            let bytes = match timeline::download(&client, &media.source, None).await {
+                Ok(b) => b,
+                Err(e) => return fail(format!("Couldn't get the picture: {e:#}")),
+            };
+            let (name2, opts) = (media.name.clone(), self.settings.lock().unwrap().upload.clone());
+            let Ok(prepared) = tokio::task::spawn_blocking(move || whisker_core::upload::prepare(&name2, bytes, &opts, None)).await else { return };
+            if let Some(why) = prepared.unclean {
+                return fail(format!("Not saved: {why}."));
+            }
+            match client.media().upload(&prepared.mime, prepared.data, None).await {
+                Ok(r) => {
+                    media.source = MediaSource::Plain(r.content_uri);
+                    media.mime = Some(prepared.mime.to_string());
+                }
+                Err(e) => return fail(format!("Couldn't upload it: {e}")),
+            }
+        }
+        let emoji = match Sticker::from_media(&name, &media) {
+            Ok(x) => x,
+            Err(e) => return fail(format!("{e:#}")),
+        };
+        let mut list: Vec<Sticker> = self.mgr.extra(&vault, stickers::EMOJI_KEY).await.unwrap_or_default();
+        list.retain(|x| x.name != emoji.name);
+        list.push(emoji.clone());
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Err(e) = self.mgr.set_extra(&vault, stickers::EMOJI_KEY, &list).await {
+            return fail(format!("Couldn't save it: {e:#}"));
+        }
+        {
+            let mut st = self.st.lock().unwrap();
+            st.emoji.retain(|(_, x)| x.name != emoji.name);
+            st.sticker_pics.remove(&format!("emoji:{}", emoji.name));
+            st.emoji.push((vault, emoji.clone()));
+            st.emoji.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+            st.sticker_from = None;
+        }
+        self.ui(|u| u.set_sticker_save_open(false));
+        self.status(format!("Saved as the emoji :{}: (type it in a message, or react with it)", emoji.name));
+        self.emoji_changed();
+    }
+
+    /// Your custom emoji changed (or were loaded): messages and reactions
+    /// use the new list, and the React menu shows them.
+    fn emoji_changed(&self) {
+        let list: Vec<(String, String)> = self.st.lock().unwrap().emoji.iter().filter_map(|(_, x)| Some((x.name.clone(), x.mxc()?.to_string()))).collect();
+        timeline::set_custom_emoji(list);
+        self.show_stickers();
+        self.show_quick_reactions();
+    }
+
+    /// The React menu: the usual few, then your custom emoji.
+    fn show_quick_reactions(&self) {
+        let custom: Vec<(String, String, Option<Pixels>)> = {
+            let st = self.st.lock().unwrap();
+            st.emoji.iter().filter_map(|(_, x)| Some((x.name.clone(), x.mxc()?.to_string(), st.sticker_pics.get(&format!("emoji:{}", x.name)).cloned().flatten()))).collect()
+        };
+        self.ui(move |u| {
+            let mut quick = quick_reactions();
+            quick.extend(custom.iter().map(|(name, mxc, px)| QuickReaction {
+                emoji: s(mxc),
+                label: s(format!(":{name}:")),
+                icon: px.clone().map(Image::from_rgba8).unwrap_or_default(),
+            }));
+            u.set_quick_reactions(ModelRc::new(VecModel::from(quick)));
+        });
+    }
+
     async fn remove_sticker(&self, name: String) {
+        if let Some(name) = name.strip_prefix("emoji:") {
+            let vault = self.st.lock().unwrap().emoji.iter().find(|(_, x)| x.name == name).map(|(v, _)| v.clone());
+            if let Some(vault) = vault {
+                let mut list: Vec<Sticker> = self.mgr.extra(&vault, stickers::EMOJI_KEY).await.unwrap_or_default();
+                list.retain(|x| x.name != name);
+                if let Err(e) = self.mgr.set_extra(&vault, stickers::EMOJI_KEY, &list).await {
+                    return self.status(format!("Couldn't remove it: {e:#}"));
+                }
+            }
+            self.st.lock().unwrap().emoji.retain(|(_, x)| x.name != name);
+            return self.emoji_changed();
+        }
         let vault = self.st.lock().unwrap().stickers.iter().find(|(_, x)| x.name == name).map(|(v, _)| v.clone());
         if let Some(vault) = vault {
             let mut list: Vec<Sticker> = self.mgr.extra(&vault, stickers::VAULT_KEY).await.unwrap_or_default();
@@ -3383,6 +3504,22 @@ impl Ctl {
 
     /// Sends a sticker from the picker.
     async fn send_sticker(&self, name: String) {
+        // A custom emoji: into the message being written.
+        if let Some(name) = name.strip_prefix("emoji:") {
+            let tag = format!(":{name}: ");
+            self.ui(move |u| {
+                let mut d = u.get_draft().to_string();
+                if !d.is_empty() && !d.ends_with(' ') {
+                    d.push(' ');
+                }
+                d.push_str(&tag);
+                u.set_draft(s(&d));
+                u.set_cursor_at(d.len() as i32);
+                u.set_cursor_request(u.get_cursor_request() + 1);
+                u.set_stickers_open(false);
+            });
+            return;
+        }
         let Some((_, room)) = self.current_room().await else { return };
         let sticker = self.st.lock().unwrap().stickers.iter().find(|(_, x)| x.name == name).map(|(_, x)| x.clone());
         self.ui(|u| u.set_stickers_open(false));
@@ -3409,47 +3546,57 @@ impl Ctl {
 
     /// The picker's rows, loading pictures not seen yet.
     fn show_stickers(&self) {
-        let (rows, missing): (Vec<(String, Option<Pixels>)>, bool) = {
+        // (name, picture, is a custom emoji)
+        let (rows, missing): (Vec<(String, Option<Pixels>, bool)>, bool) = {
             let st = self.st.lock().unwrap();
-            let rows: Vec<(String, Option<Pixels>)> = st.stickers.iter().map(|(_, x)| (x.name.clone(), st.sticker_pics.get(&x.name).cloned().flatten())).collect();
-            let missing = st.stickers.iter().any(|(_, x)| !st.sticker_pics.contains_key(&x.name));
+            let mut rows: Vec<(String, Option<Pixels>, bool)> = st.stickers.iter().map(|(_, x)| (x.name.clone(), st.sticker_pics.get(&x.name).cloned().flatten(), false)).collect();
+            rows.extend(st.emoji.iter().map(|(_, x)| (x.name.clone(), st.sticker_pics.get(&format!("emoji:{}", x.name)).cloned().flatten(), true)));
+            let missing = st.stickers.iter().any(|(_, x)| !st.sticker_pics.contains_key(&x.name)) || st.emoji.iter().any(|(_, x)| !st.sticker_pics.contains_key(&format!("emoji:{}", x.name)));
             (rows, missing)
         };
         if missing {
             self.load_sticker_pics();
         }
         self.ui(move |u| {
-            let items: Vec<StickerItem> = rows.iter().map(|(n, p)| StickerItem { name: s(n), picture: p.clone().map(Image::from_rgba8).unwrap_or_default() }).collect();
+            let items: Vec<StickerItem> = rows.iter().map(|(n, p, e)| StickerItem { name: s(n), picture: p.clone().map(Image::from_rgba8).unwrap_or_default(), emoji: *e }).collect();
             u.set_stickers(ModelRc::new(VecModel::from(items)));
         });
     }
 
     /// Downloads the pictures of stickers not shown yet, then shows them.
     fn load_sticker_pics(&self) {
-        let want: Vec<Sticker> = {
+        // (where its picture is kept, the sticker or emoji)
+        let want: Vec<(String, Sticker)> = {
             let st = self.st.lock().unwrap();
-            st.stickers.iter().map(|(_, x)| x).filter(|x| !st.sticker_pics.contains_key(&x.name)).cloned().collect()
+            st.stickers
+                .iter()
+                .map(|(_, x)| (x.name.clone(), x))
+                .chain(st.emoji.iter().map(|(_, x)| (format!("emoji:{}", x.name), x)))
+                .filter(|(k, _)| !st.sticker_pics.contains_key(k))
+                .map(|(k, x)| (k, x.clone()))
+                .collect()
         };
         let Some(account) = self.st.lock().unwrap().account else { return };
         if want.is_empty() {
             return;
         }
         // Marked as loading (no picture yet) so they're asked for once.
-        for x in &want {
-            self.st.lock().unwrap().sticker_pics.insert(x.name.clone(), None);
+        for (k, _) in &want {
+            self.st.lock().unwrap().sticker_pics.insert(k.clone(), None);
         }
         let c = self.clone();
         self.spawn(async move {
             let Some(client) = c.mgr.client(account).await else { return };
-            for x in want {
+            for (k, x) in want {
                 let Ok(src) = x.source() else { continue };
                 let px = match timeline::download(&client, &src, None).await {
                     Ok(b) => tokio::task::spawn_blocking(move || decode(&b, 96, 96, false)).await.ok().flatten(),
                     Err(_) => None,
                 };
-                c.st.lock().unwrap().sticker_pics.insert(x.name.clone(), px);
+                c.st.lock().unwrap().sticker_pics.insert(k, px);
             }
             c.show_stickers();
+            c.show_quick_reactions();
         });
     }
 
@@ -3726,14 +3873,28 @@ impl Ctl {
             "profile" => self.open_profile(&key, m.member.as_ref().map_or_else(|| m.sender.clone(), |c| c.user.clone())).await,
             "save" => self.save_media(&key, m, false).await,
             "share" => self.save_media(&key, m, true).await,
-            "save-sticker" => {
+            a @ ("save-sticker" | "save-emoji") => {
                 let Some(media) = m.media.clone() else { return };
+                let as_emoji = a == "save-emoji";
                 let stem = media.name.rsplit_once('.').map_or(media.name.as_str(), |(a, _)| a).to_owned();
                 let suggested = stickers::clean_name(&stem).unwrap_or_default();
-                self.st.lock().unwrap().sticker_from = Some(media);
+                // Custom emoji are plain files (that's how every app reads
+                // them): an encrypted picture needs a plain copy.
+                let note = if as_emoji && matches!(media.source, MediaSource::Encrypted(_)) {
+                    "This picture is encrypted. Custom emoji have to be plain files, so saving it uploads an unencrypted copy (without its metadata) that your server can see."
+                } else {
+                    ""
+                };
+                {
+                    let mut st = self.st.lock().unwrap();
+                    st.sticker_from = Some(media);
+                    st.sticker_as_emoji = as_emoji;
+                }
                 self.ui(move |u| {
                     u.set_sticker_name(s(suggested));
                     u.set_sticker_error(s(""));
+                    u.set_sticker_as_emoji(as_emoji);
+                    u.set_sticker_note(s(note));
                     u.set_sticker_save_open(true);
                 });
             }
@@ -5358,7 +5519,10 @@ impl Ctl {
         if let Some(e) = word
             .strip_prefix(':')
             .and_then(|w| w.strip_suffix(':'))
-            .filter(|n| !n.is_empty() && !self.st.lock().unwrap().stickers.iter().any(|(_, x)| x.name == *n))
+            .filter(|n| {
+                let st = self.st.lock().unwrap();
+                !n.is_empty() && !st.stickers.iter().any(|(_, x)| x.name == *n) && !st.emoji.iter().any(|(_, x)| x.name == *n)
+            })
             .and_then(emoji::shortcode)
         {
             let new = format!("{}{e}", &text[..text.len() - word.len()]);
@@ -5400,6 +5564,22 @@ impl Ctl {
                 let tag = format!(":{}:", x.name);
                 out.push((x.name.clone(), format!("{tag} · sticker"), tag, 2));
             }
+            // Your custom emoji (their pictures under "emoji:name").
+            let custom: Vec<Sticker> = {
+                let st = self.st.lock().unwrap();
+                let list: Vec<Sticker> = st.emoji.iter().map(|(_, x)| x.clone()).collect();
+                let found: Vec<Sticker> = stickers::suggest(&list, q).into_iter().take(4).cloned().collect();
+                for x in &found {
+                    if let Some(Some(p)) = st.sticker_pics.get(&format!("emoji:{}", x.name)) {
+                        pics.insert(format!("emoji:{}", x.name), p.clone());
+                    }
+                }
+                found
+            };
+            for x in &custom {
+                let tag = format!(":{}:", x.name);
+                out.push((x.name.clone(), format!("{tag} · your emoji"), tag, 3));
+            }
             for e in emoji::suggest(q).into_iter().take(8) {
                 out.push((e.to_owned(), format!(":{}:", emoji::name_of(e)), e.to_owned(), 1));
             }
@@ -5411,6 +5591,7 @@ impl Ctl {
                     picture: match kind {
                         1 => ui::emoji_image(label),
                         2 => pics.get(label).map(|p| Image::from_rgba8(p.clone())).unwrap_or_default(),
+                        3 => pics.get(&format!("emoji:{label}")).map(|p| Image::from_rgba8(p.clone())).unwrap_or_default(),
                         _ => Image::default(),
                     },
                     label: s(label),
@@ -7065,19 +7246,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.on_emoji_search(move |q| c.emoji_search(q.to_string()));
     }
     ui.set_emoji_rows(emoji_rows(&emoji::search("")));
-    let quick: Vec<QuickReaction> = emoji::QUICK
-        .iter()
-        .zip(emoji::QUICK_LABELS)
-        .map(|(e, label)| QuickReaction {
-            emoji: s(*e),
-            label: s(label),
-            icon: emoji::picture(e)
-                .and_then(|png| decode(png, 32, 32, false))
-                .map(Image::from_rgba8)
-                .unwrap_or_default(),
-        })
-        .collect();
-    ui.set_quick_reactions(ModelRc::new(VecModel::from(quick)));
+    ui.set_quick_reactions(ModelRc::new(VecModel::from(quick_reactions())));
     on!(on_create_room, |n, t, public, alias, enc, inv| create_room);
     on!(on_login, |hs, u, p, t, px, ag, reg, tok| login);
     {

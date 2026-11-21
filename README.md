@@ -331,6 +331,13 @@ operating system and the **Wisp** browser.
   adds: its Android version, sometimes its make and model, and the time). Files Whisker can't clean (HEIC, AVIF, RAW, PDF, Office documents and the
   like, or video when ffmpeg is missing) are held back with a message instead of being
   sent as they are; turn the setting off to send them anyway.
+- **Stickers and custom emoji.** Right-click a picture and pick *Save as sticker…* (sent
+  on its own by typing `:name:`) or *Save as emoji…* (`:name:` inside a message becomes the
+  picture inline, and your emoji are under *React*). Both lists are kept in your vault, not
+  on the server. Custom emoji have to be plain files (that's how every app reads them), so
+  saving an encrypted picture as one uploads an unencrypted copy, without its metadata,
+  after saying so. Other apps show your inline emoji; Whisker itself shows `:name:` in the
+  text for now, and the picture in reactions.
 - **Hidden events.** Start a message with `/hidden` to send it as an event other apps don't
   show (encrypted like any message in an encrypted room). It can carry pictures and files:
   type `/hidden` (and a caption, if you like) with files attached. In a thread, `/hidden`

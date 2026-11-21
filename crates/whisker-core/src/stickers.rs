@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 /// Where the collection is kept in the vault.
 pub const VAULT_KEY: &str = "stickers";
 
+/// Where your custom emoji are kept (same shape as stickers). Unlike a
+/// sticker, a custom emoji is always a plain (unencrypted) file: it's sent
+/// as an inline picture in a message's text, or as a reaction, and apps
+/// only read those as plain `mxc://` addresses.
+pub const EMOJI_KEY: &str = "emoji";
+
 /// Widest and tallest a sticker is shown, so other apps draw it small.
 const SHOWN_PX: u64 = 256;
 
@@ -34,6 +40,14 @@ impl Sticker {
     pub fn from_media(name: &str, m: &Media) -> Result<Self> {
         let Some(name) = clean_name(name) else { bail!("use letters, numbers, - or _ for the name") };
         Ok(Self { name, source: serde_json::to_value(&m.source)?, mime: m.mime.clone(), width: m.width, height: m.height, size: m.size })
+    }
+
+    /// Its plain file address, for a custom emoji (`None` if encrypted).
+    pub fn mxc(&self) -> Option<matrix_sdk::ruma::OwnedMxcUri> {
+        match self.source().ok()? {
+            MediaSource::Plain(u) => Some(u),
+            MediaSource::Encrypted(_) => None,
+        }
     }
 
     pub fn source(&self) -> Result<MediaSource> {
@@ -80,6 +94,48 @@ pub fn suggest<'a>(list: &'a [Sticker], q: &str) -> Vec<&'a Sticker> {
     out
 }
 
+/// `html` (a message's formatted text) with each `:name:` of one of
+/// `emoji` (name, plain mxc address) as an inline emoji picture, the way
+/// Matrix apps show custom emoji. Names inside tags (a link's address, say)
+/// are left alone. `None` when there's none in it.
+pub fn inline_emoji(html: &str, emoji: &[(String, String)]) -> Option<String> {
+    if emoji.is_empty() || !html.contains(':') {
+        return None;
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut any = false;
+    let mut in_tag = false;
+    let mut i = 0;
+    let b = html.as_bytes();
+    while i < html.len() {
+        let c = b[i];
+        if c == b'<' {
+            in_tag = true;
+        } else if c == b'>' {
+            in_tag = false;
+        } else if c == b':' && !in_tag
+            && let Some(end) = html[i + 1..].find(':').map(|e| i + 1 + e)
+        {
+            let name = &html[i + 1..end];
+            if let Some((_, mxc)) = emoji.iter().find(|(n, _)| n == name) {
+                out.push_str(&format!(r#"<img data-mx-emoticon height="32" src="{mxc}" alt=":{name}:" title=":{name}:">"#));
+                any = true;
+                i = end + 1;
+                continue;
+            }
+        }
+        let ch = html[i..].chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    any.then_some(out)
+}
+
+/// Plain text as HTML (for a message with no formatting of its own).
+pub fn plain_html(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\n', "<br>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +169,21 @@ mod tests {
         let s = Sticker::from_media("secret", &media(MediaSource::Encrypted(Box::new(file)))).unwrap();
         let back: Sticker = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(matches!(back.source().unwrap(), MediaSource::Encrypted(f) if f.url.as_str() == "mxc://x.org/secret"));
+    }
+
+    #[test]
+    fn inline_emoji_in_text() {
+        let e = vec![("blob".to_owned(), "mxc://x.org/b".to_owned())];
+        assert_eq!(
+            inline_emoji("hi :blob: :nope: 10:30", &e).unwrap(),
+            r#"hi <img data-mx-emoticon height="32" src="mxc://x.org/b" alt=":blob:" title=":blob:"> :nope: 10:30"#
+        );
+        // Not inside a tag, and nothing when there's none.
+        assert_eq!(inline_emoji(r#"<a href="https://x.org/:blob:/">:blob:</a>"#, &e).unwrap().matches("<img").count(), 1);
+        assert!(inline_emoji("plain", &e).is_none());
+        assert_eq!(plain_html("a<b>\nc"), "a&lt;b&gt;<br>c");
+        let s = Sticker::from_media("x", &media(MediaSource::Plain("mxc://x.org/a".into()))).unwrap();
+        assert_eq!(s.mxc().unwrap().as_str(), "mxc://x.org/a");
     }
 
     #[test]

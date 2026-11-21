@@ -62,6 +62,18 @@ pub fn claim(root: &Path) -> Option<std::fs::File> {
     }
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join(LOCK)).ok()?;
     lock.try_lock().ok()?;
+    // Once per process: what's there at a later claim in the same process
+    // (another manager, as tests start one each) is stores this process is
+    // running, not an earlier run's leftovers. Wiping them zeroed databases
+    // still in use.
+    {
+        static WIPED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+        let mut wiped = WIPED.lock().unwrap_or_else(|e| e.into_inner());
+        if wiped.iter().any(|w| w == root) {
+            return Some(lock);
+        }
+        wiped.push(root.to_path_buf());
+    }
     for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
         let p = e.path();
         if p.file_name().is_some_and(|n| n == LOCK) {

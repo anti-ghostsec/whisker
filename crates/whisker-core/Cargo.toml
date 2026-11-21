@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
 directories.workspace = true
 anyhow.workspace = true
 argon2.workspace = true

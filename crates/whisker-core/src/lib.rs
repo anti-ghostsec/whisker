@@ -14,6 +14,7 @@ pub mod moderation;
 pub mod notices;
 pub mod profile;
 pub mod rooms;
+pub mod signup;
 pub mod safe_web;
 pub mod stores;
 pub mod timeline;
@@ -23,7 +24,7 @@ pub mod upload;
 pub mod vault;
 pub mod verify;
 
-pub use accounts::{AccountManager, AccountSummary, LoginRequest, VaultId};
+pub use accounts::{AccountManager, AccountSummary, LoginRequest, SignupAnswer, SignupAsk, SignupStep, VaultId};
 pub use events::ClientEvent;
 pub use matrix_sdk;
 pub use moderation::ModAction;

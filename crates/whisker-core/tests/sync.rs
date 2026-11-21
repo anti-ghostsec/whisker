@@ -46,6 +46,7 @@ async fn rooms_show_up_after_first_sync() {
             kind: AccountKind::Human,
             tags: Default::default(),
             proxy: None,
+            ask: None,
         })
         .await
         .unwrap();

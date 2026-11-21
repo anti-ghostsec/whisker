@@ -136,6 +136,10 @@ struct State {
     synced: HashSet<AccountId>,
     /// Accounts whose last sync couldn't reach their server.
     offline: HashSet<AccountId>,
+    /// A sign-up step waiting for the person: where the answer goes, the
+    /// server's page for it (if it's done there), and whether the account
+    /// being made uses a proxy (then that page is copied, not opened).
+    signup: Option<(tokio::sync::oneshot::Sender<whisker_core::SignupAnswer>, String, bool)>,
     detected: HashMap<AccountId, Detected>,
     /// The last notification shown per room, so a new one replaces it.
     notified: HashMap<RoomKey, (u32, Instant)>,
@@ -5687,6 +5691,14 @@ impl Ctl {
     async fn login(&self, hs: String, user: String, pass: String, tags: String, proxy: String, agent: bool, register: bool, token: String) {
         let Some(vault) = self.st.lock().unwrap().active_vault.clone() else { return };
         let (hs, user) = split_login(&hs, &user);
+        // Sign-up steps only the person can do (a captcha, a page on the
+        // server's site) are asked for in the dialog.
+        let proxied = !proxy.trim().is_empty();
+        let me = self.clone();
+        let ask = move |step: whisker_core::SignupStep| -> std::pin::Pin<Box<dyn std::future::Future<Output = whisker_core::SignupAnswer> + Send>> {
+            let me = me.clone();
+            Box::pin(async move { me.ask_signup(step, proxied).await })
+        };
         self.ui(|u| {
             u.set_busy(true);
             u.set_login_error(s(""));
@@ -5703,8 +5715,11 @@ impl Ctl {
                 kind: if agent { AccountKind::Agent } else { AccountKind::Human },
                 tags: split_tags(&tags).into_iter().collect::<BTreeSet<_>>(),
                 proxy: Some(proxy.trim().to_owned()).filter(|p| !p.is_empty()),
+                ask: Some(&ask),
             })
             .await;
+        self.st.lock().unwrap().signup = None;
+        self.ui(|u| u.set_signup_step(0));
         match res {
             Ok(id) => {
                 self.ui(|u| {
@@ -5728,6 +5743,79 @@ impl Ctl {
                 });
             }
         }
+    }
+
+    /// Shows a sign-up step in the dialog and waits for the person's answer.
+    async fn ask_signup(&self, step: whisker_core::SignupStep, proxied: bool) -> whisker_core::SignupAnswer {
+        use whisker_core::{SignupAnswer, SignupStep};
+        let (kind, picture, stage, url, note) = match step {
+            SignupStep::Captcha { image, retry } => {
+                let Some(px) = tokio::task::spawn_blocking(move || decode(&image, 600, 240, false)).await.ok().flatten() else {
+                    return SignupAnswer::Cancel;
+                };
+                (1, Some(px), String::new(), String::new(), retry.unwrap_or_default())
+            }
+            SignupStep::Fallback { stage, url, retry } => (2, None, stage, url, retry.unwrap_or_default()),
+            // The documents, one a line; their links kept for Copy and Open.
+            SignupStep::Terms { documents } => {
+                let shown = documents.iter().map(|(name, url)| format!("{name}: {url}")).collect::<Vec<_>>().join("\n");
+                let links = documents.into_iter().map(|d| d.1).collect::<Vec<_>>().join("\n");
+                (3, None, shown, links, String::new())
+            }
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.st.lock().unwrap().signup = Some((tx, url, proxied));
+        self.ui(move |u| {
+            if let Some(px) = picture {
+                u.set_signup_picture(Image::from_rgba8(px));
+            }
+            u.set_signup_stage(s(stage));
+            u.set_signup_note(s(note));
+            u.set_signup_step(kind);
+        });
+        let answer = rx.await.unwrap_or(SignupAnswer::Cancel);
+        self.ui(|u| {
+            u.set_signup_step(0);
+            u.set_signup_note(s(""));
+        });
+        answer
+    }
+
+    /// The dialog's answer to a sign-up step: 0 cancel, 1 the captcha's
+    /// answer (`text`), 2 a new picture, 3 done on the server's page (or
+    /// the terms agreed to), 4 copy that page's (or the terms') links, 5
+    /// open them.
+    fn signup_answer(&self, kind: i32, text: String) {
+        use whisker_core::SignupAnswer;
+        let mut st = self.st.lock().unwrap();
+        if matches!(kind, 4 | 5) {
+            let Some((_, url, proxied)) = st.signup.as_ref() else { return };
+            let (url, proxied) = (url.clone(), *proxied);
+            drop(st);
+            if kind == 4 || proxied {
+                let note = if proxied {
+                    "Link copied, not opened: this account uses a proxy and your browser doesn't. Paste it into a browser that uses the same proxy (Tor Browser for Tor)."
+                } else {
+                    "Copied."
+                };
+                self.ui(move |u| {
+                    u.invoke_copy_text(s(url));
+                    u.set_signup_note(s(note));
+                });
+            } else {
+                for link in url.lines() {
+                    open_link(link);
+                }
+            }
+            return;
+        }
+        let Some((tx, ..)) = st.signup.take() else { return };
+        let _ = tx.send(match kind {
+            1 => SignupAnswer::Text(text),
+            2 => SignupAnswer::NewPicture,
+            3 => SignupAnswer::Done,
+            _ => SignupAnswer::Cancel,
+        });
     }
 
     // ---- settings ----
@@ -6962,6 +7050,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.set_quick_reactions(ModelRc::new(VecModel::from(quick)));
     on!(on_create_room, |n, t, public, alias, enc, inv| create_room);
     on!(on_login, |hs, u, p, t, px, ag, reg, tok| login);
+    {
+        let c = ctl.clone();
+        ui.on_signup_answer(move |kind, text| c.signup_answer(kind, text.to_string()));
+    }
     {
         // A dragged account moves in the rail at once; the saved order follows.
         let c = ctl.clone();

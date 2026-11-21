@@ -146,6 +146,7 @@ async fn main() -> Result<()> {
                     kind: if agent { AccountKind::Agent } else { AccountKind::Human },
                     tags: tags.into_iter().collect(),
                     proxy,
+                    ask: None,
                 })
                 .await?;
             println!("logged in: {id}");

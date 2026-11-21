@@ -146,7 +146,38 @@ pub struct LoginRequest<'a> {
     pub kind: AccountKind,
     pub tags: BTreeSet<String>,
     pub proxy: Option<String>,
+    /// Asks the person through a sign-up step the server needs (a captcha,
+    /// or one done on the server's own page). `None`: steps like that end
+    /// the sign-up with an error saying what the server wants.
+    pub ask: Option<&'a SignupAsk>,
 }
+
+/// A sign-up step only the person can do. See [`LoginRequest::ask`].
+#[derive(Debug, Clone)]
+pub enum SignupStep {
+    /// The server's own captcha ([`crate::signup::CAPTCHA`]): type what the
+    /// picture (PNG or JPEG bytes) says. `retry`: why the last answer failed.
+    Captcha { image: Vec<u8>, retry: Option<String> },
+    /// The server's terms: agree to these documents (name, link) with
+    /// [`SignupAnswer::Done`].
+    Terms { documents: Vec<(String, String)> },
+    /// A step done on the server's own page (`url`), in a browser: then
+    /// say [`SignupAnswer::Done`]. `stage` says what it is.
+    Fallback { stage: String, url: String, retry: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignupAnswer {
+    /// The captcha's answer.
+    Text(String),
+    /// Another captcha picture, please.
+    NewPicture,
+    /// The step on the server's page is done.
+    Done,
+    Cancel,
+}
+
+pub type SignupAsk = dyn Fn(SignupStep) -> futures_util::future::BoxFuture<'static, SignupAnswer> + Send + Sync;
 
 impl AccountManager {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
@@ -779,16 +810,30 @@ impl AccountManager {
     ///
     /// Boxed: it starts a sync that may call it again.
     pub fn follow_move(&self, account: AccountId) -> futures_util::future::BoxFuture<'_, ()> {
-        Box::pin(self.follow_move_inner(account))
+        Box::pin(self.follow_move_inner(account, false))
     }
 
-    async fn follow_move_inner(&self, account: AccountId) {
+    /// Like [`Self::follow_move`], for an account that works: moves it to a
+    /// faster address its server names, if there is one (anoncat's direct
+    /// port, for an account that signed in through its relay).
+    pub fn prefer_direct(&self, account: AccountId) -> futures_util::future::BoxFuture<'_, ()> {
+        Box::pin(self.follow_move_inner(account, true))
+    }
+
+    async fn follow_move_inner(&self, account: AccountId, better_only: bool) {
         let Some((vault, mut record)) = self.inner.read().await.live.get(&account).map(|a| (a.vault.clone(), a.record.clone())) else { return };
         let Some(server) = record.user_id.split_once(':').map(|s| s.1.to_owned()) else { return };
         let named = discover(&record).await;
         let token = record.session.tokens.access_token.clone();
+        let list = if better_only {
+            let Some(named) = &named else { return };
+            let better = crate::moves::better(named, &record.homeserver);
+            crate::moves::candidates(Some(&better), &server, &record.homeserver, &record.homeservers_used)
+        } else {
+            crate::moves::candidates(named.as_deref(), &server, &record.homeserver, &record.homeservers_used)
+        };
         let mut found = None;
-        for c in crate::moves::candidates(named.as_deref(), &server, &record.homeserver, &record.homeservers_used) {
+        for c in list {
             if crate::moves::confirm(&c, &record.user_id, &token, record.proxy.as_deref()).await {
                 found = Some(c);
                 break;
@@ -849,10 +894,13 @@ impl AccountManager {
         // Servers move (the saved URL can go dead), so ask the server name
         // where it lives now, but don't let a slow answer hold up unlocking.
         // Only a checked answer is used (see `crate::moves`).
+        // A faster address it names (anoncat's direct port, not its relay)
+        // is taken too, if it can be reached from here.
         if let Some(server) = record.user_id.split_once(':').map(|s| s.1.to_owned())
-            && let named @ Some(_) = discover(&record).await
+            && let Some(named) = discover(&record).await
         {
-            for now in crate::moves::candidates(named.as_deref(), &server, &record.homeserver, &record.homeservers_used) {
+            let better = crate::moves::better(&named, &record.homeserver);
+            for now in crate::moves::candidates(Some(&better), &server, &record.homeserver, &record.homeservers_used) {
                 if crate::moves::confirm(&now, &record.user_id, &record.session.tokens.access_token, record.proxy.as_deref()).await {
                     self.save_move(vault, &mut record, now).await?;
                     break;
@@ -1162,7 +1210,7 @@ impl AccountManager {
             .await
             .with_context(|| format!("could not use {homeserver} as the homeserver"))?;
         if req.register {
-            self.register_on(&client, req.username, req.password, req.token).await?;
+            self.register_on(&client, req.username, req.password, req.token, req.ask).await?;
         } else {
             client
                 .matrix_auth()
@@ -1194,6 +1242,13 @@ impl AccountManager {
         };
         self.mutate_profile(req.vault, |p| p.accounts.push(record.clone())).await?;
         self.go_live(req.vault, record, client.clone()).await;
+        // Signed in through a relay: the server's direct address, if it
+        // names one and it can be reached from here, is faster.
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            mgr.prefer_direct(id).await;
+        });
         match crate::verify::ensure_identity(&client, Some(req.password)).await {
             Ok(_) => self.vouch_own().await,
             Err(e) => tracing::warn!("couldn't set up cross-signing for the new account: {e:#}"),
@@ -1211,20 +1266,26 @@ impl AccountManager {
         Ok(id)
     }
 
-    /// Creates an account, answering the server's sign-up checks that can be
-    /// done in-app (none, or a registration token). Servers that want an
-    /// email, phone number or captcha get a clear error instead.
-    async fn register_on(&self, client: &Client, username: &str, password: &str, token: Option<&str>) -> Result<()> {
+    /// Creates an account, answering the server's sign-up checks: those that
+    /// can be done in-app (none, a registration token, the server's own
+    /// captcha), and, through `ask`, any other on the server's own page
+    /// (except an email or phone number). Otherwise a clear error.
+    async fn register_on(&self, client: &Client, username: &str, password: &str, token: Option<&str>, ask: Option<&SignupAsk>) -> Result<()> {
+        use crate::signup::{self, CAPTCHA};
         use matrix_sdk::ruma::api::client::account::register::v3::Request;
         use matrix_sdk::ruma::api::client::uiaa::{AuthData, AuthType, Dummy, RegistrationToken};
 
         let mut auth: Option<AuthData> = None;
-        for _ in 0..5 {
+        // Each round is one answer (a captcha tried, a new picture asked
+        // for): plenty for a person, and an end to a server that never stops.
+        for _ in 0..40 {
             let mut req = Request::new();
             req.username = Some(username.to_owned());
             req.password = Some(password.to_owned());
             req.initial_device_display_name = Some(self.device_name.to_string());
-            req.auth = auth.take();
+            let sent = auth.take();
+            let sent_type = sent.as_ref().map(|a| a.auth_type().map(|t| t.to_string()));
+            req.auth = sent;
             let err = match client.matrix_auth().register(req).await {
                 Ok(_) => return Ok(()),
                 Err(e) => e,
@@ -1232,16 +1293,22 @@ impl AccountManager {
             let Some(info) = err.as_uiaa_response() else {
                 return Err(anyhow!("couldn't create the account: {err}"));
             };
-            let doable = |t: &AuthType| matches!(t, AuthType::Dummy) || (matches!(t, AuthType::RegistrationToken) && token.is_some());
-            let Some(flow) = info.flows.iter().find(|f| f.stages.iter().all(doable)) else {
-                let needs: BTreeSet<String> = info.flows.iter().flat_map(|f| f.stages.iter().map(|s| match s {
-                    AuthType::EmailIdentity => "an email address".to_owned(),
-                    AuthType::Msisdn => "a phone number".to_owned(),
-                    AuthType::ReCaptcha => "a captcha".to_owned(),
-                    AuthType::RegistrationToken => "a registration token".to_owned(),
-                    AuthType::Terms => "accepting its terms".to_owned(),
-                    other => other.to_string(),
-                })).collect();
+            let inline = |t: &AuthType| {
+                matches!(t, AuthType::Dummy)
+                    || (matches!(t, AuthType::RegistrationToken) && token.is_some())
+                    || (ask.is_some() && (t.as_str() == CAPTCHA || matches!(t, AuthType::Terms)))
+            };
+            // Done on the server's page: anything but an email, phone number
+            // or registration token (those are asked for elsewhere).
+            let on_page = |t: &AuthType| ask.is_some() && !matches!(t, AuthType::EmailIdentity | AuthType::Msisdn | AuthType::RegistrationToken);
+            // Everything here first; else the fewest steps in a browser.
+            let flow = info
+                .flows
+                .iter()
+                .filter(|f| f.stages.iter().all(|s| inline(s) || on_page(s)))
+                .min_by_key(|f| f.stages.iter().filter(|s| !inline(s)).count());
+            let Some(flow) = flow else {
+                let needs: BTreeSet<String> = info.flows.iter().flat_map(|f| f.stages.iter().map(signup::describe)).collect();
                 let needs: Vec<_> = needs.into_iter().collect();
                 bail!(
                     "this server's sign-up needs {}. Enter a registration token if you have one, or sign up on the server's website and then log in here",
@@ -1252,18 +1319,77 @@ impl AccountManager {
                 bail!("the server didn't accept the sign-up");
             };
             let session = info.session.clone();
-            auth = Some(match next {
+            // Why the last answer failed, if it did.
+            let retry = info.auth_error.as_ref().map(|e| e.message.clone());
+            let again = sent_type.flatten().as_deref() == Some(next.as_str());
+            auth = match next {
                 AuthType::RegistrationToken => {
+                    if again {
+                        bail!("the server didn't accept the registration token{}", retry.map(|r| format!(": {r}")).unwrap_or_default());
+                    }
                     let mut t = RegistrationToken::new(token.unwrap_or_default().to_owned());
                     t.session = session;
-                    AuthData::RegistrationToken(t)
+                    Some(AuthData::RegistrationToken(t))
                 }
-                _ => {
+                AuthType::Dummy => {
+                    if again {
+                        bail!("the server didn't accept the sign-up{}", retry.map(|r| format!(": {r}")).unwrap_or_default());
+                    }
                     let mut d = Dummy::new();
                     d.session = session;
-                    AuthData::Dummy(d)
+                    Some(AuthData::Dummy(d))
                 }
-            });
+                AuthType::Terms => {
+                    let Some(ask) = ask else { bail!("this server's sign-up needs accepting its terms") };
+                    let documents = signup::terms(info.params.as_deref().map(|p| p.get()));
+                    if again || documents.is_empty() {
+                        // Not shown here after all: on the server's page.
+                        let Some(session) = session else { bail!("the server's sign-up needs accepting its terms, but gave no session to do it in") };
+                        let url = signup::fallback_url(client.homeserver().as_str(), next.as_str(), &session);
+                        match ask(SignupStep::Fallback { stage: signup::describe(next), url, retry: None }).await {
+                            SignupAnswer::Done => Some(AuthData::fallback_acknowledgement(session)),
+                            SignupAnswer::Cancel => bail!("sign-up cancelled"),
+                            _ => None,
+                        }
+                    } else {
+                        match ask(SignupStep::Terms { documents }).await {
+                            SignupAnswer::Done => {
+                                let mut t = matrix_sdk::ruma::api::client::uiaa::Terms::new();
+                                t.session = session;
+                                Some(AuthData::Terms(t))
+                            }
+                            SignupAnswer::Cancel => bail!("sign-up cancelled"),
+                            _ => None,
+                        }
+                    }
+                }
+                t if t.as_str() == CAPTCHA => {
+                    let Some(ask) = ask else { bail!("this server's sign-up needs its captcha") };
+                    let image = signup::captcha_image(info.params.as_deref().map(|p| p.get())).ok_or_else(|| anyhow!("the server's captcha picture couldn't be read"))?;
+                    let retry = if again { Some(retry.unwrap_or_else(|| "That wasn't it. Try this one.".to_owned())) } else { None };
+                    match ask(SignupStep::Captcha { image, retry }).await {
+                        SignupAnswer::Text(a) => {
+                            let mut data = serde_json::Map::new();
+                            data.insert("response".into(), a.trim().into());
+                            Some(AuthData::new(CAPTCHA, session, data)?)
+                        }
+                        // A fresh start: new session, new picture.
+                        SignupAnswer::NewPicture | SignupAnswer::Done => None,
+                        SignupAnswer::Cancel => bail!("sign-up cancelled"),
+                    }
+                }
+                other => {
+                    let Some(ask) = ask else { bail!("this server's sign-up needs {}", signup::describe(other)) };
+                    let Some(session) = session else { bail!("the server's sign-up needs {}, but gave no session to do it in", signup::describe(other)) };
+                    let url = signup::fallback_url(client.homeserver().as_str(), other.as_str(), &session);
+                    let retry = again.then(|| retry.unwrap_or_else(|| "It isn't done yet: finish it on the page, then press Done.".to_owned()));
+                    match ask(SignupStep::Fallback { stage: signup::describe(other), url, retry }).await {
+                        SignupAnswer::Done => Some(AuthData::fallback_acknowledgement(session)),
+                        SignupAnswer::Cancel => bail!("sign-up cancelled"),
+                        _ => None,
+                    }
+                }
+            };
         }
         bail!("the server kept asking for more sign-up steps")
     }
@@ -1768,31 +1894,47 @@ fn unreachable(e: &matrix_sdk::Error) -> bool {
 }
 
 /// Where `record`'s server says its client API lives now (from
-/// `/.well-known/matrix/client`), or `None` if it doesn't say in time.
-async fn discover(record: &AccountRecord) -> Option<String> {
+/// `/.well-known/matrix/client`), faster first, or `None` if it doesn't say
+/// in time.
+async fn discover(record: &AccountRecord) -> Option<Vec<String>> {
     let server = record.user_id.split_once(':')?.1;
-    well_known(&format!("{}://{server}", crate::rooms::scheme_for(server)), record.proxy.as_deref()).await
+    well_known_all(&format!("{}://{server}", crate::rooms::scheme_for(server)), record.proxy.as_deref()).await
 }
 
-/// The client API address `origin` (`https://server`) names in its
-/// `/.well-known/matrix/client`, or `None` if it names none in time.
-async fn well_known(origin: &str, proxy: Option<&str>) -> Option<String> {
+/// Where a server that's reached through a relay (for apps that can't use
+/// its port) can also be reached directly, faster, for apps that look:
+/// `"org.anoncat.direct": {"base_url": "https://hs.example.org:65123"}` in
+/// its `.well-known/matrix/client`. Other apps ignore it and use the relay
+/// in `m.homeserver`.
+const DIRECT: &str = "org.anoncat.direct";
+
+/// The client API addresses `origin` names in its `.well-known`: the
+/// direct one ([`DIRECT`]) first if it names one, then `m.homeserver`.
+async fn well_known_all(origin: &str, proxy: Option<&str>) -> Option<Vec<String>> {
     let mut http = crate::tls::http_builder().timeout(std::time::Duration::from_secs(6));
     if let Some(p) = proxy {
         http = http.proxy(reqwest::Proxy::all(p).ok()?);
     }
     let url = format!("{origin}/.well-known/matrix/client");
     let v: serde_json::Value = http.build().ok()?.get(url).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
-    let base = v.get("m.homeserver")?.get("base_url")?.as_str()?.trim_end_matches('/');
-    // Never down to plain http: a file fetched over https naming an http
-    // address would send the account's token unencrypted (and anyone in
-    // between could rewrite it). Only a server already reached over http
-    // (an .onion, or one on the local network) may name an http address.
-    let ok = base.starts_with("https://") || (base.starts_with("http://") && origin.starts_with("http://"));
-    if !ok {
-        tracing::warn!("ignoring the homeserver address {origin} names: it isn't https");
-    }
-    ok.then(|| base.to_owned())
+    let base = |key: &str| v.get(key)?.get("base_url")?.as_str().map(|b| b.trim_end_matches('/').to_owned());
+    let ok = |b: &String| {
+        // As for `m.homeserver`, below.
+        let ok = b.starts_with("https://") || (b.starts_with("http://") && origin.starts_with("http://"));
+        if !ok {
+            tracing::warn!("ignoring the homeserver address {origin} names: it isn't https");
+        }
+        ok
+    };
+    let home = base("m.homeserver").filter(ok)?;
+    Some(base(DIRECT).filter(ok).filter(|d| *d != home).into_iter().chain([home]).collect())
+}
+
+/// The client API address `origin` (`https://server`) names in its
+/// `/.well-known/matrix/client` for every app (`m.homeserver`), or `None`
+/// if it names none in time.
+async fn well_known(origin: &str, proxy: Option<&str>) -> Option<String> {
+    well_known_all(origin, proxy).await?.pop()
 }
 
 /// The client API address for a server typed at sign-in: what its

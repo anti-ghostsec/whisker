@@ -49,6 +49,7 @@ async fn account_stores_live_in_ram_and_inside_the_vault() {
             kind: AccountKind::Human,
             tags: Default::default(),
             proxy: None,
+            ask: None,
         })
         .await
         .unwrap();

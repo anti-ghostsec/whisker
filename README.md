@@ -15,7 +15,13 @@ operating system and the **Wisp** browser.
 - **Sign in or create accounts.** Pick a suggested server (anoncat.gleeze.com) and type
   just your username, or choose *Other server…* and enter any server; a full address like
   `@you:matrix.org` works too. Sign-up works on servers that allow open registration or
-  hand out registration tokens; servers that need an email or captcha say so.
+  hand out registration tokens. A server with its own in-app captcha (anoncat) shows the
+  picture right in the *Create account* dialog: the picture comes with the server's reply,
+  so nothing else is fetched and it works over an onion address too. A server's terms are
+  listed there to read and agree to. Any other step a server asks for (a captcha of
+  another kind, say) is done on the server's own page:
+  Whisker gives you the link to open in a browser, then carries on when you press *Done*.
+  Only servers that need an email address or phone number can't be signed up to here.
 - **Many accounts, signed in at once.** Switch between any account on any server with
   one click. Each account syncs in the background, so nothing goes stale.
 - **Tags.** Label accounts (`main`, `alt`, `work`, …) and filter the account list by tag.
@@ -42,7 +48,10 @@ operating system and the **Wisp** browser.
   addresses the account used before. It shows *Reconnecting…* meanwhile. A new address is
   used only if it's https, on the server name's own host or one under it (or a host the
   account already used), and confirms the account's session is its own; otherwise the
-  account's sign-in is never sent there.
+  account's sign-in is never sent there. A server behind a relay (for apps that can't
+  use its port) can also name its direct address (`org.anoncat.direct` in its
+  `.well-known`): Whisker uses that, which is faster, when it can reach it, and the relay
+  when it can't, while other apps keep using the relay.
 - **AI accounts.** Each AI signs in as its own Matrix account, separate from yours, with its
   own settings page. Paste the address of any AI API (OpenRouter, Groq, Mistral, DeepSeek,
   Gemini, OpenAI, Venice, LM Studio, llama.cpp, vLLM, Ollama, or any Anthropic-style API).

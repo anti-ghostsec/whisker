@@ -80,12 +80,13 @@ pub async fn confirm(base: &str, user_id: &str, token: &str, proxy: Option<&str>
 }
 
 /// Where to look, in order: what `.well-known` names (`named`, if it could
-/// be had: then only that), else the server name itself and the addresses
-/// the account used before. Never `current`, and only trusted ones.
-pub fn candidates(named: Option<&str>, server: &str, current: &str, used: &[String]) -> Vec<String> {
+/// be had: then only those, the faster first), else the server name itself
+/// and the addresses the account used before. Never `current`, and only
+/// trusted ones.
+pub fn candidates(named: Option<&[String]>, server: &str, current: &str, used: &[String]) -> Vec<String> {
     let current = current.trim_end_matches('/');
     let mut all: Vec<String> = match named {
-        Some(n) => vec![n.to_owned()],
+        Some(n) => n.to_vec(),
         None => std::iter::once(format!("{}://{server}", crate::rooms::scheme_for(server))).chain(used.iter().cloned()).collect(),
     };
     let mut trusted_list = used.to_vec();
@@ -99,6 +100,14 @@ pub fn candidates(named: Option<&str>, server: &str, current: &str, used: &[Stri
         new
     });
     all
+}
+
+/// What `.well-known` names that's better than `current` (named earlier:
+/// the server's direct address while using its relay, say), best first.
+/// Empty when `current` is already the best.
+pub fn better(named: &[String], current: &str) -> Vec<String> {
+    let current = current.trim_end_matches('/');
+    named.iter().map(|n| n.trim_end_matches('/').to_owned()).take_while(|n| n != current).collect()
 }
 
 /// `used` with `old` added (newest first, at most [`REMEMBER`]).
@@ -136,10 +145,19 @@ mod tests {
     #[test]
     fn where_to_look() {
         let used = vec!["https://hs.cat.example:53383".to_owned()];
+        let one = |s: &str| vec![s.to_owned()];
         // `.well-known` answered: only what it names, if trusted.
-        assert_eq!(candidates(Some("https://hs.cat.example:65123/"), "cat.example", "https://hs.cat.example:53383", &used), ["https://hs.cat.example:65123"]);
-        assert!(candidates(Some("https://evil.example"), "cat.example", "https://hs.cat.example:53383", &used).is_empty());
-        assert!(candidates(Some("https://hs.cat.example:53383"), "cat.example", "https://hs.cat.example:53383/", &used).is_empty());
+        assert_eq!(candidates(Some(&one("https://hs.cat.example:65123/")), "cat.example", "https://hs.cat.example:53383", &used), ["https://hs.cat.example:65123"]);
+        assert!(candidates(Some(&one("https://evil.example")), "cat.example", "https://hs.cat.example:53383", &used).is_empty());
+        assert!(candidates(Some(&one("https://hs.cat.example:53383")), "cat.example", "https://hs.cat.example:53383/", &used).is_empty());
+        // The direct port, then the relay: on the relay, the direct one is
+        // better; on the direct one, nothing is.
+        let both = vec!["https://hs.cat.example:65123".to_owned(), "https://cat.example".to_owned()];
+        assert_eq!(better(&both, "https://cat.example/"), ["https://hs.cat.example:65123"]);
+        assert!(better(&both, "https://hs.cat.example:65123").is_empty());
+        assert_eq!(better(&both, "https://old.cat.example"), both);
+        // The direct port down: the relay.
+        assert_eq!(candidates(Some(&both), "cat.example", "https://hs.cat.example:65123", &[]), ["https://cat.example"]);
         // It didn't: the server name, then the addresses used before.
         assert_eq!(candidates(None, "cat.example", "https://hs.cat.example:65123", &used), ["https://cat.example", "https://hs.cat.example:53383"]);
         let mut u = used.clone();

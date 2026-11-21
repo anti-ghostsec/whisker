@@ -1594,6 +1594,12 @@ component LoginDialog inherits Overlay {
     in property <bool> busy;
     in property <bool> agent;
     in-out property <bool> register;
+    // A sign-up step to do (see AppWindow's signup-step).
+    in property <int> step;
+    in property <image> picture;
+    in property <string> stage;
+    in property <string> note;
+    callback answer(int, string);
     // Suggested servers, then "Other server…" last.
     in property <[string]> servers;
     property <int> pick: 0;
@@ -1637,6 +1643,56 @@ component LoginDialog inherits Overlay {
     proxy := Input { placeholder: "Proxy (optional), e.g. socks5h://127.0.0.1:9050"; }
     if root.mismatch: Text { text: "The passwords don't match."; color: Theme.danger; }
     if root.error != "": Text { text: root.error; color: Theme.danger; wrap: char-wrap; }
+    // The server's captcha, shown here (nothing else is fetched for it).
+    if root.step == 1: VerticalLayout {
+        spacing: 6px;
+        Text { text: "Type what the picture says."; color: Theme.text; font-weight: 700; }
+        Rectangle {
+            height: 120px;
+            border-radius: 6px;
+            background: #ffffff;
+            clip: true;
+            Image { source: root.picture; width: parent.width; height: parent.height; image-fit: contain; }
+        }
+        if root.note != "": Text { text: root.note; color: Theme.danger; wrap: word-wrap; }
+        captcha-answer := Input { placeholder: "Answer"; accepted => { root.answer(1, self.text); } }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Btn { text: "New picture"; clicked => { root.answer(2, ""); } }
+            Btn { text: "Continue"; primary: true; enabled: captcha-answer.text != ""; clicked => { root.answer(1, captcha-answer.text); } }
+        }
+    }
+    // The server's terms, agreed to here.
+    if root.step == 3: VerticalLayout {
+        spacing: 6px;
+        Text { text: "To create an account on this server you agree to:"; color: Theme.text; font-weight: 700; wrap: word-wrap; }
+        Text { text: root.stage; color: Theme.muted; font-size: 12px; wrap: char-wrap; }
+        if root.note != "": Text { text: root.note; color: Theme.muted; wrap: word-wrap; }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Btn { text: "Copy links"; clicked => { root.answer(4, ""); } }
+            Btn { text: "Read"; clicked => { root.answer(5, ""); } }
+            Btn { text: "I agree"; primary: true; clicked => { root.answer(3, ""); } }
+        }
+    }
+    // A step Whisker can't do itself, done on the server's own page.
+    if root.step == 2: VerticalLayout {
+        spacing: 6px;
+        Text {
+            text: "This server's sign-up needs " + root.stage + ", done on its own page. Open it in a browser, finish there, then press Done.";
+            color: Theme.text; wrap: word-wrap;
+        }
+        if root.note != "": Text { text: root.note; color: Theme.danger; wrap: word-wrap; }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Btn { text: "Copy link"; clicked => { root.answer(4, ""); } }
+            Btn { text: "Open page"; clicked => { root.answer(5, ""); } }
+            Btn { text: "Done"; primary: true; clicked => { root.answer(3, ""); } }
+        }
+    }
     HorizontalLayout {
         spacing: 8px;
         alignment: end;
@@ -2079,6 +2135,14 @@ export component AppWindow inherits Window {
     in-out property <bool> show-login;
     in-out property <bool> login-agent;
     in-out property <string> login-error;
+    // A sign-up step waiting for the person: 0 none, 1 the server's
+    // captcha (picture, answer), 2 a step done on the server's own page.
+    in property <int> signup-step;
+    in property <image> signup-picture;
+    in property <string> signup-stage;
+    in property <string> signup-note;
+    // 0 cancel, 1 answer (text), 2 new picture, 3 done, 4 copy link, 5 open page
+    callback signup-answer(int, string);
     in-out property <string> room-search;
 
     // On phones one pane shows at a time: 1 rooms, 2 chat.
@@ -3579,7 +3643,12 @@ export component AppWindow inherits Window {
             agent: root.login-agent;
             servers: root.login-servers;
             login(hs, u, p, t, px, ag, reg, tok) => { root.login(hs, u, p, t, px, ag, reg, tok); }
-            dismiss => { root.show-login = false; }
+            step: root.signup-step;
+            picture: root.signup-picture;
+            stage: root.signup-stage;
+            note: root.signup-note;
+            answer(k, t) => { root.signup-answer(k, t); }
+            dismiss => { root.signup-answer(0, ""); root.show-login = false; }
         }
 
         if root.select-text != "": Overlay {

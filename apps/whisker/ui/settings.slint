@@ -1272,7 +1272,7 @@ component AgentPage inherits VerticalLayout {
         }
         Field { label: "Only in these rooms"; hint: "Room ids, comma separated. Empty means every room it's in."; Input { text <=> root.a-rooms; placeholder: "All rooms"; } }
         Number { text: "Seconds between replies"; hint: "Per room, to stop it flooding."; minimum: 0; maximum: 3600; value <=> root.a-cooldown; }
-        Number { text: "Actions per message"; hint: "How many tool steps it may take before answering. If it runs out mid-action, it posts nothing."; minimum: 1; maximum: 20; value <=> root.a-steps; }
+        Number { text: "Actions per message"; hint: "How many tool steps (actions, page reads) it may take before answering. On the last one it answers with what it has; if it still runs out, it says so. More lets it read bigger things (a repository) but costs more."; minimum: 1; maximum: 20; value <=> root.a-steps; }
     }
 
     Card {

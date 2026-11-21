@@ -37,7 +37,19 @@ Moderation tools are only provided when the person you are answering is allowed 
 tool isn't available, say you can't do that. Before a ban or kick, make sure the target and reason \
 are clear; after any moderation action, say briefly what you did. Reply in plain Markdown. A \
 <state>…</state> block in your reply is never shown in the chat: the app keeps it and shows it back \
-to you next time.";
+to you next time. You only act when a message arrives: nothing happens after your reply, so never \
+say you'll look into something, keep working on it or report back later. Do what you can in this \
+reply and answer with what you found.";
+
+/// Added to the last tool results of a reply, so the model answers with
+/// what it has instead of asking for more and getting cut off.
+const LAST_STEP: &str = "(From the app, not a chat member: this is your last step for this reply. Don't call any more \
+tools: answer now with what you found, and say plainly what you didn't get to.)";
+
+/// Posted when a reply still ran out of steps: better than silence, which
+/// looks like the account died.
+const OUT_OF_STEPS: &str = "I ran out of steps before I could finish that, sorry. Ask me about one part at a time \
+(one folder or file, say) and I'll get further.";
 
 /// Added to the notes when the agent may read the web.
 const WEB_NOTES: &str = "\
@@ -697,8 +709,16 @@ impl AgentRunner {
         }
 
         let persona = persona(&self.cfg, &lines, event_id, sender);
-        let mut system = vec![OPERATING_NOTES];
-        if self.web.is_some() && can_reply {
+        let steps = self.cfg.max_steps.max(1);
+        let web_on = self.web.is_some() && can_reply;
+        // Its limits, so a big job is cut to fit instead of running out.
+        let budget = format!(
+            "You can use tools in at most {steps} steps per reply{}. For a big job (a whole repository, say), read \
+             the parts that matter most and answer within that.",
+            if web_on { format!(", reading at most {} pages", web::MAX_FETCHES) } else { String::new() }
+        );
+        let mut system = vec![OPERATING_NOTES, budget.as_str()];
+        if web_on {
             system.push(WEB_NOTES);
         }
         system.extend(persona.system.iter().map(String::as_str));
@@ -745,7 +765,7 @@ impl AgentRunner {
         // Only a turn that ends without asking for more tools is a finished
         // answer; text from a turn cut off by `max_steps` is half a thought.
         let mut finished = false;
-        for _ in 0..self.cfg.max_steps.max(1) {
+        for step in 0..steps {
             let turn = self.llm.turn(&system, &messages, &tool_defs).await?;
             if turn.refused {
                 return Ok((false, None));
@@ -783,10 +803,23 @@ impl AgentRunner {
                 }
                 results.push((call.id.clone(), r.map(|a| format!("done: {a}"))));
             }
-            messages.push(llm::tool_results(results));
+            let mut results = llm::tool_results(results);
+            // The next turn is the last: an answer from what it has.
+            if step + 2 == steps
+                && let Some(blocks) = results["content"].as_array_mut()
+            {
+                blocks.push(json!({ "type": "text", "text": LAST_STEP }));
+            }
+            messages.push(results);
         }
         if !finished {
-            tracing::warn!("agent {me}: ran out of steps ({}) before finishing; not posting", self.cfg.max_steps);
+            tracing::warn!("agent {me}: ran out of steps ({steps}) before finishing");
+            // Its unfinished text is half a thought; a short note says why
+            // there's no answer.
+            if can_reply {
+                room.send(agent_message(OUT_OF_STEPS)).await?;
+                return Ok((true, None));
+            }
             return Ok((false, None));
         }
 

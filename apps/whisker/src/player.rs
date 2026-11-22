@@ -83,6 +83,16 @@ pub fn play_stream(ui: Weak<AppWindow>, id: String, relay: Relay) -> bool {
 
 fn start(ui: Weak<AppWindow>, id: String, input: OsString, relay: Option<Relay>) -> bool {
     stop(&ui);
+    // Still loading, as far as anyone watching can tell: stopping what
+    // played before cleared the dots, and looking at the file takes a
+    // while (it's read from the server), so it looked as if nothing was
+    // happening until the dots came back with the first picture.
+    let shown = id.clone();
+    let _ = ui.upgrade_in_event_loop(move |u| {
+        let p = u.global::<Player>();
+        p.set_id(shown.into());
+        p.set_loading(true);
+    });
     let Some(info) = probe_media(&input) else { return false };
     // Sound alone needs somewhere to go.
     let sound_only = info.width == 0;

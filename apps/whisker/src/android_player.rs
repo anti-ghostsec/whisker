@@ -124,6 +124,16 @@ pub fn play_remote(ui: Weak<AppWindow>, id: String, file: Arc<RemoteFile>, rt: t
 
 fn start(ui: Weak<AppWindow>, id: String, src: Src) -> bool {
     stop(&ui);
+    // Still loading, as far as anyone watching can tell: stopping what
+    // played before cleared the dots, and looking at the file takes a
+    // while (it's read from the server), so it looked as if nothing was
+    // happening until the dots came back with the first picture.
+    let shown = id.clone();
+    let _ = ui.upgrade_in_event_loop(move |u| {
+        let p = u.global::<Player>();
+        p.set_id(shown.into());
+        p.set_loading(true);
+    });
     let Some(info) = probe(&src) else { return false };
     // Everything starts muted (no sudden loud sound); the speaker turns it on.
     *NOW.lock().unwrap() = Some(Playing { id: id.clone(), src, info, at: 0.0, muted: true, large: false, playing: false, generation: 0 });

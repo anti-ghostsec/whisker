@@ -6,6 +6,8 @@ members = [
     "apps/whisker",
     "apps/whisker-agentd",
 ]
+# A patched copy of a dependency (see [patch.crates-io]), not part of the build's own crates.
+exclude = ["vendor/ruma-common"]
 
 [workspace.package]
 version = "0.40.0"
@@ -52,3 +54,11 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 3
 debug = false
+
+# ruma-common 0.20.2 with three `Box::deserialize` calls given their type: Typst's
+# Unicode data (ICU) turns on zerovec's serde support, and with it the compiler
+# can no longer work out which Box those calls mean (E0275). Nothing else
+# changed; see vendor/ruma-common/WHISKER-PATCH.md. Drop it once matrix-sdk moves
+# to a ruma-common without the problem.
+[patch.crates-io]
+ruma-common = { path = "vendor/ruma-common" }

@@ -141,6 +141,10 @@ operating system and the **Wisp** browser.
   again); an encrypted one goes as a fresh copy with its own key, so the two rooms share
   neither the key nor the file, and it isn't sent into a room that isn't encrypted at all
   (anyone could read it there). Replies lose their reply link.
+  With *Forward encrypted files without copying* on (Settings, off by default), forwarding as
+  the same account into an encrypted room sends the same file and key at once, as other apps
+  do, which is what makes forwarding a very big file practical; someone in both rooms can then
+  tell it's the same file.
 - **File links:** *Copy file link* on a picture, video or file's menu copies its address
   (`mxc://server/id`). Paste one on its own and send it, and it goes out as that picture,
   video or file without being uploaded again; Whisker asks the server only for its type and

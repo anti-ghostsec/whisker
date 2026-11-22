@@ -470,6 +470,13 @@ const PREVIEW_TRIES: u8 = 6;
 /// Previews downloading at once, across the whole app. Each batch used to
 /// get its own few, so a busy room sent dozens of requests at once and
 /// servers turned some down (rate limits), leaving blank previews.
+/// The biggest video or sound file downloaded whole to play it, when it
+/// can't be played while it streams.
+#[cfg(target_os = "android")]
+const WHOLE_MAX: u64 = 200 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const WHOLE_MAX: u64 = 600 * 1024 * 1024;
+
 static PREVIEW_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(6);
 /// The same for avatars.
 static AVATAR_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(6);
@@ -865,6 +872,14 @@ impl Ctl {
                 let (c, client, room) = (c.clone(), client.clone(), room.clone());
                 tokio::spawn(async move {
                     let _slot = PREVIEW_SLOTS.acquire().await;
+                    // The room was left while this waited its turn (far back
+                    // in a busy room, thousands wait): it isn't fetched for
+                    // nobody, holding up the room now open. It's asked for
+                    // again when its message is back on screen.
+                    if c.current() != Some((account, room.clone())) {
+                        c.loading.lock().unwrap().remove(id.as_str());
+                        return;
+                    }
                     // Each way in turn: another server may not make thumbnails,
                     // or send one we can't read.
                     let (mut decoded, mut failed) = ((None, None), false);
@@ -1864,6 +1879,28 @@ impl Ctl {
         });
     }
 
+    /// A room being left lets go of what was scrolled back to: all but its
+    /// newest messages, with their pictures, animations and link cards.
+    /// Kept, days of a busy room stayed in memory (decoded pictures and
+    /// every frame of every animation) until a new message happened to
+    /// come there, and coming back drew all of it again.
+    fn let_go(&self, key: &RoomKey) {
+        let mut st = self.st.lock().unwrap();
+        let Some(list) = st.messages.get_mut(key) else { return };
+        if list.len() <= KEEP_PER_ROOM {
+            return;
+        }
+        let gone: Vec<OwnedEventId> = list.drain(..list.len() - KEEP_PER_ROOM).map(|m| m.event_id).collect();
+        // Older history now starts after a gap: fetched afresh when the room opens.
+        st.older.remove(key);
+        for id in &gone {
+            st.pictures.remove(id);
+            st.animations.remove(id);
+            st.link_cards.remove(id);
+            st.picture_tries.remove(id);
+        }
+    }
+
     /// Adds messages to a room's cache; returns how many were new.
     fn merge(&self, key: &RoomKey, items: Vec<HistoryItem>) -> usize {
         let mut st = self.st.lock().unwrap();
@@ -1942,6 +1979,9 @@ impl Ctl {
 
     async fn select_account(&self, id: String) {
         let Ok(id) = id.parse::<AccountId>() else { return };
+        if let Some(left) = self.current().filter(|k| k.0 != id) {
+            self.let_go(&left);
+        }
         {
             let mut st = self.st.lock().unwrap();
             st.account_chosen = true;
@@ -2000,6 +2040,9 @@ impl Ctl {
         let Some(client) = self.mgr.client(account).await else { return };
         let Some(room) = client.get_room(&room_id) else { return };
         let key = (account, room_id.clone());
+        if let Some(left) = self.current().filter(|k| *k != key) {
+            self.let_go(&left);
+        }
         // An invitation opens as a card with Accept / Decline.
         if room.state() == matrix_sdk::RoomState::Invited {
             {
@@ -4696,12 +4739,32 @@ impl Ctl {
             });
             // Played while it streams when the server sends parts of
             // files, so it starts at once; else downloaded first, below.
-            match self.cancellable(files::RemoteFile::open_to_play(&client, &media.source)).await {
+            // A big file from another server: this account's server fetches
+            // all of it before it answers, which can take minutes.
+            let waiting = {
+                let c = self.clone();
+                self.rt.spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(8)).await;
+                    c.status("Waiting for your server: it may be fetching the file from another server first (✕ to stop)…");
+                })
+            };
+            // On disk, not in the RAM folder: a server that only sends whole
+            // files has all of a video kept here while it plays (never
+            // readable: see `RemoteFile::open_to_play`).
+            let keep_in = self.mgr.data_dir().join("playing");
+            let opened = self.cancellable(files::RemoteFile::open_to_play(&client, &media.source, Some(keep_in.as_path()))).await;
+            waiting.abort();
+            // What the server says the size is, else what the message says.
+            let size = opened.as_ref().ok().and_then(|f| f.size()).or(media.size);
+            match opened {
                 Ok(file) if file.seekable() => {
                     if timeline::sniff_media(file.head()).is_none() {
                         self.ui(|u| u.global::<Player>().set_loading(false));
                         self.status("Couldn't open it: it isn't a video or audio file Whisker knows (use Save to keep it)");
                         return;
+                    }
+                    if file.downloading().is_some() {
+                        self.show_downloading(file.clone(), event_id.to_string());
                     }
                     if self.play_streaming(file, event_id.to_string()).await {
                         self.status(if media.kind == MediaKind::Audio { "Playing, muted: tap the speaker to turn the sound on." } else { "" });
@@ -4715,6 +4778,14 @@ impl Ctl {
                 }
                 Err(e) => tracing::info!("can't stream it, downloading it first: {e:#}"),
                 Ok(_) => tracing::info!("the server sends only whole files; downloading it first"),
+            }
+            // Downloading it first means all of it in memory: fine for a
+            // clip, not for gigabytes (a phone runs out and closes other
+            // apps, a VPN among them).
+            if let Some(s) = size.filter(|s| *s > WHOLE_MAX) {
+                self.ui(|u| u.global::<Player>().set_loading(false));
+                self.status(format!("Can't play it here: it's {} and couldn't be played a part at a time. Use Save to keep it.", ui::human_size(s)));
+                return;
             }
         }
         let dir = media_dir(self.mgr.data_dir());
@@ -4768,6 +4839,34 @@ impl Ctl {
                 self.status(if e.to_string() == "cancelled" { "Download cancelled.".to_owned() } else { format!("Couldn't open it: {e:#}") });
             }
         }
+    }
+
+    /// Says how far the download of `file` (message `id`) has got while it
+    /// plays, until it's all here or something else is played.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn show_downloading(&self, file: Arc<files::RemoteFile>, id: String) {
+        let c = self.clone();
+        self.rt.spawn(async move {
+            let size = file.size().unwrap_or(0).max(1);
+            let mut started = false;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                // Stopped, or another one is playing now. (It takes a
+                // moment to count as loaded, and longer when the player
+                // needs the end of the file first.)
+                let loaded = player::is_loaded(&id);
+                started |= loaded;
+                // (Only this is still holding it: the player let it go.)
+                if (started && !loaded) || Arc::strong_count(&file) == 1 {
+                    return;
+                }
+                match file.downloading() {
+                    Some((at, true)) => c.status(format!("Downloading while it plays: {}%", at * 100 / size)),
+                    Some((at, false)) if at < size => return c.status("The download stopped: the rest of it can't be played."),
+                    _ => return c.status(""),
+                }
+            }
+        });
     }
 
     /// Starts playing `file` (message `id`) in the window while it streams.

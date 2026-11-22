@@ -101,7 +101,7 @@ pub fn kind_of(mime: Option<&str>) -> MediaKind {
 /// Asks `mxc`'s server for the file's type, size and name, through the
 /// account's own connection, without downloading it.
 pub async fn probe(client: &Client, mxc: &MxcUri) -> Result<LinkedFile> {
-    let (res, _) = open(client, mxc, None).await?;
+    let (res, _) = open(client, mxc, None, ANSWER).await?;
     let header = |h: reqwest::header::HeaderName| res.headers().get(h).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let mut mime = header(reqwest::header::CONTENT_TYPE).map(|m| m.split(';').next().unwrap_or_default().trim().to_ascii_lowercase());
     let size = header(reqwest::header::CONTENT_LENGTH).and_then(|l| l.parse().ok());
@@ -135,21 +135,29 @@ impl Address {
 
 /// Starts downloading `mxc` (the caller reads as much as it wants, from
 /// `range` when given), and says from where.
-async fn open(client: &Client, mxc: &MxcUri, range: Option<&str>) -> Result<(reqwest::Response, Address)> {
+/// Longest wait for a server to start answering about a file.
+const ANSWER: std::time::Duration = std::time::Duration::from_secs(30);
+/// The same for a file someone pressed play on (it can be cancelled): a
+/// server asked for a big file from another server first fetches all of
+/// it, and only then answers, which takes minutes for gigabytes. Giving
+/// up after [`ANSWER`] meant such a video was downloaded whole instead
+/// (into memory, and once more when that failed) and never played.
+const ANSWER_TO_PLAY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+async fn open(client: &Client, mxc: &MxcUri, range: Option<&str>, answer: std::time::Duration) -> Result<(reqwest::Response, Address)> {
     let (server, id) = (mxc.server_name().context("that isn't a file address")?, mxc.media_id().context("that isn't a file address")?);
     let base = client.homeserver();
     let mut last = None;
     // Servers from before authenticated media only know the old address.
     for (path, auth) in [(format!("_matrix/client/v1/media/download/{server}/{id}"), true), (format!("_matrix/media/v3/download/{server}/{id}"), false)] {
         let at = Address { url: base.join(&path)?, auth };
-        let mut req = at.get(client);
+        // The client's own limit on a whole request is shorter than a
+        // long wait: this one gets as long as it's given.
+        let mut req = at.get(client).timeout(answer + std::time::Duration::from_secs(60));
         if let Some(r) = range {
             req = req.header(reqwest::header::RANGE, r);
         }
-        let res = tokio::time::timeout(std::time::Duration::from_secs(30), req.send())
-            .await
-            .context("the server took too long")?
-            .context("the server didn't answer")?;
+        let res = tokio::time::timeout(answer, req.send()).await.context("the server took too long")?.context("the server didn't answer")?;
         let status = res.status();
         if status.is_success() {
             return Ok((res, at));
@@ -198,6 +206,145 @@ impl Drop for Key {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.k.zeroize();
+    }
+}
+
+/// A file from a server that only sends whole files, played while it
+/// downloads: it comes once, front to back, into a file on disk, and any
+/// part that has arrived can be read (so the player can jump about in it).
+/// Loading it whole into memory first, as before, never worked for
+/// gigabytes.
+///
+/// What's on disk is never readable: an encrypted file is kept as the
+/// server sent it, a plain one is encrypted with a key made up for this one
+/// playing, and either key is only in memory. The file has no name (it's
+/// taken out of its folder as soon as it's made), so it's gone when playing
+/// stops or Whisker closes, however that happens.
+#[cfg(unix)]
+struct Spool {
+    file: Arc<std::fs::File>,
+    key: Key,
+    /// Bytes on disk so far, and whether more are coming.
+    have: tokio::sync::watch::Receiver<(u64, Coming)>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq)]
+enum Coming {
+    Yes,
+    Done,
+    Stopped,
+}
+
+#[cfg(unix)]
+impl Drop for Spool {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(unix)]
+impl Spool {
+    /// Starts keeping `res` (the whole file, `size` bytes) in `dir`.
+    fn start(res: reqwest::Response, media_key: Option<Key>, size: u64, dir: &std::path::Path) -> Result<Spool> {
+        use std::os::unix::fs::OpenOptionsExt;
+        crate::stores::make_private_dir(dir)?;
+        let path = dir.join(&crate::vault::random_secret()[..16]);
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
+        std::fs::remove_file(&path).context("couldn't keep the download private")?;
+        let (key, scramble) = match media_key {
+            Some(k) => (k, false),
+            None => {
+                let (mut k, mut iv) = ([0u8; 32], [0u8; 16]);
+                getrandom::fill(&mut k).map_err(|e| anyhow::anyhow!("no random numbers: {e}"))?;
+                getrandom::fill(&mut iv).map_err(|e| anyhow::anyhow!("no random numbers: {e}"))?;
+                (Key { k, iv }, true)
+            }
+        };
+        let file = Arc::new(file);
+        let (tx, have) = tokio::sync::watch::channel((0, Coming::Yes));
+        let task = tokio::spawn(Self::fill(res, file.clone(), scramble.then(|| key.clone()), size, tx));
+        Ok(Spool { file, key, have, task })
+    }
+
+    /// Writes the download to disk as it comes, saying how far it has got.
+    async fn fill(mut res: reqwest::Response, file: Arc<std::fs::File>, scramble: Option<Key>, size: u64, tx: tokio::sync::watch::Sender<(u64, Coming)>) {
+        use aes::cipher::StreamCipher;
+        use std::os::unix::fs::FileExt;
+        /// Written (and readable) this much at a time.
+        const STEP: usize = 256 * 1024;
+        let mut cipher = scramble.as_ref().map(|k| k.cipher_at(0));
+        let (mut at, mut buf) = (0u64, Vec::with_capacity(STEP * 2));
+        let end = loop {
+            let chunk = match tokio::time::timeout(std::time::Duration::from_secs(60), res.chunk()).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    tracing::info!("a file being played stopped coming: {e}");
+                    break Coming::Stopped;
+                }
+                Err(_) => break Coming::Stopped,
+            };
+            let last = chunk.is_none();
+            if let Some(c) = chunk {
+                let from = buf.len();
+                buf.extend_from_slice(&c);
+                if let Some(cipher) = &mut cipher {
+                    cipher.apply_keystream(&mut buf[from..]);
+                }
+            }
+            // More than the server said there'd be: not the file asked for.
+            if at + buf.len() as u64 > size {
+                break Coming::Stopped;
+            }
+            if buf.len() >= STEP || (last && !buf.is_empty()) {
+                let (f, data) = (file.clone(), std::mem::replace(&mut buf, Vec::with_capacity(STEP * 2)));
+                let n = data.len() as u64;
+                match tokio::task::spawn_blocking(move || f.write_all_at(&data, at)).await {
+                    Ok(Ok(())) => at += n,
+                    Ok(Err(e)) => {
+                        tracing::warn!("couldn't keep a file being played (is the disk full?): {e}");
+                        break Coming::Stopped;
+                    }
+                    Err(_) => break Coming::Stopped,
+                }
+                let _ = tx.send((at, Coming::Yes));
+            }
+            if last {
+                break if at == size { Coming::Done } else { Coming::Stopped };
+            }
+        };
+        let _ = tx.send((at, end));
+    }
+
+    /// How much has come, and whether more is coming.
+    fn progress(&self) -> (u64, bool) {
+        let (at, coming) = *self.have.borrow();
+        (at, coming == Coming::Yes)
+    }
+
+    /// Bytes `offset..end` of the file, once they've come.
+    async fn read(&self, offset: u64, end: u64) -> Result<Vec<u8>> {
+        use aes::cipher::StreamCipher;
+        use std::os::unix::fs::FileExt;
+        let mut have = self.have.clone();
+        loop {
+            let (got, coming) = *have.borrow_and_update();
+            if got >= end {
+                break;
+            }
+            if coming != Coming::Yes || have.changed().await.is_err() {
+                bail!("the download stopped before that part of the file came");
+            }
+        }
+        let (file, key) = (self.file.clone(), self.key.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut data = vec![0u8; (end - offset) as usize];
+            file.read_exact_at(&mut data, offset)?;
+            key.cipher_at(offset).apply_keystream(&mut data);
+            Ok(data)
+        })
+        .await?
     }
 }
 
@@ -309,8 +456,14 @@ impl Piece {
 
 /// Bytes fetched at a time by [`RemoteFile::read_at`].
 const BLOCK: u64 = 512 * 1024;
-/// Blocks kept (about 20 MB).
-const KEEP_BLOCKS: usize = 40;
+/// Blocks kept (about 48 MB). A file whose sound and picture sit far apart
+/// is read in two places at once, each fetching ahead: with fewer kept,
+/// the two pushed each other's blocks out and they were fetched again and
+/// again (many times the file's size, for a big one).
+const KEEP_BLOCKS: usize = 96;
+/// Times a block is asked for before giving up: a connection that drops
+/// for a moment (a VPN reconnecting) doesn't end the video.
+const BLOCK_TRIES: u32 = 4;
 /// Blocks fetched ahead of what's read, so playing doesn't wait on them
 /// (8 MB: several seconds of a phone video; 2 MB ran out every couple
 /// of seconds, and the picture stopped and jumped).
@@ -342,31 +495,58 @@ pub struct RemoteFile {
     /// Bytes still allowed to be fetched.
     budget: AtomicU64,
     blocks: std::sync::Mutex<Blocks>,
+    /// The whole file, coming once and kept on disk: for a server that
+    /// doesn't send parts.
+    #[cfg(unix)]
+    spool: Option<Spool>,
 }
 
 impl RemoteFile {
     /// For looking at the file: reads at most [`RELAY_BUDGET`].
     pub async fn open(client: &Client, source: &MediaSource) -> Result<Arc<RemoteFile>> {
-        Self::open_with(client, source, |_| RELAY_BUDGET).await
+        Self::open_with(client, source, |_| RELAY_BUDGET, ANSWER, None).await
     }
 
-    /// For playing the file: reads up to a few times its size.
-    pub async fn open_to_play(client: &Client, source: &MediaSource) -> Result<Arc<RemoteFile>> {
-        Self::open_with(client, source, playing_budget).await
+    /// For playing the file: reads up to a few times its size. From a
+    /// server that only sends whole files it's downloaded once, kept in
+    /// `keep_in` (never readable there, see [`Spool`]) and played as it
+    /// comes.
+    pub async fn open_to_play(client: &Client, source: &MediaSource, keep_in: Option<&std::path::Path>) -> Result<Arc<RemoteFile>> {
+        Self::open_with(client, source, playing_budget, ANSWER_TO_PLAY, keep_in).await
     }
 
-    async fn open_with(client: &Client, source: &MediaSource, budget: fn(Option<u64>) -> u64) -> Result<Arc<RemoteFile>> {
+    async fn open_with(client: &Client, source: &MediaSource, budget: fn(Option<u64>) -> u64, answer: std::time::Duration, keep_in: Option<&std::path::Path>) -> Result<Arc<RemoteFile>> {
         let (mxc, key) = address_and_key(source)?;
-        let (res, at) = open(client, &mxc, Some("bytes=0-4095")).await?;
+        let (res, at) = open(client, &mxc, Some("bytes=0-4095"), answer).await?;
         let ranges = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
         let size = if ranges { content_range(res.headers()).and_then(|(_, total)| total) } else { res.content_length() };
         let allowed = AtomicU64::new(budget(size));
+        // The whole file is on its way (the server doesn't send parts):
+        // it's kept as it comes, and read from there.
+        #[cfg(unix)]
+        if let (false, Some(size), Some(dir)) = (ranges, size, keep_in) {
+            let spool = Spool::start(res, key.clone(), size, dir)?;
+            let head = spool.read(0, size.min(4096)).await?;
+            return Ok(Arc::new(RemoteFile { client: client.clone(), at, key, size: Some(size), ranges, head, budget: allowed, blocks: Default::default(), spool: Some(spool) }));
+        }
+        let _ = keep_in;
         let mut piece = Piece::new(res, 0, Some(4095), key.clone())?;
         let mut head = Vec::new();
         while let Some(data) = piece.next(&allowed).await? {
             head.extend_from_slice(&data);
         }
-        Ok(Arc::new(RemoteFile { client: client.clone(), at, key, size, ranges, head, budget: allowed, blocks: Default::default() }))
+        Ok(Arc::new(RemoteFile {
+            client: client.clone(),
+            at,
+            key,
+            size,
+            ranges,
+            head,
+            budget: allowed,
+            blocks: Default::default(),
+            #[cfg(unix)]
+            spool: None,
+        }))
     }
 
     /// The file's size, when the server says it.
@@ -382,7 +562,30 @@ impl RemoteFile {
     /// Whether any part can be read without reading what comes before it:
     /// the server sends parts and says the size.
     pub fn seekable(&self) -> bool {
-        self.ranges && self.size.is_some()
+        self.parts() && self.size.is_some()
+    }
+
+    /// Any part can be asked for: the server sends parts, or the whole
+    /// file is being kept as it comes.
+    fn parts(&self) -> bool {
+        #[cfg(unix)]
+        if self.spool.is_some() {
+            return true;
+        }
+        self.ranges
+    }
+
+    /// For a file played while the whole of it downloads: how many bytes
+    /// have come, and whether more are coming. `None` for one read in parts.
+    pub fn downloading(&self) -> Option<(u64, bool)> {
+        #[cfg(unix)]
+        {
+            self.spool.as_ref().map(Spool::progress)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     /// Starts downloading the file from byte `from`, to `to` when given.
@@ -407,6 +610,10 @@ impl RemoteFile {
         let end = offset.saturating_add(len as u64).min(size);
         if offset >= end {
             return Ok(Vec::new());
+        }
+        #[cfg(unix)]
+        if let Some(spool) = &self.spool {
+            return spool.read(offset, end).await;
         }
         let (first, last) = (offset / BLOCK, (end - 1) / BLOCK);
         for i in last + 1..=last + READ_AHEAD {
@@ -445,15 +652,31 @@ impl RemoteFile {
             let size = self.size.context("the server didn't say how big the file is")?;
             let from = i * BLOCK;
             let to = (from + BLOCK).min(size) - 1;
-            let mut piece = self.fetch(from, Some(to)).await?;
-            let mut data = Vec::with_capacity((to + 1 - from) as usize);
-            while let Some(d) = piece.next(&self.budget).await? {
-                data.extend_from_slice(&d);
+            let mut tries = 0;
+            loop {
+                tries += 1;
+                let got = async {
+                    let mut piece = self.fetch(from, Some(to)).await?;
+                    let mut data = Vec::with_capacity((to + 1 - from) as usize);
+                    while let Some(d) = piece.next(&self.budget).await? {
+                        data.extend_from_slice(&d);
+                    }
+                    if data.len() as u64 != to + 1 - from {
+                        bail!("the server sent too little");
+                    }
+                    Ok::<Arc<[u8]>, anyhow::Error>(Arc::from(data))
+                }
+                .await;
+                match got {
+                    Ok(data) => return Ok(data),
+                    // Out of budget: asking again would only fail again.
+                    Err(e) if tries >= BLOCK_TRIES || self.budget.load(Ordering::Relaxed) == 0 => return Err(e),
+                    Err(e) => {
+                        tracing::debug!("part {i} of a file didn't come ({e:#}); asking again");
+                        tokio::time::sleep(std::time::Duration::from_secs(u64::from(tries) * 2)).await;
+                    }
+                }
             }
-            if data.len() as u64 != to + 1 - from {
-                bail!("the server sent too little");
-            }
-            Ok::<Arc<[u8]>, anyhow::Error>(Arc::from(data))
         })
         .await
         .cloned()
@@ -564,7 +787,7 @@ async fn relay_one(mut sock: tokio::net::TcpStream, file: &Arc<RemoteFile>, secr
     let range = lines.find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("range")).map(|(_, v)| v.trim().to_owned()));
     // A server that only sends whole files: so does the relay, which
     // tells ffmpeg not to jump about.
-    let asked = range.as_deref().filter(|_| file.ranges).and_then(|r| asked_range(r, file.size));
+    let asked = range.as_deref().filter(|_| file.parts()).and_then(|r| asked_range(r, file.size));
     // Not the sender's content type: ffmpeg would take it as a hint (a
     // playlist type makes it read the file as a playlist).
     let mut out = String::new();
@@ -588,7 +811,7 @@ async fn relay_one(mut sock: tokio::net::TcpStream, file: &Arc<RemoteFile>, secr
         }
     };
     out.push_str("Content-Type: application/octet-stream\r\nConnection: close\r\n");
-    if file.ranges {
+    if file.parts() {
         out.push_str("Accept-Ranges: bytes\r\n");
     }
     out.push_str("\r\n");
@@ -971,7 +1194,7 @@ mod tests {
         let client = Client::builder().homeserver_url(server.uri()).build().await.unwrap();
         let info = EncryptedFileInfo::V2(V2EncryptedFileInfo::encode(k, iv));
         let source = MediaSource::Encrypted(Box::new(EncryptedFile::new(OwnedMxcUri::from("mxc://localhost/enc"), info, EncryptedFileHashes::new())));
-        let file = RemoteFile::open_to_play(&client, &source).await.unwrap();
+        let file = RemoteFile::open_to_play(&client, &source, None).await.unwrap();
         assert!(file.seekable());
         assert_eq!(file.size(), Some(plain.len() as u64));
         assert_eq!(file.head(), &plain[..4096]);
@@ -982,6 +1205,56 @@ mod tests {
         let got = reqwest::Client::new().get(&relay.url).header("range", "bytes=100000-").send().await.unwrap();
         assert_eq!(got.status().as_u16(), 206);
         assert_eq!(&got.bytes().await.unwrap()[..], &plain[100_000..]);
+    }
+
+    /// A server that only sends whole files: the file is played as it
+    /// downloads, any part of it once it has come, and what's kept on disk
+    /// meanwhile isn't readable (and has no name).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plays_whole_file_downloads_as_they_come() {
+        use aes::cipher::{KeyIvInit, StreamCipher};
+        use matrix_sdk::ruma::events::room::{EncryptedFile, EncryptedFileHashes, V2EncryptedFileInfo};
+        let plain: Vec<u8> = (0..900_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        let (k, iv) = ([3u8; 32], [5u8, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut sealed = plain.clone();
+        Aes256Ctr::new((&k).into(), (&iv).into()).apply_keystream(&mut sealed);
+        let server = wiremock::MockServer::start().await;
+        // No parts, whatever is asked.
+        wiremock::Mock::given(wiremock::matchers::path_regex("/download/localhost/enc$")).respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(sealed)).mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::path_regex("/download/localhost/plain$")).respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(plain.clone())).mount(&server).await;
+        let client = Client::builder().homeserver_url(server.uri()).build().await.unwrap();
+        let dir = std::env::temp_dir().join(format!("whisker-spool-{}", std::process::id()));
+        let info = EncryptedFileInfo::V2(V2EncryptedFileInfo::encode(k, iv));
+        let sources = [
+            MediaSource::Encrypted(Box::new(EncryptedFile::new(OwnedMxcUri::from("mxc://localhost/enc"), info, EncryptedFileHashes::new()))),
+            MediaSource::Plain(OwnedMxcUri::from("mxc://localhost/plain")),
+        ];
+        for source in sources {
+            // Without somewhere to keep it, it can't be read in parts.
+            assert!(!RemoteFile::open_to_play(&client, &source, None).await.unwrap().seekable());
+            let file = RemoteFile::open_to_play(&client, &source, Some(&dir)).await.unwrap();
+            assert!(file.seekable());
+            assert_eq!(file.size(), Some(plain.len() as u64));
+            assert_eq!(file.head(), &plain[..4096]);
+            // The end first: it waits for the download to get there.
+            for (at, len) in [(plain.len() - 5, 100), (0, 10), (456_789, 50_000)] {
+                assert_eq!(file.read_at(at as u64, len).await.unwrap(), plain[at..(at + len).min(plain.len())]);
+            }
+            assert_eq!(file.downloading().map(|d| d.0), Some(plain.len() as u64));
+            // Nothing is left in the folder, even while it plays.
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            // What's on disk isn't the file.
+            use std::os::unix::fs::FileExt;
+            let mut raw = vec![0u8; 4096];
+            file.spool.as_ref().unwrap().file.read_exact_at(&mut raw, 0).unwrap();
+            assert_ne!(raw, plain[..4096]);
+            let relay = Relay::serve(file).await.unwrap();
+            let got = reqwest::Client::new().get(&relay.url).header("range", "bytes=100000-").send().await.unwrap();
+            assert_eq!(got.status().as_u16(), 206);
+            assert_eq!(&got.bytes().await.unwrap()[..], &plain[100_000..]);
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

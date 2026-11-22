@@ -367,31 +367,54 @@ pub fn picture_size(w: Option<u64>, h: Option<u64>, px: Option<&Pixels>) -> (f32
     ((w * scale).max(60.0), (h * scale).max(40.0))
 }
 
+/// Rows kept built beyond the open room's (other rooms, threads).
+const KEEP_ROWS: usize = 4000;
+
+/// What a row shows, as a number: the same number, the same row (so it's
+/// reused, not built again).
+pub fn row_sig(r: &MsgRow, pixels: &PixelCache) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let loaded = |m: &Option<OwnedMxcUri>| m.as_ref().is_some_and(|m| matches!(pixels.lock().unwrap().get(m), Some(Some(_))));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", r.item).hash(&mut h);
+    (r.mine, r.first, r.picture_failed, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust).hash(&mut h);
+    r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
+    r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
+    loaded(&r.item.sender_avatar).hash(&mut h);
+    r.link_card.as_ref().map(|c| (c.state, &c.title, &c.description, c.picture.as_ref().map(|p| (p.width(), p.height())))).hash(&mut h);
+    r.readers.iter().map(|x| loaded(&x.2)).collect::<Vec<_>>().hash(&mut h);
+    r.reactions.iter().map(|x| loaded(&custom_reaction(&x.0))).collect::<Vec<_>>().hash(&mut h);
+    h.finish()
+}
+
 impl Models {
     /// The row for `r`, reused from last time when nothing about it changed.
     pub fn message(&mut self, r: &MsgRow, pixels: &PixelCache) -> MessageItem {
-        use std::hash::{Hash, Hasher};
-        let loaded = |m: &Option<OwnedMxcUri>| m.as_ref().is_some_and(|m| matches!(pixels.lock().unwrap().get(m), Some(Some(_))));
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{:?}", r.item).hash(&mut h);
-        (r.mine, r.first, r.picture_failed, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust).hash(&mut h);
-        r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
-        r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
-        loaded(&r.item.sender_avatar).hash(&mut h);
-        r.link_card.as_ref().map(|c| (c.state, &c.title, &c.description, c.picture.as_ref().map(|p| (p.width(), p.height())))).hash(&mut h);
-        r.readers.iter().map(|x| loaded(&x.2)).collect::<Vec<_>>().hash(&mut h);
-        r.reactions.iter().map(|x| loaded(&custom_reaction(&x.0))).collect::<Vec<_>>().hash(&mut h);
-        let sig = h.finish();
+        self.message_signed(r, row_sig(r, pixels), pixels)
+    }
+
+    /// [`Models::message`] with `r`'s [`row_sig`] worked out already (off
+    /// the UI thread: for thousands of rows it's most of the work).
+    pub fn message_signed(&mut self, r: &MsgRow, sig: u64, pixels: &PixelCache) -> MessageItem {
         let id = r.item.event_id.to_string();
         if let Some((_, item)) = self.built.get(&id).filter(|(old, _)| *old == sig) {
             return item.clone();
         }
-        if self.built.len() > 4000 {
-            self.built.clear();
-        }
         let item = self.build_message(r, pixels);
         self.built.insert(id, (sig, item.clone()));
         item
+    }
+
+    /// Many rows at once (a whole room). Rows kept from other rooms and
+    /// views are let go only when there are a great many: dropping them all
+    /// whenever the count passed a limit, as before, threw away a long
+    /// room's own rows on every redraw, so each change rebuilt all of them.
+    pub fn message_rows(&mut self, rows: &[MsgRow], sigs: &[u64], pixels: &PixelCache) -> Vec<MessageItem> {
+        if self.built.len() > (rows.len() * 2).max(KEEP_ROWS) {
+            let here: std::collections::HashSet<String> = rows.iter().map(|r| r.item.event_id.to_string()).collect();
+            self.built.retain(|id, _| here.contains(id));
+        }
+        rows.iter().zip(sigs).map(|(r, sig)| self.message_signed(r, *sig, pixels)).collect()
     }
 
     fn build_message(&mut self, r: &MsgRow, pixels: &PixelCache) -> MessageItem {

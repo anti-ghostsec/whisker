@@ -1714,9 +1714,11 @@ impl Ctl {
         let items: Vec<HistoryItem> = rows.iter().map(|r| r.item.clone()).collect();
         self.fetch_pictures(&key, &items);
         let (px, older) = (self.avatars.clone(), self.st.lock().unwrap().older.get(&key).cloned().flatten().is_some());
+        // Worked out here, not on the UI thread (it reads every message).
+        let sigs: Vec<u64> = rows.iter().map(|r| ui::row_sig(r, &px)).collect();
         self.ui(move |u| {
             ui::with(|m| {
-                let items: Vec<MessageItem> = rows.iter().map(|r| m.message(r, &px)).collect();
+                let items = m.message_rows(&rows, &sigs, &px);
                 ui::sync_rows(&m.messages, items, |a, b| a.id == b.id);
             });
             u.set_has_older(older);
@@ -6089,9 +6091,10 @@ impl Ctl {
         let items: Vec<HistoryItem> = rows.iter().map(|r| r.item.clone()).collect();
         self.fetch_pictures(&key, &items);
         let px = self.avatars.clone();
+        let sigs: Vec<u64> = rows.iter().map(|r| ui::row_sig(r, &px)).collect();
         self.ui(move |_| {
             ui::with(|m| {
-                let items: Vec<MessageItem> = rows.iter().map(|r| m.message(r, &px)).collect();
+                let items = m.message_rows(&rows, &sigs, &px);
                 ui::sync_rows(&m.thread, items, |a, b| a.id == b.id);
             });
         });

@@ -4334,7 +4334,15 @@ impl Ctl {
         let Some(sending) = self.mgr.client(sender).await else { return };
         let (Some(from), Some(to)) = (client.get_room(&from_id), OwnedRoomId::try_from(target.as_str()).ok().and_then(|id| sending.get_room(&id))) else { return };
         // An edited text message goes as its newest text.
-        let edited = self.find(&(account, from_id.clone()), event_id.as_str()).filter(|m| m.edited && m.media.is_none()).map(|m| m.body);
+        let found = self.find(&(account, from_id.clone()), event_id.as_str());
+        // An encrypted file goes as a fresh copy (downloaded, then uploaded
+        // again with a key of its own), which takes a while for a big one:
+        // say so, instead of a greyed button and nothing else.
+        if let Some(media) = found.as_ref().and_then(|m| m.media.as_ref()).filter(|m| matches!(m.source, MediaSource::Encrypted(_))) {
+            let size = media.size.map(|s| format!(" ({})", ui::human_size(s))).unwrap_or_default();
+            self.ui(move |u| u.set_forward_status(s(format!("Copying the file{size}: it's downloaded, then uploaded again with a new key. This takes a while for a big file…"))));
+        }
+        let edited = found.filter(|m| m.edited && m.media.is_none()).map(|m| m.body);
         let mark = |sent: bool, id: String| {
             move |_: &AppWindow| {
                 ui::with(|m| {

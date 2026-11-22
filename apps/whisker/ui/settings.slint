@@ -240,6 +240,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-show-events(bool);
     callback set-show-hidden(bool);
     callback set-allow-screenshots(bool);
+    callback set-typst(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -312,6 +313,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.show-hidden;
                 toggled => { root.set-show-hidden(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Typst"; color: Theme.text; }
+                Text {
+                    text: "Maths and small typeset documents. Start a message with /typst to send what follows typeset, as a picture everyone can see (the text goes with it for apps that can't show pictures). Typst code blocks (```typst) in messages are shown typeset too. Nothing a document names is read or fetched: no files, no packages, not even the date.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.typst;
+                toggled => { root.set-typst(self.checked); }
             }
         }
         // Only Android stops screenshots.
@@ -1392,6 +1409,7 @@ export component SettingsPage inherits Rectangle {
     callback set-show-events(bool);
     callback set-show-hidden(bool);
     callback set-allow-screenshots(bool);
+    callback set-typst(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -1500,6 +1518,7 @@ export component SettingsPage inherits Rectangle {
                             set-show-events(b) => { root.set-show-events(b); }
                             set-show-hidden(b) => { root.set-show-hidden(b); }
                             set-allow-screenshots(b) => { root.set-allow-screenshots(b); }
+                            set-typst(b) => { root.set-typst(b); }
                             set-dev-mode(b) => { root.set-dev-mode(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-key-sharing(i) => { root.set-key-sharing(i); }

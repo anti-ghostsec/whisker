@@ -1056,7 +1056,7 @@ component MessageRow inherits Rectangle {
                                 pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } }
                                 clicked => {
                                     if root.item.link-card == 1 { root.act("link-preview", root.item.id); }
-                                    else if root.item.link-card == 3 { root.go(root.item.link-url); }
+                                    else if root.item.link-card == 3 && root.item.link-url != "" { root.go(root.item.link-url); }
                                 }
                             }
                             card-col := VerticalLayout {
@@ -1072,7 +1072,8 @@ component MessageRow inherits Rectangle {
                                     height: min(225px, (card-w - 23px) * root.item.link-picture.height / max(1, root.item.link-picture.width));
                                     border-radius: 6px;
                                     clip: true;
-                                    Image { source: root.item.link-picture; width: parent.width; height: parent.height; image-fit: cover; }
+                                    // Typst (no address) is shown whole; a site's picture fills the space.
+                                    Image { source: root.item.link-picture; width: parent.width; height: parent.height; image-fit: root.item.link-url == "" ? contain : cover; }
                                     // Playing here (YouTube through Invidious).
                                     property <bool> here: root.item.link-video && Player.id == root.item.id;
                                     if self.here && !Player.large && Player.frame.width > 0: Rectangle {
@@ -2263,6 +2264,7 @@ export component AppWindow inherits Window {
     callback set-show-events(bool);
     callback set-show-hidden(bool);
     callback set-allow-screenshots(bool);
+    callback set-typst(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -3617,6 +3619,7 @@ export component AppWindow inherits Window {
             set-show-events(b) => { root.set-show-events(b); }
             set-show-hidden(b) => { root.set-show-hidden(b); }
             set-allow-screenshots(b) => { root.set-allow-screenshots(b); }
+            set-typst(b) => { root.set-typst(b); }
             set-dev-mode(b) => { root.set-dev-mode(b); }
             set-notify-level(i) => { root.set-notify-level(i); }
             set-key-sharing(i) => { root.set-key-sharing(i); }

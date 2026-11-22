@@ -334,6 +334,13 @@ operating system and the **Wisp** browser.
   adds: its Android version, sometimes its make and model, and the time). Files Whisker can't clean (HEIC, AVIF, RAW, PDF, Office documents and the
   like, or video when ffmpeg is missing) are held back with a message instead of being
   sent as they are; turn the setting off to send them anyway.
+- **Typst** (off until Settings → *Typst* is on): maths and small typeset documents. Start a
+  message with `/typst` and what follows is typeset and sent as a picture, so every app shows
+  it; its source goes along as the picture's text for apps that can't show pictures. Typst
+  code blocks (```` ```typst ````) in messages show typeset under the text. A document sees
+  only its own text: no files, no packages (nothing is fetched), not even today's date, and it
+  uses Typst's own built-in fonts, so the picture looks the same everywhere and says nothing
+  about your device. One is typeset at a time, with a 10-second limit.
 - **Stickers and custom emoji.** Right-click a picture and pick *Save as sticker…* (sent
   on its own by typing `:name:`) or *Save as emoji…* (`:name:` inside a message becomes the
   picture inline, and your emoji are under *React*). Both lists are kept in your vault, not

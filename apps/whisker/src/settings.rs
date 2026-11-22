@@ -58,6 +58,10 @@ pub struct AppSettings {
     /// picture show Whisker (off: the screen stays blank in all of them).
     #[serde(default)]
     pub allow_screenshots: bool,
+    /// Typst: `/typst …` sends it typeset as a picture, and ```typst code
+    /// blocks in messages are shown typeset. Off by default.
+    #[serde(default)]
+    pub typst: bool,
     /// Notifications: 0 off, 1 just "New message", 2 sender and room, 3 with text.
     #[serde(default = "two")]
     pub notify_level: i32,

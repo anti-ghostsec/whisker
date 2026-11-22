@@ -48,6 +48,8 @@ export global Prefs {
     // Android: screenshots, screen recording and the recent-apps picture
     // show Whisker (off: they're blank).
     in-out property <bool> allow-screenshots: false;
+    // Typst: /typst sends it typeset, and typst code blocks show typeset.
+    in-out property <bool> typst: false;
     // Room events in full detail (and the ones with no sentence of their own).
     in-out property <bool> dev-mode: false;
     // 0 off, 1 "New message" only, 2 sender and room, 3 with message text.

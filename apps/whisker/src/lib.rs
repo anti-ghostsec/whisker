@@ -23,6 +23,7 @@ mod spaces;
 mod spell;
 #[cfg(not(target_os = "android"))]
 mod spell_marks;
+mod typeset;
 mod ui;
 mod voice;
 
@@ -58,6 +59,8 @@ const PAGE: u32 = 50;
 const ROWS_FIRST: usize = 20;
 const ROWS_STEP: usize = 15;
 const AVATAR_PX: u32 = 96;
+/// The `site` of a message's card when it's its Typst, typeset.
+const TYPST_CARD: &str = "Typst";
 /// Animated pictures bigger than this show still (playing them means
 /// downloading and decoding every frame).
 const MAX_ANIMATION_BYTES: u64 = 20 * 1024 * 1024;
@@ -830,6 +833,7 @@ impl Ctl {
     /// animated GIF/WebP files (so they play). A few at a time, decoded off
     /// the network threads.
     fn fetch_pictures(&self, key: &RoomKey, items: &[HistoryItem]) {
+        self.typeset_blocks(key, items);
         self.fetch_link_cards(key, items);
         let items = &self.resolve_links(key, items);
         let wanted: Vec<(OwnedEventId, Vec<Attempt>)> = {
@@ -946,6 +950,59 @@ impl Ctl {
                         c.fetch_animation_later((account, room), id, src);
                     }
                 });
+            }
+        });
+    }
+
+    /// Messages with ```typst code blocks, when Typst is on: typeset, shown
+    /// as a card under the text (instead of a link preview). One at a time,
+    /// in the order they're shown.
+    fn typeset_blocks(&self, key: &RoomKey, items: &[HistoryItem]) {
+        if !self.settings.lock().unwrap().typst {
+            return;
+        }
+        let mut todo = Vec::new();
+        {
+            let mut st = self.st.lock().unwrap();
+            for m in items {
+                if m.media.is_some() || st.link_cards.contains_key(&m.event_id) || timeline::is_undecryptable(&m.body) {
+                    continue;
+                }
+                let Some(src) = typeset::blocks(&m.body) else { continue };
+                st.link_cards.insert(m.event_id.clone(), ui::LinkCard { site: TYPST_CARD.into(), state: ui::CardState::Loading, ..Default::default() });
+                todo.push((m.event_id.clone(), src));
+            }
+        }
+        if todo.is_empty() {
+            return;
+        }
+        let (c, key) = (self.clone(), key.clone());
+        self.spawn(async move {
+            static QUEUE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            for (id, src) in todo {
+                let got = {
+                    let _turn = QUEUE.lock().await;
+                    typeset::render_async(src).await
+                };
+                let card = match got {
+                    Ok(img) => {
+                        // Card-sized (it's at most 400 px wide there).
+                        let px = tokio::task::spawn_blocking(move || {
+                            let img = if img.width() > 1000 { image::imageops::resize(&img, 1000, (img.height() as u64 * 1000 / img.width() as u64).max(1) as u32, image::imageops::FilterType::Triangle) } else { img };
+                            Pixels::clone_from_slice(img.as_raw(), img.width(), img.height())
+                        })
+                        .await
+                        .ok();
+                        ui::LinkCard { site: TYPST_CARD.into(), picture: px, state: ui::CardState::Ready, ..Default::default() }
+                    }
+                    Err(e) => ui::LinkCard { site: TYPST_CARD.into(), description: e, state: ui::CardState::Ready, ..Default::default() },
+                };
+                // Turned off meanwhile: not shown.
+                if !c.settings.lock().unwrap().typst {
+                    return;
+                }
+                c.st.lock().unwrap().link_cards.insert(id.clone(), card);
+                c.update_message(&key, &id);
             }
         });
     }
@@ -3148,6 +3205,15 @@ impl Ctl {
             self.post_sticker(&room, sticker).await;
             return;
         }
+        // "/typst …": sent typeset, as a picture (when Typst is on).
+        if let Some(src) = text.strip_prefix("/typst").filter(|r| r.starts_with([' ', '\n']))
+            && self.settings.lock().unwrap().typst
+            && self.st.lock().unwrap().editing.is_none()
+        {
+            let src = src.trim().to_owned();
+            self.send_typst(&room, src, text.clone()).await;
+            return;
+        }
         // "/hidden text": sent as an event other apps don't show.
         if let Some(rest) = text.strip_prefix("/hidden ").map(str::trim).filter(|r| !r.is_empty())
             && self.st.lock().unwrap().editing.is_none()
@@ -3633,6 +3699,53 @@ impl Ctl {
         self.ui(|u| u.set_stickers_open(false));
         if let Some(sticker) = sticker {
             self.post_sticker(&room, sticker).await;
+        }
+    }
+
+    /// Typesets `src` and posts it as a picture (as a reply when one is
+    /// being written), its source as the picture's text for apps that show
+    /// no pictures. On failure the message goes back in the box.
+    async fn send_typst(&self, room: &matrix_sdk::Room, src: String, typed: String) {
+        let give_back = |c: &Self, why: String| {
+            c.status(format!("Not sent: {why}"));
+            let typed = typed.clone();
+            c.ui(move |u| {
+                if u.get_draft().is_empty() {
+                    u.set_draft(s(&typed));
+                }
+            });
+        };
+        self.status("Typesetting…");
+        let img = match typeset::render_async(src.clone()).await {
+            Ok(i) => i,
+            Err(e) => return give_back(self, e),
+        };
+        let Some(png) = tokio::task::spawn_blocking(move || typeset::png(&img)).await.ok().flatten() else {
+            return give_back(self, "the picture couldn't be made".into());
+        };
+        let opts = self.settings.lock().unwrap().upload.clone();
+        let Ok(prepared) = tokio::task::spawn_blocking(move || whisker_core::upload::prepare("typst.png", png, &opts, None)).await else { return };
+        let reply_to = self.st.lock().unwrap().reply_to.take();
+        self.ui(|u| {
+            u.set_reply_to(s(""));
+            u.set_stick_bottom(true);
+        });
+        self.status("Sending…");
+        let sent = match whisker_core::upload::upload(room, prepared, false, |_| {}).await {
+            Ok(mut m) => {
+                // Its text is the source (what apps without pictures show,
+                // and a picture's description), not a file name.
+                if let matrix_sdk::ruma::events::room::message::MessageType::Image(c) = &mut m {
+                    c.body = src.chars().take(4000).collect();
+                    c.filename = None;
+                }
+                whisker_core::upload::post_reply(room, m, reply_to.as_deref()).await.map(drop)
+            }
+            Err(e) => Err(e),
+        };
+        match sent {
+            Ok(()) => self.status(""),
+            Err(e) => give_back(self, format!("{e:#}")),
         }
     }
 
@@ -5824,6 +5937,22 @@ impl Ctl {
         self.spawn(async move { c.show_messages().await });
     }
 
+    fn set_typst(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.typst = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_typst(on);
+        }
+        // Messages with Typst in them show it typeset now (or plain again).
+        if !on {
+            self.st.lock().unwrap().link_cards.retain(|_, c| c.site != TYPST_CARD);
+        }
+        let c = self.clone();
+        self.spawn(async move { c.show_messages().await });
+    }
+
     fn set_allow_screenshots(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.allow_screenshots = on;
@@ -7209,6 +7338,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_show_events(prefs.show_events);
     ui.global::<Prefs>().set_show_hidden(prefs.show_hidden);
     ui.global::<Prefs>().set_allow_screenshots(prefs.allow_screenshots);
+    ui.global::<Prefs>().set_typst(prefs.typst);
     #[cfg(target_os = "android")]
     droid::allow_screenshots(prefs.allow_screenshots);
     ui.global::<Prefs>().set_dev_mode(prefs.developer_mode);
@@ -7509,6 +7639,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_set_allow_screenshots(move |b| c.set_allow_screenshots(b));
+    }
+    {
+        let c = ctl.clone();
+        ui.on_set_typst(move |b| c.set_typst(b));
     }
     {
         let c = ctl.clone();

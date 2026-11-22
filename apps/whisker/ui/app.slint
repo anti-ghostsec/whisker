@@ -729,6 +729,13 @@ component MessageRow inherits Rectangle {
     property <string> selection;
     // Lit for a moment: a click on a reply to it just scrolled here.
     in property <bool> flash;
+    // Scrolled well out of view. Nothing of it is drawn then (without the
+    // clip, every part of every loaded message is gone through on each
+    // frame), and its animated pictures stop stepping: left running, they
+    // had the whole window redrawn many times a second for nothing, which
+    // is what made a room slow, then stuck, the further back it went.
+    in property <bool> away;
+    clip: root.away;
 
     background: area.has-hover ? Theme.hover : transparent;
     if root.flash: Rectangle { background: Theme.accent.transparentize(0.75); }
@@ -893,7 +900,7 @@ component MessageRow inherits Rectangle {
                             background: Theme.raised;
                             Timer {
                                 interval: max(20, root.item.frame-ms) * 1ms;
-                                running: root.item.frames.length > 1;
+                                running: root.item.frames.length > 1 && !root.away;
                                 triggered => { parent.frame = mod(parent.frame + 1, root.item.frames.length); }
                             }
                             if root.item.picture.width > 0 && root.item.frames.length == 0: Image { source: root.item.picture; width: parent.width; height: parent.height; image-fit: cover; }
@@ -2776,6 +2783,7 @@ export component AppWindow inherits Window {
                                     item: m;
                                     // A click on a reply to this message: scroll it into view.
                                     flash: root.jump-id == m.id;
+                                    away: self.y + self.height < -msgs.content-y - 600px || self.y > msgs.visible-height - msgs.content-y + 600px;
                                     changed flash => {
                                         if self.flash {
                                             root.stick-bottom = false;

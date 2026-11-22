@@ -14,8 +14,8 @@ use typst::foundations::{Bytes, Datetime};
 use typst::syntax::{FileId, Source};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
+use typst::layout::PagedDocument;
 use typst::{Library, LibraryExt, World};
-use typst_layout::PagedDocument;
 
 /// Longest text typeset (bytes).
 pub const MAX_SOURCE: usize = 8 * 1024;
@@ -72,7 +72,7 @@ impl World for One {
         FONTS.fonts.get(index).cloned()
     }
 
-    fn today(&self, _offset: Option<typst::foundations::Duration>) -> Option<Datetime> {
+    fn today(&self, _offset: Option<i64>) -> Option<Datetime> {
         None
     }
 }
@@ -95,16 +95,24 @@ pub fn render(src: &str) -> Result<image::RgbaImage, String> {
         let first = errors.iter().find(|e| e.severity == Severity::Error).map(|e| e.message.to_string());
         format!("Typst: {}", first.unwrap_or_else(|| "it couldn't be typeset".into()))
     })?;
-    let page = doc.pages().first().ok_or("Typst: there's nothing to show")?;
+    let page = doc.pages.first().ok_or("Typst: there's nothing to show")?;
     let size = page.frame.size();
     let (w, h) = (size.x.to_pt(), size.y.to_pt());
     if !(w > 0.0 && h > 0.0) {
         return Err("Typst: there's nothing to show".into());
     }
     let scale = SCALE.min(MAX_PX / w).min(MAX_PX / h);
-    let pixmap = typst_render::render(page, &typst_render::RenderOptions { pixel_per_pt: scale.into(), render_bleed: false });
+    let pixmap = typst_render::render(page, scale as f32);
     let (pw, ph) = (pixmap.width(), pixmap.height());
-    image::RgbaImage::from_raw(pw, ph, pixmap.take_demultiplied()).ok_or_else(|| "Typst: the picture couldn't be made".into())
+    let rgba: Vec<u8> = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    image::RgbaImage::from_raw(pw, ph, rgba).ok_or_else(|| "Typst: the picture couldn't be made".into())
 }
 
 /// [`render`] off the async threads, one at a time, with a time limit.

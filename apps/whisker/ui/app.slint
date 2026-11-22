@@ -1942,6 +1942,11 @@ export component AppWindow inherits Window {
     callback explore-preview(string);
     in property <string> invite-from;
     in property <bool> has-older;
+    // Newer messages are loaded but not drawn (you went far back).
+    in property <bool> has-newer;
+    // The next change keeps what's read in place counted from the top
+    // (rows going or coming at the bottom); it's cleared once used.
+    in-out property <bool> anchor-top: false;
     // Suggested servers for sign-in / sign-up, then "Other server…".
     in property <[string]> login-servers;
     in property <bool> can-moderate;
@@ -2182,6 +2187,8 @@ export component AppWindow inherits Window {
     // The reply bar was closed: the next message isn't a reply.
     callback cancel-reply();
     callback load-older();
+    callback load-newer();
+    callback jump-latest();
     callback message-action(string, string);
     callback open-link(string);
     callback login(string, string, string, string, string, bool, bool, string);
@@ -2749,6 +2756,15 @@ export component AppWindow inherits Window {
                             // a fling or wheel keeps moving after that, and going by
                             // the old place made the view leap.
                             function settle() {
+                                if root.anchor-top {
+                                    root.anchor-top = false;
+                                    self.content-y = max(min(0px, self.content-y), self.visible-height - self.content-height);
+                                    self.from-bottom = max(0px, self.content-height + self.content-y - self.visible-height);
+                                    self.seen-height = self.content-height;
+                                    self.seen-visible = self.visible-height;
+                                    self.blur-from = self.content-y;
+                                    return;
+                                }
                                 if !root.stick-bottom && self.seen-height > 0px {
                                     self.from-bottom = max(0px, self.seen-height + self.content-y - self.seen-visible);
                                 }
@@ -2766,8 +2782,10 @@ export component AppWindow inherits Window {
                                 // Reading counts as use for auto-lock.
                                 root.activity();
                                 if Prefs.touch && abs(self.content-y - self.blur-from) > 24px { root.blur-request += 1; }
-                                root.stick-bottom = self.content-y <= self.visible-height - self.content-height + 40px;
+                                // At the bottom of what's drawn isn't the end while newer rows aren't drawn.
+                                root.stick-bottom = !root.has-newer && self.content-y <= self.visible-height - self.content-height + 40px;
                                 self.from-bottom = max(0px, self.content-height + self.content-y - self.visible-height);
+                                if root.has-newer && self.content-y <= self.visible-height - self.content-height + 400px { root.load-newer(); }
                             }
                             col := VerticalLayout {
                                 width: msgs.visible-width;
@@ -2815,7 +2833,7 @@ export component AppWindow inherits Window {
                             older := Text { text: "Load older messages"; font-size: 12px; color: Theme.text; }
                             TouchArea { mouse-cursor: pointer; clicked => { msgs.from-bottom = max(0px, msgs.content-height + msgs.content-y - msgs.visible-height); root.stick-bottom = false; root.load-older(); } }
                         }
-                        if !root.stick-bottom: Rectangle {
+                        if !root.stick-bottom || root.has-newer: Rectangle {
                             x: parent.width - 52px;
                             y: parent.height - 52px;
                             width: 38px;
@@ -2827,7 +2845,11 @@ export component AppWindow inherits Window {
                             Text { text: "↓"; font-size: 18px; color: Theme.text; }
                             TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { root.stick-bottom = true; msgs.content-y = min(0px, msgs.visible-height - msgs.content-height); }
+                                clicked => {
+                                    if root.has-newer { root.jump-latest(); }
+                                    root.stick-bottom = true;
+                                    msgs.content-y = min(0px, msgs.visible-height - msgs.content-height);
+                                }
                             }
                         }
                     }

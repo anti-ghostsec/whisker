@@ -57,6 +57,12 @@ const PAGE: u32 = 50;
 /// Opening a room draws this many of its newest messages at once, then the
 /// rest a few at a time, so a long room doesn't hold up the window.
 const ROWS_FIRST: usize = 20;
+/// Most rows drawn at once. Every drawn row is laid out each time anything
+/// changes, so a week of history drawn whole made the app crawl; what's not
+/// drawn stays loaded (nothing is fetched again).
+const WINDOW: usize = 200;
+/// Rows brought in at a time when going further back or forward.
+const WINDOW_STEP: usize = 60;
 const ROWS_STEP: usize = 15;
 const AVATAR_PX: u32 = 96;
 /// The `site` of a message's card when it's its Typst, typeset.
@@ -108,6 +114,12 @@ struct State {
     files: Option<RoomFiles>,
     /// While a room is opening: how many of its newest rows are drawn so far.
     row_limit: Option<usize>,
+    /// Which of each room's loaded rows are drawn (see [`Win`]).
+    window: HashMap<RoomKey, Win>,
+    /// Loading newer rows back in is under way (one at a time).
+    loading_newer: bool,
+    /// The next drawing keeps what's read in place counted from the top.
+    anchor_top: bool,
     /// Messages replied to that aren't loaded, fetched on their own: sender
     /// and text (`None`: being fetched, or it couldn't be).
     reply_cache: HashMap<OwnedEventId, Option<(String, String)>>,
@@ -544,6 +556,26 @@ fn media_address(src: &MediaSource) -> &str {
 enum PreviewFrom {
     Explore,
     Room(Option<OwnedRoomId>),
+}
+
+/// The rows of a room that are drawn: up to `shown` of them, ending with
+/// `end` (`None`: the newest, following new messages as they come).
+#[derive(Debug, Clone, Default)]
+struct Win {
+    end: Option<OwnedEventId>,
+    /// 0: [`WINDOW`].
+    shown: usize,
+    /// Set when drawn: how many loaded rows are above the first drawn one,
+    /// the drawn rows' ids, and the next newer ones after them.
+    above: usize,
+    drawn: Vec<OwnedEventId>,
+    newer: Vec<OwnedEventId>,
+}
+
+impl Win {
+    fn shown(&self) -> usize {
+        if self.shown == 0 { WINDOW } else { self.shown }
+    }
 }
 
 /// What a matrix.to link in a message points at.
@@ -1696,6 +1728,23 @@ impl Ctl {
             return 0;
         };
         let mut rows = self.rows(&key).await;
+        // Only the window's rows (see `Win`).
+        let (above, newer) = {
+            let mut st = self.st.lock().unwrap();
+            let w = st.window.entry(key.clone()).or_default();
+            let all = rows.len();
+            let end = w.end.as_ref().and_then(|id| rows.iter().position(|r| &r.item.event_id == id)).map_or(all, |i| i + 1);
+            if end == all {
+                w.end = None;
+            }
+            let start = end.saturating_sub(w.shown());
+            w.newer = rows[end..].iter().take(WINDOW_STEP).map(|r| r.item.event_id.clone()).collect();
+            w.above = start;
+            rows.truncate(end);
+            rows.drain(..start);
+            w.drawn = rows.iter().map(|r| r.item.event_id.clone()).collect();
+            (start, end < all)
+        };
         let total = rows.len();
         self.fetch_reply_targets(&key, &rows);
         if let Some(n) = self.st.lock().unwrap().row_limit
@@ -1713,13 +1762,20 @@ impl Ctl {
         );
         let items: Vec<HistoryItem> = rows.iter().map(|r| r.item.clone()).collect();
         self.fetch_pictures(&key, &items);
-        let (px, older) = (self.avatars.clone(), self.st.lock().unwrap().older.get(&key).cloned().flatten().is_some());
+        let (px, older) = (self.avatars.clone(), above > 0 || self.st.lock().unwrap().older.get(&key).cloned().flatten().is_some());
+        let anchor_top = std::mem::take(&mut self.st.lock().unwrap().anchor_top);
         self.ui(move |u| {
+            // Rows going or coming at the bottom: what's read stays put
+            // counted from the top (otherwise it's counted from the end).
+            if anchor_top {
+                u.set_anchor_top(true);
+            }
             ui::with(|m| {
                 let items: Vec<MessageItem> = rows.iter().map(|r| m.message(r, &px)).collect();
                 ui::sync_rows(&m.messages, items, |a, b| a.id == b.id);
             });
             u.set_has_older(older);
+            u.set_has_newer(newer);
         });
         total
     }
@@ -2076,6 +2132,7 @@ impl Ctl {
             st.editing = None;
             st.thread = None;
             st.row_limit = Some(ROWS_FIRST);
+            st.window.remove(&key);
         }
         self.ui(move |u| {
             u.set_thread_open(false);
@@ -3122,6 +3179,16 @@ impl Ctl {
 
     async fn load_older(&self) {
         let Some((key, room)) = self.current_room().await else { return };
+        // Loaded but not drawn (further up than the window): drawn first.
+        let above = self.st.lock().unwrap().window.get(&key).map_or(0, |w| w.above);
+        if above > 0 {
+            if let Some(w) = self.st.lock().unwrap().window.get_mut(&key) {
+                w.shown = w.shown() + above.min(WINDOW_STEP);
+            }
+            self.show_messages().await;
+            self.trim_newest(&key).await;
+            return;
+        }
         let Some(Some(mut token)) = self.st.lock().unwrap().older.get(&key).cloned() else { return };
         if self.st.lock().unwrap().older_failed.get(&key).is_some_and(|t| t.elapsed() < OLDER_RETRY) {
             return;
@@ -3133,6 +3200,10 @@ impl Ctl {
             match timeline::history(&room, Some(token.clone()), PAGE).await {
                 Ok(page) => {
                     let added = self.merge(&key, page.items);
+                    // What came is drawn (above what's there).
+                    if let Some(w) = self.st.lock().unwrap().window.get_mut(&key) {
+                        w.shown = w.shown() + added;
+                    }
                     self.merge_reactions(&key, page.reactions);
                     self.forget_deleted(&key, &page.gone);
                     let next = page.older.filter(|t| *t != token);
@@ -3157,6 +3228,69 @@ impl Ctl {
         }
         self.show_messages().await;
         self.ui(|u| u.set_loading_history(false));
+        self.trim_newest(&key).await;
+    }
+
+    /// More drawn than [`WINDOW`] after going back: the newest drawn rows
+    /// stop being drawn (after the older ones are in place, so the view
+    /// doesn't move).
+    async fn trim_newest(&self, key: &RoomKey) {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let mut st = self.st.lock().unwrap();
+            let Some(w) = st.window.get_mut(key) else { return };
+            let n = w.drawn.len();
+            if n <= WINDOW {
+                return;
+            }
+            w.end = Some(w.drawn[WINDOW - 1].clone());
+            w.shown = WINDOW;
+            st.anchor_top = true;
+        }
+        if self.current().as_ref() == Some(key) {
+            self.show_messages().await;
+        }
+    }
+
+    /// Near the bottom of what's drawn, with newer rows not drawn: the next
+    /// ones come back in, and as many of the oldest drawn stop being drawn.
+    async fn load_newer(&self) {
+        let Some(key) = self.current() else { return };
+        {
+            let mut st = self.st.lock().unwrap();
+            if st.loading_newer {
+                return;
+            }
+            let Some(w) = st.window.get_mut(&key) else { return };
+            if w.end.is_none() || w.newer.is_empty() {
+                return;
+            }
+            let k = w.newer.len();
+            // All that's left: back to following the newest.
+            w.end = if k < WINDOW_STEP { None } else { w.newer.last().cloned() };
+            w.shown = w.shown() + k;
+            st.anchor_top = true;
+            st.loading_newer = true;
+        }
+        self.show_messages().await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        if let Some(w) = self.st.lock().unwrap().window.get_mut(&key) {
+            w.shown = WINDOW;
+        }
+        if self.current().as_ref() == Some(&key) {
+            self.show_messages().await;
+        }
+        self.st.lock().unwrap().loading_newer = false;
+    }
+
+    /// Back to the newest messages (the ↓ button, or sending something).
+    async fn jump_latest(&self) {
+        let Some(key) = self.current() else { return };
+        let was_back = self.st.lock().unwrap().window.remove(&key).is_some_and(|w| w.end.is_some());
+        if was_back {
+            self.show_messages().await;
+        }
+        self.ui(|u| u.set_stick_bottom(true));
     }
 
     async fn send(&self, text: String) {
@@ -3164,6 +3298,10 @@ impl Ctl {
         let Some((key, room)) = self.current_room().await else {
             return;
         };
+        // What's sent shows at the end: back there from further up.
+        if !text.is_empty() || !self.st.lock().unwrap().pending_files.is_empty() {
+            self.jump_latest().await;
+        }
         // Files waiting to go: the text is their caption.
         let files = {
             let mut st = self.st.lock().unwrap();
@@ -3751,6 +3889,7 @@ impl Ctl {
 
     /// Posts a sticker, as a reply when one is being written.
     async fn post_sticker(&self, room: &matrix_sdk::Room, sticker: Sticker) {
+        self.jump_latest().await;
         let reply_to = self.st.lock().unwrap().reply_to.take();
         self.ui(|u| {
             u.set_reply_to(s(""));
@@ -7585,6 +7724,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.on_remove_pending_file(move |i| c.remove_pending_file(i));
     }
     on!(on_load_older, load_older);
+    on!(on_load_newer, load_newer);
+    on!(on_jump_latest, jump_latest);
     on!(on_remove_agent, remove_agent);
     on!(on_lock, lock);
     {

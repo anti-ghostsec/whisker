@@ -34,6 +34,10 @@ android:
       # No copy of Whisker's data in Google's cloud backup or adb backups
       # (also added by the build, see .github/workflows).
       allow_backup: false
+      # The APK carries Java code: Slint's small helper, as classes.dex (the
+      # build adds it, see .github/workflows), so it's ordinary app code and
+      # isn't loaded from memory when Whisker starts.
+      has_code: true
       activities:
         # Whisker shows up in other apps' Share menus, for any files or text.
         - intent_filters:

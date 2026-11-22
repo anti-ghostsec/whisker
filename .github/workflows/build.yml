@@ -170,13 +170,52 @@ jobs:
           assert t.count(old) == 1
           t = t.replace(old, old + '    #[serde(rename(serialize = "android:requestLegacyExternalStorage"))]\n    pub request_legacy_external_storage: Option<bool>,\n    #[serde(rename(serialize = "android:allowBackup"))]\n    pub allow_backup: Option<bool>,\n')
           open(p, "w").write(t)
+          # The APK gets the classes.dex Slint's Android backend builds (the
+          # newest one under WHISKER_DEX_DIR): xbuild can add one, but only
+          # does for its own web-view apps.
+          p = "xbuild/src/command/build.rs"
+          t = open(p).read()
+          old = "                apk.finish(env.target().signer().cloned())?;\n"
+          assert t.count(old) == 1
+          new = """                if let Some(dir) = std::env::var_os("WHISKER_DEX_DIR") {
+                              fn find(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+                                  for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                                      let p = e.path();
+                                      if p.is_dir() {
+                                          find(&p, out);
+                                      } else if p.file_name() == Some(OsStr::new("classes.dex")) && p.to_string_lossy().contains("i-slint-backend-android-activity") {
+                                          out.push(p);
+                                      }
+                                  }
+                              }
+                              let mut found = Vec::new();
+                              find(Path::new(&dir), &mut found);
+                              found.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+                              let dex = found.last().context("no classes.dex from Slint's Android backend to put in the APK")?;
+                              apk.add_dex(dex)?;
+                          }
+          """
+          t = t.replace(old, new + old)
+          open(p, "w").write(t)
           EOF
           cargo install --path xbuild --locked
 
       - name: Build
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          WHISKER_DEX_DIR: target/x/release/android
         run: x build -p whisker --platform android --arch arm64 --release --format apk
+
+      # Slint's Java helper is ordinary code in the APK, so nothing is
+      # loaded from memory when Whisker starts (hardened systems such as
+      # GrapheneOS can refuse that, and Whisker then didn't open).
+      - name: Check the APK carries the Java helper
+        run: |
+          set -eu
+          apk=target/x/release/android/whisker.apk
+          unzip -p "$apk" classes.dex | grep -aq 'Ldev/slint/android/SlintAndroidJavaHelper;' || { echo "::error::The APK has no classes.dex with Slint's Java helper"; exit 1; }
+          tools="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)"
+          "${tools}aapt2" dump xmltree --file AndroidManifest.xml "$apk" | grep -A1 'hasCode' | grep -q 'true' || { echo "::error::The APK's manifest doesn't say it has code"; exit 1; }
 
       # Android loads the app's library only if everything it needs is in
       # it or in the phone's own libraries. A C++ name left unresolved (the

@@ -6,6 +6,8 @@ members = [
     "apps/whisker",
     "apps/whisker-agentd",
 ]
+# A patched copy of a dependency (see [patch.crates-io]), not part of the build's own crates.
+exclude = ["vendor/i-slint-backend-android-activity"]
 
 [workspace.package]
 version = "0.41.3"
@@ -52,3 +54,13 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 3
 debug = false
+
+# Slint's Android backend 1.19.0 with one change: its Java helper is looked for
+# in the APK's own code first, and only loaded from memory (upstream's way)
+# when it isn't there. Hardened systems (GrapheneOS) can refuse apps code
+# loaded from memory, and Whisker then didn't start. The build puts the helper
+# in the APK (see .github/workflows); the change is described in
+# vendor/i-slint-backend-android-activity/WHISKER-PATCH.md. Drop it once Slint
+# can use a helper shipped in the APK.
+[patch.crates-io]
+i-slint-backend-android-activity = { path = "vendor/i-slint-backend-android-activity" }

@@ -50,6 +50,9 @@ export global Prefs {
     in-out property <bool> allow-screenshots: false;
     // Typst: /typst sends it typeset, and typst code blocks show typeset.
     in-out property <bool> typst: false;
+    // Forwarding an encrypted file reuses it (same key) where that's safe,
+    // instead of uploading a fresh copy.
+    in-out property <bool> forward-as-is: false;
     // Room events in full detail (and the ones with no sentence of their own).
     in-out property <bool> dev-mode: false;
     // 0 off, 1 "New message" only, 2 sender and room, 3 with message text.

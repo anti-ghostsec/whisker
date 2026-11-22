@@ -2272,6 +2272,7 @@ export component AppWindow inherits Window {
     callback set-show-hidden(bool);
     callback set-allow-screenshots(bool);
     callback set-typst(bool);
+    callback set-forward-as-is(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -3628,6 +3629,7 @@ export component AppWindow inherits Window {
             set-show-hidden(b) => { root.set-show-hidden(b); }
             set-allow-screenshots(b) => { root.set-allow-screenshots(b); }
             set-typst(b) => { root.set-typst(b); }
+            set-forward-as-is(b) => { root.set-forward-as-is(b); }
             set-dev-mode(b) => { root.set-dev-mode(b); }
             set-notify-level(i) => { root.set-notify-level(i); }
             set-key-sharing(i) => { root.set-key-sharing(i); }

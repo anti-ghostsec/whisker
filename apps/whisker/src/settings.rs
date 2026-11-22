@@ -62,6 +62,12 @@ pub struct AppSettings {
     /// blocks in messages are shown typeset. Off by default.
     #[serde(default)]
     pub typst: bool,
+    /// Forwarding an encrypted file as the account that has it, into an
+    /// encrypted room, sends the same file and key (at once, as other apps
+    /// do) instead of a fresh copy. Off by default: someone in both rooms
+    /// can tell it's the same file.
+    #[serde(default)]
+    pub forward_as_is: bool,
     /// Notifications: 0 off, 1 just "New message", 2 sender and room, 3 with text.
     #[serde(default = "two")]
     pub notify_level: i32,

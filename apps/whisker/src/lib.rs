@@ -4338,7 +4338,10 @@ impl Ctl {
         // An encrypted file goes as a fresh copy (downloaded, then uploaded
         // again with a key of its own), which takes a while for a big one:
         // say so, instead of a greyed button and nothing else.
-        if let Some(media) = found.as_ref().and_then(|m| m.media.as_ref()).filter(|m| matches!(m.source, MediaSource::Encrypted(_))) {
+        // Unless it's sent as it is (Settings): only by the account that has
+        // it, so another account's copy never shares its address.
+        let as_is = sender == account && self.settings.lock().unwrap().forward_as_is;
+        if let Some(media) = found.as_ref().and_then(|m| m.media.as_ref()).filter(|m| !as_is && matches!(m.source, MediaSource::Encrypted(_))) {
             let size = media.size.map(|s| format!(" ({})", ui::human_size(s))).unwrap_or_default();
             self.ui(move |u| u.set_forward_status(s(format!("Copying the file{size}: it's downloaded, then uploaded again with a new key. This takes a while for a big file…"))));
         }
@@ -4356,7 +4359,7 @@ impl Ctl {
         };
         self.ui(mark(true, target.clone()));
         let opts = self.settings.lock().unwrap().upload.clone();
-        match timeline::forward(&from, &event_id, &to, edited.as_deref(), &opts).await {
+        match timeline::forward(&from, &event_id, &to, edited.as_deref(), &opts, as_is).await {
             Ok(_) => {
                 let name = timeline::room_name(&to).await;
                 self.ui(move |u| u.set_forward_status(s(format!("Forwarded to {name}."))));
@@ -6046,6 +6049,16 @@ impl Ctl {
         self.spawn(async move { c.show_messages().await });
     }
 
+    fn set_forward_as_is(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.forward_as_is = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_forward_as_is(on);
+        }
+    }
+
     fn set_typst(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.typst = on;
@@ -7449,6 +7462,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_show_hidden(prefs.show_hidden);
     ui.global::<Prefs>().set_allow_screenshots(prefs.allow_screenshots);
     ui.global::<Prefs>().set_typst(prefs.typst);
+    ui.global::<Prefs>().set_forward_as_is(prefs.forward_as_is);
     #[cfg(target_os = "android")]
     droid::allow_screenshots(prefs.allow_screenshots);
     ui.global::<Prefs>().set_dev_mode(prefs.developer_mode);
@@ -7753,6 +7767,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_set_typst(move |b| c.set_typst(b));
+    }
+    {
+        let c = ctl.clone();
+        ui.on_set_forward_as_is(move |b| c.set_forward_as_is(b));
     }
     {
         let c = ctl.clone();

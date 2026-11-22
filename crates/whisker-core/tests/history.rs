@@ -150,7 +150,7 @@ async fn forwards_a_copy_without_the_reply() {
         .expect(1)
         .mount(server.server())
         .await;
-    let id = timeline::forward(&from, event_id!("$pic"), &to, None, &Default::default()).await.unwrap();
+    let id = timeline::forward(&from, event_id!("$pic"), &to, None, &Default::default(), false).await.unwrap();
     assert_eq!(id, "$copy");
 }
 
@@ -180,7 +180,10 @@ async fn an_encrypted_file_is_not_forwarded_into_a_plain_room() {
         .expect(0)
         .mount(server.server())
         .await;
-    let e = timeline::forward(&from, event_id!("$secret"), &to, None, &Default::default()).await.unwrap_err();
+    let e = timeline::forward(&from, event_id!("$secret"), &to, None, &Default::default(), false).await.unwrap_err();
+    assert!(format!("{e:#}").contains("isn't"), "{e:#}");
+    // Nor as it is, with "forward without copying" on.
+    let e = timeline::forward(&from, event_id!("$secret"), &to, None, &Default::default(), true).await.unwrap_err();
     assert!(format!("{e:#}").contains("isn't"), "{e:#}");
     let e = whisker_core::files::share_file_of(&from, event_id!("$secret"), &to, None, &Default::default()).await.unwrap_err();
     assert!(format!("{e:#}").contains("isn't"), "{e:#}");

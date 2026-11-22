@@ -1398,6 +1398,7 @@ pub async fn forward(
     to: &Room,
     edited_body: Option<&str>,
     opts: &crate::upload::UploadOptions,
+    as_is: bool,
 ) -> Result<OwnedEventId> {
     let content = match edited_body {
         Some(body) => RoomMessageEventContent::text_plain(body),
@@ -1418,8 +1419,14 @@ pub async fn forward(
                 content = RoomMessageEventContent::text_plain(strip_reply_fallback(&t.body));
             }
             if crate::files::has_encrypted_media(&content.msgtype) {
-                let msg = crate::files::copy_encrypted(from, &content.msgtype, to, opts).await?;
-                return crate::upload::post(to, msg).await;
+                // Its key goes with it: never into a room anyone can read.
+                crate::files::must_be_encrypted(to).await?;
+                // As it is (the same file and key, at once) only when asked
+                // for; else a fresh copy with a key of its own.
+                if !as_is {
+                    let msg = crate::files::copy_encrypted(from, &content.msgtype, to, opts).await?;
+                    return crate::upload::post(to, msg).await;
+                }
             }
             content
         }

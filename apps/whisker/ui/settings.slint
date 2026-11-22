@@ -241,6 +241,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-show-hidden(bool);
     callback set-allow-screenshots(bool);
     callback set-typst(bool);
+    callback set-forward-as-is(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -698,6 +699,22 @@ component GeneralPage inherits VerticalLayout {
                 model: ["Every device", "Devices their owner signed", "Only devices I've verified"];
                 current-index: Prefs.key-sharing;
                 selected => { root.set-key-sharing(self.current-index); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Forward encrypted files without copying"; color: Theme.text; }
+                Text {
+                    text: "Off: an encrypted file you forward is downloaded and uploaded again with a new key, so nothing ties the two rooms' copies together; a big file takes a long time. On: forwarding as the same account into an encrypted room sends the same file and key, at once, as other apps do; someone who is in both rooms can then tell it's the same file. Either way, forwarding as another account makes a new copy, and an encrypted file never goes into a room that isn't encrypted.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.forward-as-is;
+                toggled => { root.set-forward-as-is(self.checked); }
             }
         }
     }
@@ -1410,6 +1427,7 @@ export component SettingsPage inherits Rectangle {
     callback set-show-hidden(bool);
     callback set-allow-screenshots(bool);
     callback set-typst(bool);
+    callback set-forward-as-is(bool);
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -1519,6 +1537,7 @@ export component SettingsPage inherits Rectangle {
                             set-show-hidden(b) => { root.set-show-hidden(b); }
                             set-allow-screenshots(b) => { root.set-allow-screenshots(b); }
                             set-typst(b) => { root.set-typst(b); }
+                            set-forward-as-is(b) => { root.set-forward-as-is(b); }
                             set-dev-mode(b) => { root.set-dev-mode(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-key-sharing(i) => { root.set-key-sharing(i); }

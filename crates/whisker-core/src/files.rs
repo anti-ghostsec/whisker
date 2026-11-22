@@ -1001,6 +1001,16 @@ pub fn has_encrypted_media(m: &MessageType) -> bool {
     })
 }
 
+/// Refuses a room that isn't encrypted: an encrypted file's key travels in
+/// the message, and there anyone could read it.
+pub(crate) async fn must_be_encrypted(to: &Room) -> Result<()> {
+    let encrypted = to.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false);
+    if !encrypted {
+        bail!("that file is encrypted and this room isn't, so it wasn't sent here (anyone could read it). Send it to an encrypted room, or save it and send it yourself");
+    }
+    Ok(())
+}
+
 /// A fresh copy of an encrypted message's file for `to`: downloaded from
 /// `from`, what metadata can be taken out taken out, and uploaded again
 /// with a new key, so the
@@ -1009,10 +1019,7 @@ pub fn has_encrypted_media(m: &MessageType) -> bool {
 /// the room it came from promised its sender.
 pub async fn copy_encrypted(from: &Room, m: &MessageType, to: &Room, opts: &crate::upload::UploadOptions) -> Result<MessageType> {
     let Some(media) = crate::timeline::media_of(m) else { bail!("that message has no file") };
-    let encrypted = to.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false);
-    if !encrypted {
-        bail!("that file is encrypted and this room isn't, so it wasn't sent here (anyone could read it). Send it to an encrypted room, or save it and send it yourself");
-    }
+    must_be_encrypted(to).await?;
     let bytes = crate::timeline::download_in(&from.client(), from.room_id(), &media.source, None)
         .await
         .context("couldn't get the file")?;

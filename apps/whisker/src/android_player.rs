@@ -1059,7 +1059,7 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
     ex.seek(at_us);
     let mut rate = format.i32("sample-rate").unwrap_or(48000);
     let mut channels = format.i32("channel-count").unwrap_or(2);
-    let mut stream = None;
+    let mut stream: Option<ndk::audio::AudioStream> = None;
     let mut buf = Vec::new();
     let mut more = true;
     let mut played = 0u64;

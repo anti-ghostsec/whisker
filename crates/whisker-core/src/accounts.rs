@@ -782,6 +782,14 @@ impl AccountManager {
         if let Some(p) = proxy {
             b = b.proxy(p);
         }
+        // Older messages' keys are fetched from the account's key backup
+        // when a message can't be read (once the recovery key has been
+        // entered). The SDK leaves that off unless asked, so a new sign-in
+        // could read nothing sent before it, recovery key or not.
+        b = b.with_encryption_settings(matrix_sdk::encryption::EncryptionSettings {
+            backup_download_strategy: matrix_sdk::encryption::BackupDownloadStrategy::AfterDecryptionFailure,
+            ..Default::default()
+        });
         use matrix_sdk_base::crypto::CollectStrategy;
         b = b.with_room_key_recipient_strategy(match self.key_sharing.load(std::sync::atomic::Ordering::Relaxed) {
             0 => CollectStrategy::AllDevices,

@@ -2032,7 +2032,9 @@ export component AppWindow inherits Window {
     changed current-room => { if Prefs.touch { root.blur-request += 1; } else { root.focus-request += 1; } }
     in-out property <int> blur-request;
     changed blur-request => { if Prefs.touch { back-keys.focus(); } }
-    changed viewer-open => { if root.viewer-open { root.blur-request += 1; } }
+    changed viewer-open => { if root.viewer-open { root.blur-request += 1; } root.viewer-menu = false; }
+    // Phones: the open picture's menu (after holding it) is up.
+    property <bool> viewer-menu;
     property <bool> video-large: Player.large;
     changed video-large => { if root.video-large { root.blur-request += 1; } }
     changed emoji-open => { if !root.emoji-open { root.focus-request += 1; } }
@@ -2258,6 +2260,7 @@ export component AppWindow inherits Window {
         if root.sheet-open { root.sheet-open = false; return true; }
         if root.recording { root.voice-cancel(); return true; }
         if Player.large && Player.id != "" { Player.set-large(false); return true; }
+        if root.viewer-menu { root.viewer-menu = false; return true; }
         if root.viewer-open { root.viewer-open = false; return true; }
         if root.emoji-open { root.emoji-open = false; return true; }
         if root.picker-open { root.picker-finish(false); return true; }
@@ -3036,9 +3039,24 @@ export component AppWindow inherits Window {
                               compose-flick := Flickable {
                                 // Scrolled by keeping the cursor in view (below), and by dragging on phones;
                                 // a mouse drag selects text instead.
-                                mouse-drag-pan-enabled: false;
+                                mouse-drag-pan-enabled: Prefs.touch;
                                 content-width: self.width;
                                 content-height: max(self.height, compose.preferred-height);
+                                // The cursor is on the last line: what's typed there stays
+                                // in view as the text grows. Going by cursor moves alone
+                                // missed text still being composed by a phone's keyboard,
+                                // and a scroll position left over from before the box grew
+                                // or shrank kept part of the text out of sight.
+                                property <bool> at-end: true;
+                                function settle() {
+                                    if self.at-end {
+                                        self.content-y = min(0px, self.height - self.content-height);
+                                    } else {
+                                        self.content-y = max(min(0px, self.height - self.content-height), min(0px, self.content-y));
+                                    }
+                                }
+                                changed content-height => { self.settle(); }
+                                changed height => { self.settle(); }
                                 ContextMenuArea {
                                     width: compose-flick.width;
                                     height: compose-flick.content-height;
@@ -3069,6 +3087,7 @@ export component AppWindow inherits Window {
                                         edited => { root.draft-edited(self.text); }
                                         // Long messages: what you're typing stays in view.
                                         cursor-position-changed(p) => {
+                                            compose-flick.at-end = p.y + 30px >= self.preferred-height;
                                             if p.y + compose-flick.content-y < 0px {
                                                 compose-flick.content-y = -p.y;
                                             } else if p.y + 20px + compose-flick.content-y > compose-flick.height {
@@ -3867,13 +3886,18 @@ export component AppWindow inherits Window {
 
         if root.viewer-open: Rectangle {
             background: #000000e0;
-            TouchArea { clicked => { root.viewer-open = false; } }
+            // (Not on phones: a second finger landing to pinch ends the first
+            // one's touch, which counted as a tap and closed the picture
+            // before it could be zoomed. There, ✕ or Back closes it.)
+            TouchArea { clicked => { if !Prefs.touch { root.viewer-open = false; } } }
             if root.viewer-image.width == 0: Text { text: root.viewer-percent > 0 ? "Loading… " + root.viewer-percent + "%" : "Loading…"; color: white; }
             vcm := ContextMenuArea {
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
                 width: parent.width - 40px;
                 height: parent.height - 80px;
+                // Phones get the rows that slide up on a hold instead.
+                enabled: !Prefs.touch;
                 Menu {
                     MenuItem { title: "Save image…"; activated => { root.message-action("save", root.viewer-id); } }
                     if Prefs.touch: MenuItem { title: "Share…"; activated => { root.message-action("share", root.viewer-id); } }
@@ -3889,7 +3913,7 @@ export component AppWindow inherits Window {
                 }
                 // Zoom: pinch (two fingers, or a trackpad), the mouse wheel or a
                 // double tap; one finger or the mouse drags a zoomed picture.
-                Rectangle {
+                zoomer := Rectangle {
                     property <float> zoom: 1;
                     property <length> pan-x;
                     property <length> pan-y;
@@ -3941,7 +3965,13 @@ export component AppWindow inherits Window {
                         }
                         // A tap on the unzoomed picture closes it, as around it.
                         clicked => {
-                            if !parent.dragged && parent.zoom <= 1.01 { root.viewer-open = false; }
+                            if !Prefs.touch && !parent.dragged && parent.zoom <= 1.01 { root.viewer-open = false; }
+                        }
+                        // Phones: holding the picture brings up what can be done with it.
+                        Timer {
+                            interval: 450ms;
+                            running: Prefs.touch && parent.pressed && !zoomer.dragged && !root.viewer-menu;
+                            triggered => { root.viewer-menu = true; }
                         }
                         double-clicked => {
                             parent.base-zoom = parent.zoom;
@@ -3975,18 +4005,36 @@ export component AppWindow inherits Window {
                     }
                 }
             }
-            // Save / Forward / Close, top right.
+            // Save / Forward / Close, top right. Drawn (not font characters,
+            // which some phones don't have) on dark discs, so they show on a
+            // light picture too.
             HorizontalLayout {
                 x: parent.width - self.preferred-width - 12px;
                 // Below a phone's status bar, where they can be tapped.
                 y: Safe.top + 10px;
-                spacing: 6px;
-                for b in [{ icon: "⤓", tip: "save" }, { icon: "↪", tip: "forward" }, { icon: "✕", tip: "close" }]: Rectangle {
-                    width: 38px;
-                    height: 38px;
-                    border-radius: 19px;
-                    background: vb.has-hover ? #ffffff30 : #ffffff14;
-                    Text { text: b.icon; color: white; font-size: 18px; }
+                width: self.preferred-width;
+                height: 42px;
+                spacing: 8px;
+                for b in [
+                    { tip: "save", shape: "M 12 4 V 15 M 7 11 L 12 16 L 17 11 M 5 20 H 19" },
+                    { tip: "forward", shape: "M 14 6 L 20 12 L 14 18 M 20 12 H 9 A 5 5 0 0 0 4 17 V 19" },
+                    { tip: "close", shape: "M 6 6 L 18 18 M 18 6 L 6 18" }
+                ]: Rectangle {
+                    width: 42px;
+                    height: 42px;
+                    border-radius: 21px;
+                    background: vb.has-hover ? #000000d0 : #000000a0;
+                    border-width: 1px;
+                    border-color: #ffffff40;
+                    Path {
+                        width: 20px;
+                        height: 20px;
+                        viewbox-width: 24;
+                        viewbox-height: 24;
+                        stroke: white;
+                        stroke-width: 2px;
+                        commands: b.shape;
+                    }
                     vb := TouchArea {
                         mouse-cursor: pointer;
                         clicked => {
@@ -3994,6 +4042,28 @@ export component AppWindow inherits Window {
                             if b.tip == "forward" { root.viewer-open = false; root.message-action("forward", root.viewer-id); }
                             if b.tip == "close" { root.viewer-open = false; }
                         }
+                    }
+                }
+            }
+            // Phones: the picture's menu, after holding it.
+            if root.viewer-menu: Rectangle {
+                background: #00000080;
+                TouchArea { clicked => { root.viewer-menu = false; } }
+                Rectangle {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    height: vmenu.preferred-height;
+                    y: parent.height - self.height - Safe.bottom - 8px;
+                    border-radius: 14px;
+                    background: Theme.panel;
+                    TouchArea {}
+                    vmenu := VerticalLayout {
+                        padding: 6px;
+                        SheetRow { text: "Save image"; clicked => { root.viewer-menu = false; root.message-action("save", root.viewer-id); } }
+                        SheetRow { text: "Share…"; clicked => { root.viewer-menu = false; root.message-action("share", root.viewer-id); } }
+                        SheetRow { text: "Forward…"; clicked => { root.viewer-menu = false; root.viewer-open = false; root.message-action("forward", root.viewer-id); } }
+                        SheetRow { text: "Copy link to message"; clicked => { root.viewer-menu = false; root.copy-text("https://matrix.to/#/" + root.current-room + "/" + root.viewer-id); } }
+                        SheetRow { text: "Close picture"; clicked => { root.viewer-menu = false; root.viewer-open = false; } }
                     }
                 }
             }

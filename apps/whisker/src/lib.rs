@@ -90,6 +90,8 @@ type CardAndPicture = (whisker_agent::card::Card, Option<Vec<u8>>);
 
 #[derive(Default)]
 struct State {
+    /// A newer Whisker that was found, waiting to be installed.
+    update: Option<whisker_core::update::Update>,
     account: Option<AccountId>,
     room: Option<OwnedRoomId>,
     /// A room looked at before joining (it's `room` while shown), and
@@ -1208,6 +1210,24 @@ impl Ctl {
     }
 
     async fn after_unlock(&self, vaults: Vec<VaultId>) {
+        // Looking for a newer Whisker, once a day while it runs (when
+        // that's on). Started once the first vault is open: it goes through
+        // an account's proxy when one has one, which only shows then.
+        {
+            static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let c = self.clone();
+                self.spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    loop {
+                        if c.settings.lock().unwrap().auto_update {
+                            c.look_for_update(false).await;
+                        }
+                        tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+                    }
+                });
+            }
+        }
         {
             let mut st = self.st.lock().unwrap();
             if st.main_vault.is_none() {
@@ -6059,6 +6079,132 @@ impl Ctl {
         }
     }
 
+    fn set_auto_update(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.auto_update = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_auto_update(on);
+        }
+        if on {
+            let c = self.clone();
+            self.spawn(async move { c.look_for_update(false).await });
+        }
+    }
+
+    /// Shows where updating has got to on the Settings page. `version`: the
+    /// newer Whisker that can be installed (empty: none), when that changed.
+    fn show_update(&self, status: impl Into<String>, version: Option<String>, busy: bool) {
+        let status = status.into();
+        self.ui(move |u| {
+            let p = u.global::<Prefs>();
+            p.set_update_status(s(status));
+            if let Some(v) = version {
+                p.set_update_version(s(v));
+            }
+            p.set_update_busy(busy);
+        });
+    }
+
+    /// "Check for updates" on the Settings page.
+    async fn check_update(&self) {
+        self.look_for_update(true).await;
+    }
+
+    /// Asks whether there's a newer Whisker. `asked`: someone pressed the
+    /// button, so every outcome is said; else only a newer one is, and it's
+    /// installed when updating by itself is on (phones only say so:
+    /// Android asks before installing anything).
+    async fn look_for_update(&self, asked: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOOKING: AtomicBool = AtomicBool::new(false);
+        if LOOKING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if asked {
+            self.show_update("Looking for a newer Whisker…", None, true);
+        }
+        let proxy = self.mgr.any_proxy().await;
+        let found = whisker_core::update::check(proxy.as_deref()).await;
+        LOOKING.store(false, Ordering::SeqCst);
+        match found {
+            Ok(Some(update)) => {
+                let (version, can) = (update.version.clone(), update.installable());
+                self.st.lock().unwrap().update = Some(update);
+                if !can {
+                    return self.show_update(format!("Whisker {version} is out, but it can't be installed from here: get it from Whisker's releases page."), Some(String::new()), false);
+                }
+                self.show_update(format!("Whisker {version} is available."), Some(version.clone()), false);
+                if asked {
+                    return;
+                }
+                if cfg!(target_os = "android") {
+                    self.status(format!("Whisker {version} is available: Settings → Updates."));
+                } else if self.settings.lock().unwrap().auto_update {
+                    self.install_update().await;
+                }
+            }
+            Ok(None) if asked => self.show_update("This is the newest Whisker.", Some(String::new()), false),
+            Ok(None) => {}
+            Err(e) if asked => self.show_update(format!("Couldn't look for updates: {e:#}"), None, false),
+            Err(e) => tracing::info!("couldn't look for updates: {e:#}"),
+        }
+    }
+
+    /// Downloads the newer Whisker that was found, checks it's signed with
+    /// Whisker's key, and installs it (Android: hands it to the installer).
+    async fn install_update(&self) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        static INSTALLING: AtomicBool = AtomicBool::new(false);
+        let Some(update) = self.st.lock().unwrap().update.clone() else { return };
+        if INSTALLING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let version = update.version.clone();
+        self.show_update(format!("Downloading Whisker {version}…"), None, true);
+        let proxy = self.mgr.any_proxy().await;
+        let progress = {
+            let (c, version, size, last) = (self.clone(), version.clone(), update.size.filter(|s| *s > 0), AtomicU64::new(0));
+            move |n: u64| {
+                let Some(size) = size else { return };
+                let pct = (n.saturating_mul(100) / size).min(100);
+                if last.swap(pct, Ordering::Relaxed) != pct {
+                    c.show_update(format!("Downloading Whisker {version}… {pct}%"), None, true);
+                }
+            }
+        };
+        #[cfg(not(target_os = "android"))]
+        let done: Result<String, String> = async {
+            let path = whisker_core::update::staging_path().map_err(|e| format!("{e:#}"))?;
+            whisker_core::update::download(&update, proxy.as_deref(), &path, progress).await.map_err(|e| format!("{e:#}"))?;
+            tokio::task::spawn_blocking(move || whisker_core::update::install(&path)).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))?;
+            Ok(format!("Whisker {version} is installed. Close Whisker and open it again to use it."))
+        }
+        .await;
+        #[cfg(target_os = "android")]
+        let done: Result<String, String> = async {
+            let dir = droid::staging_dir().ok_or("Whisker's own folder can't be written to")?;
+            let path = dir.join(format!("whisker-{version}.apk"));
+            whisker_core::update::download(&update, proxy.as_deref(), &path, progress).await.map_err(|e| format!("{e:#}"))?;
+            let saved = saved_android(&path, "application/vnd.android.package-archive").await?;
+            Ok(if droid::install(&saved) { format!("Android is asking to install Whisker {version}.") } else { format!("Whisker {version} is saved to {}: open it there to install it.", saved.shown) })
+        }
+        .await;
+        INSTALLING.store(false, Ordering::SeqCst);
+        match done {
+            Ok(said) => {
+                #[cfg(not(target_os = "android"))]
+                {
+                    self.st.lock().unwrap().update = None;
+                }
+                self.status(said.clone());
+                self.show_update(said, Some(String::new()), false);
+            }
+            Err(e) => self.show_update(format!("Couldn't update: {e}"), None, false),
+        }
+    }
+
     fn set_typst(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.typst = on;
@@ -7430,6 +7576,7 @@ fn split_login(hs: &str, user: &str) -> (String, String) {
 }
 
 pub fn run(data_dir: PathBuf) -> Result<()> {
+    whisker_core::update::clean_up();
     // Before any secret is in memory: no core dumps.
     whisker_core::harden_process();
     let rt = tokio::runtime::Runtime::new()?;
@@ -7463,6 +7610,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_allow_screenshots(prefs.allow_screenshots);
     ui.global::<Prefs>().set_typst(prefs.typst);
     ui.global::<Prefs>().set_forward_as_is(prefs.forward_as_is);
+    ui.global::<Prefs>().set_auto_update(prefs.auto_update);
+    ui.global::<Prefs>().set_app_version(s(whisker_core::update::current()));
     #[cfg(target_os = "android")]
     droid::allow_screenshots(prefs.allow_screenshots);
     ui.global::<Prefs>().set_dev_mode(prefs.developer_mode);
@@ -7772,6 +7921,12 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         let c = ctl.clone();
         ui.on_set_forward_as_is(move |b| c.set_forward_as_is(b));
     }
+    {
+        let c = ctl.clone();
+        ui.on_set_auto_update(move |b| c.set_auto_update(b));
+    }
+    on!(on_check_update, check_update);
+    on!(on_install_update, install_update);
     {
         let c = ctl.clone();
         ui.on_set_dev_mode(move |b| c.set_dev_mode(b));

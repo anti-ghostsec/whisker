@@ -68,6 +68,10 @@ pub struct AppSettings {
     /// can tell it's the same file.
     #[serde(default)]
     pub forward_as_is: bool,
+    /// Looks for a newer Whisker once a day and installs it (phones: says
+    /// so, and Android asks before installing). On by default.
+    #[serde(default = "yes")]
+    pub auto_update: bool,
     /// Notifications: 0 off, 1 just "New message", 2 sender and room, 3 with text.
     #[serde(default = "two")]
     pub notify_level: i32,

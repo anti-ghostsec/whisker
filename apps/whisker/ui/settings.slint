@@ -242,6 +242,9 @@ component GeneralPage inherits VerticalLayout {
     callback set-allow-screenshots(bool);
     callback set-typst(bool);
     callback set-forward-as-is(bool);
+    callback set-auto-update(bool);
+    callback check-update();
+    callback install-update();
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -560,6 +563,33 @@ component GeneralPage inherits VerticalLayout {
             hint: "The server's file store then only holds scrambled data. Everyone in the room can still open them (the key is in the message), and a few older apps may not show them.";
             checked: Prefs.up-encrypt;
             toggled(b) => { root.set-upload("encrypt", b ? 1 : 0); }
+        }
+    }
+    Card {
+        title: "Updates";
+        subtitle: "Whisker " + Prefs.app-version + ". Looking for a newer one asks GitHub, which then sees your address (or your proxy's, if one of your accounts uses one) and nothing else. Only an update signed with Whisker's own key is ever installed.";
+        if Prefs.update-status != "": Text { text: Prefs.update-status; font-size: 12px; color: Theme.text; wrap: word-wrap; }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Btn { text: "Check for updates"; enabled: !Prefs.update-busy; clicked => { root.check-update(); } }
+            if Prefs.update-version != "": Btn { text: "Install " + Prefs.update-version; primary: true; enabled: !Prefs.update-busy; clicked => { root.install-update(); } }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Update automatically"; color: Theme.text; }
+                Text {
+                    text: Prefs.touch ? "Looks once a day and tells you when there's a newer Whisker. Android asks before installing it." : "Looks once a day and installs a newer Whisker by itself; it's used from the next time Whisker starts.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.auto-update;
+                toggled => { root.set-auto-update(self.checked); }
+            }
         }
     }
     Card {
@@ -1428,6 +1458,9 @@ export component SettingsPage inherits Rectangle {
     callback set-allow-screenshots(bool);
     callback set-typst(bool);
     callback set-forward-as-is(bool);
+    callback set-auto-update(bool);
+    callback check-update();
+    callback install-update();
     callback set-dev-mode(bool);
     callback set-notify-level(int);
     callback set-key-sharing(int);
@@ -1538,6 +1571,9 @@ export component SettingsPage inherits Rectangle {
                             set-allow-screenshots(b) => { root.set-allow-screenshots(b); }
                             set-typst(b) => { root.set-typst(b); }
                             set-forward-as-is(b) => { root.set-forward-as-is(b); }
+                            set-auto-update(b) => { root.set-auto-update(b); }
+                            check-update => { root.check-update(); }
+                            install-update => { root.install-update(); }
                             set-dev-mode(b) => { root.set-dev-mode(b); }
                             set-notify-level(i) => { root.set-notify-level(i); }
                             set-key-sharing(i) => { root.set-key-sharing(i); }

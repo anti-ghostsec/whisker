@@ -87,11 +87,15 @@ jobs:
           cp target/release/whisker target/release/whisker-agentd dist/whisker-linux-x86_64/
           cp README.md apps/whisker/whisker.desktop dist/whisker-linux-x86_64/
           tar -C dist -czf dist/whisker-linux-x86_64.tar.gz whisker-linux-x86_64
+          # The program on its own too: what Whisker's updater downloads.
+          cp target/release/whisker dist/whisker-linux-x86_64.bin
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: whisker-linux-x86_64
-          path: dist/whisker-linux-x86_64.tar.gz
+          path: |
+            dist/whisker-linux-x86_64.tar.gz
+            dist/whisker-linux-x86_64.bin
           if-no-files-found: error
 
   windows:
@@ -118,11 +122,15 @@ jobs:
           New-Item -ItemType Directory -Force dist/whisker-windows-x86_64 | Out-Null
           Copy-Item target/release/whisker.exe, target/release/whisker-agentd.exe, README.md dist/whisker-windows-x86_64/
           Compress-Archive -Path dist/whisker-windows-x86_64 -DestinationPath dist/whisker-windows-x86_64.zip
+          # The program on its own too: what Whisker's updater downloads.
+          Copy-Item target/release/whisker.exe dist/whisker-windows-x86_64.exe
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: whisker-windows-x86_64
-          path: dist/whisker-windows-x86_64.zip
+          path: |
+            dist/whisker-windows-x86_64.zip
+            dist/whisker-windows-x86_64.exe
           if-no-files-found: error
 
   android:
@@ -324,6 +332,36 @@ jobs:
           printf '%s\n' "$certs"
           got=$(printf '%s\n' "$certs" | sed -n 's/^.*[Ss]igner.*certificate SHA-256 digest: //p' | head -1)
           [ "$got" = "$(tr -d '[:space:]' < apps/whisker/android-release-cert.sha256)" ] || { echo "::error::The APK is signed with $got, not Whisker's release key" >&2; exit 1; }
+
+      # Whisker updates itself only from files signed with its update key
+      # (Ed25519; the public half is in crates/whisker-core/src/update.rs).
+      # The UPDATE_SIGNING_KEY secret holds the private half, as PEM. Each
+      # signature is of the file's SHA-256 followed by the version, so a
+      # file from an older release can't be passed off as a newer one.
+      # Without the secret the release still goes out; it just can't be
+      # installed by the updater.
+      - name: Sign the files Whisker updates itself from
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -eu
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::warning::No UPDATE_SIGNING_KEY secret: Whisker's own updater won't install this release."
+            exit 0
+          fi
+          key="$RUNNER_TEMP/update.pem"
+          msg="$RUNNER_TEMP/update.msg"
+          trap 'rm -f "$key" "$msg"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+          # The key the apps trust, not some other one.
+          have=$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')
+          want=$(sed -n '/^const SIGNING_KEY/,/^];/p' crates/whisker-core/src/update.rs | grep -o '0x[0-9a-f][0-9a-f]' | sed 's/0x//' | tr -d '\n')
+          [ "$have" = "$want" ] || { echo "::error::UPDATE_SIGNING_KEY isn't the key Whisker trusts for updates"; exit 1; }
+          version="${GITHUB_REF_NAME#v}"
+          for f in dist/whisker-linux-x86_64.bin dist/whisker-windows-x86_64.exe dist/whisker.apk; do
+            { openssl dgst -sha256 -binary "$f"; printf '%s' "$version"; } > "$msg"
+            openssl pkeyutl -sign -inkey "$key" -rawin -in "$msg" -out "$f.sig"
+          done
 
       - name: Attach artifacts
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2

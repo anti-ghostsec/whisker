@@ -417,6 +417,25 @@ pub fn share(file: &Saved, mime: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Hands a saved APK (a Whisker update, already checked) to Android's
+/// installer, which asks before it installs anything.
+pub fn install(file: &Saved) -> bool {
+    with_env(|env, activity| {
+        let Some(u) = &file.uri else { return Ok(false) };
+        let text = env.new_string(u)?;
+        let uri = env.call_static_method("android/net/Uri", "parse", "(Ljava/lang/String;)Landroid/net/Uri;", &[JValue::Object(&text)])?.l()?;
+        let action = env.new_string("android.intent.action.VIEW")?;
+        let intent = env.new_object("android/content/Intent", "(Ljava/lang/String;)V", &[JValue::Object(&action)])?;
+        let kind = env.new_string("application/vnd.android.package-archive")?;
+        env.call_method(&intent, "setDataAndType", "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;", &[JValue::Object(&uri), JValue::Object(&kind)])?;
+        // Lets the installer read it (1), in a task of its own (0x10000000).
+        env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(1 | 0x1000_0000)])?;
+        env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
+        Ok(true)
+    })
+    .unwrap_or(false)
+}
+
 /// Where files being saved are written first (Whisker's own folder).
 pub fn staging_dir() -> Option<PathBuf> {
     let dir = APP.get()?.internal_data_path()?.join("saving");

@@ -41,6 +41,13 @@ operating system and the **Wisp** browser.
   not by your network. Clicking a web link in an account with a proxy copies it instead of
   opening it, since your browser wouldn't use that proxy: paste it into a browser that does
   (Tor Browser, say).
+- **Updates.** Whisker looks for a newer version once a day and installs it, used from the
+  next start (Settings → Updates has the switch, on by default, and a *Check for updates*
+  button). On Android it tells you, and Android asks before installing. Looking asks
+  GitHub's releases page, through one of your accounts' proxy if any has one; nothing about
+  you is sent. Only a file signed with Whisker's update key is installed, and the signature
+  names the version, so neither someone who took over the releases page nor an old release
+  passed off as new gets anything onto your device.
 - **Servers that move.** If a server changes its address (a new port, or behind a relay
   now, or not any more), Whisker follows it with no sign-in again: when the server hasn't
   answered for about 25 seconds, and once on unlock, it asks the server name

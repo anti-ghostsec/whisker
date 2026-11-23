@@ -228,6 +228,14 @@ impl AccountManager {
         self.key_sharing.store(mode.min(2), std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// A proxy one of the accounts in the unlocked vaults uses, if any
+    /// does (whether or not that account is connected just now): what isn't
+    /// any one account's (looking for updates) goes through it, so someone
+    /// who only ever connects through a proxy still does.
+    pub async fn any_proxy(&self) -> Option<String> {
+        self.inner.read().await.vaults.values().flat_map(|v| v.profile.accounts.iter()).find_map(|r| r.proxy.clone())
+    }
+
     /// The most each account's media cache (pictures and videos already
     /// downloaded, kept with the running stores: in memory, gone on lock)
     /// may hold. The oldest go first when it's full. Accounts opened from

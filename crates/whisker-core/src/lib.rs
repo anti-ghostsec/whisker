@@ -20,6 +20,7 @@ pub mod stores;
 pub mod timeline;
 pub mod tls;
 pub mod stickers;
+pub mod update;
 pub mod upload;
 pub mod vault;
 pub mod verify;

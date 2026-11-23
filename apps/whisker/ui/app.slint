@@ -748,54 +748,63 @@ component MessageRow inherits Rectangle {
         running: Prefs.touch && (area.pressed || root.pressing) && !root.held;
         triggered => { root.held = true; root.hold(root.item); }
     }
+    // The message as the right-click menu sees it: as it was when the
+    // pointer came to it, and kept up while the pointer is on it. A message
+    // changing under an open menu (someone read it, say) made the menu
+    // number its entries afresh, and the submenu being opened then came up
+    // empty (React showed a thin bar with nothing in it) or a click on an
+    // entry did nothing.
+    property <MessageItem> shown: root.item;
+    changed item => { if area.has-hover { root.shown = root.item; } }
     area := TouchArea {
         pointer-event(e) => { root.press(e); }
+        changed has-hover => { if self.has-hover { root.shown = root.item; } }
         cm := ContextMenuArea {
             // Phones get the big menu instead.
             enabled: !Prefs.touch;
             Menu {
                 if root.selection != "" || TextTools.spanning: MenuItem { title: "Copy"; activated => { TextTools.copy-selection(root.selection); } }
                 if root.selection != "" || TextTools.spanning: MenuSeparator {}
-                if root.item.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.item.id); } }
-                if root.item.media == 1: MenuItem { title: "Save as sticker…"; activated => { root.action("save-sticker", root.item.id); } }
-                if root.item.media == 1: MenuItem { title: "Save as emoji…"; activated => { root.action("save-emoji", root.item.id); } }
-                if Prefs.menu-open-media && (root.item.media == 2 || root.item.media == 3): MenuItem { title: "Play"; activated => { root.action("play", root.item.id); } }
-                if root.item.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.item.id); } }
-                if root.item.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.item.id); } }
+                if root.shown.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.shown.id); } }
+                if root.shown.media == 1: MenuItem { title: "Save as sticker…"; activated => { root.action("save-sticker", root.shown.id); } }
+                if root.shown.media == 1: MenuItem { title: "Save as emoji…"; activated => { root.action("save-emoji", root.shown.id); } }
+                if Prefs.menu-open-media && (root.shown.media == 2 || root.shown.media == 3): MenuItem { title: "Play"; activated => { root.action("play", root.shown.id); } }
+                if root.shown.media == 2: MenuItem { title: "Save video…"; activated => { root.action("save", root.shown.id); } }
+                if root.shown.media == 3: MenuItem { title: "Save audio…"; activated => { root.action("save", root.shown.id); } }
                 // Phones: hand it to another app (it's saved to Download first).
-                if Prefs.touch && root.item.media > 0 && root.item.media < 4: MenuItem { title: "Share…"; activated => { root.action("share", root.item.id); } }
-                if Prefs.menu-open-media && root.item.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.item.id); } }
-                if Prefs.menu-copy-file && root.item.media > 0: MenuItem { title: "Copy file link"; activated => { root.action("copy-file", root.item.id); } }
-                if root.item.media > 0 && root.item.media < 4: MenuSeparator {}
+                if Prefs.touch && root.shown.media > 0 && root.shown.media < 4: MenuItem { title: "Share…"; activated => { root.action("share", root.shown.id); } }
+                if Prefs.menu-open-media && root.shown.media == 1: MenuItem { title: "Open image"; activated => { root.action("view", root.shown.id); } }
+                if Prefs.menu-copy-file && root.shown.media > 0: MenuItem { title: "Copy file link"; activated => { root.action("copy-file", root.shown.id); } }
+                if root.shown.media > 0 && root.shown.media < 4: MenuSeparator {}
                 if Prefs.menu-react: Menu {
                     title: "React";
-                    for r in root.quick-reactions: MenuItem { title: r.label; icon: r.icon; activated => { root.action("react:" + r.emoji, root.item.id); } }
+                    for r in root.quick-reactions: MenuItem { title: r.label; icon: r.icon; activated => { root.action("react:" + r.emoji, root.shown.id); } }
                     MenuItem { title: "More emoji…"; activated => { root.pick-reaction(); } }
                 }
-                if Prefs.menu-reply: MenuItem { title: "Reply"; activated => { root.action("reply", root.item.id); } }
-                if Prefs.menu-thread: MenuItem { title: "Reply in thread"; activated => { root.action("thread", root.item.id); } }
-                if Prefs.menu-forward: MenuItem { title: "Forward…"; activated => { root.action("forward", root.item.id); } }
-                if Prefs.menu-quote: MenuItem { title: "Quote"; activated => { root.action("quote", root.item.id); } }
-                if Prefs.menu-copy: MenuItem { title: "Copy whole message"; activated => { root.copy(root.item.body); } }
-                if root.item.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.item.id); } }
-                if Prefs.touch && root.item.media > 3: MenuItem { title: "Share…"; activated => { root.action("share", root.item.id); } }
+                if Prefs.menu-reply: MenuItem { title: "Reply"; activated => { root.action("reply", root.shown.id); } }
+                if Prefs.menu-thread: MenuItem { title: "Reply in thread"; activated => { root.action("thread", root.shown.id); } }
+                if Prefs.menu-forward: MenuItem { title: "Forward…"; activated => { root.action("forward", root.shown.id); } }
+                if Prefs.menu-quote: MenuItem { title: "Quote"; activated => { root.action("quote", root.shown.id); } }
+                if Prefs.menu-copy: MenuItem { title: "Copy whole message"; activated => { root.copy(root.shown.body); } }
+                if root.shown.media > 3: MenuItem { title: "Save file…"; activated => { root.action("save", root.shown.id); } }
+                if Prefs.touch && root.shown.media > 3: MenuItem { title: "Share…"; activated => { root.action("share", root.shown.id); } }
                 if Prefs.menu-open-links: Menu {
                     title: "Open link";
-                    enabled: root.item.links.length > 0;
-                    for l in root.item.links: MenuItem { title: l; activated => { root.link(l); } }
+                    enabled: root.shown.links.length > 0;
+                    for l in root.shown.links: MenuItem { title: l; activated => { root.link(l); } }
                 }
-                if Prefs.menu-copy-link: MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); } }
-                if root.item.mine: MenuItem { title: root.item.media == 0 ? "Edit" : root.item.caption ? "Edit caption" : "Add a caption"; activated => { root.action("edit", root.item.id); } }
+                if Prefs.menu-copy-link: MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.shown.id); } }
+                if root.shown.mine: MenuItem { title: root.shown.media == 0 ? "Edit" : root.shown.caption ? "Edit caption" : "Add a caption"; activated => { root.action("edit", root.shown.id); } }
                 MenuSeparator {}
-                if root.item.mine || root.can-moderate: MenuItem { title: "Delete"; activated => { root.action("delete", root.item.id); } }
-                if !root.item.mine && root.can-moderate: Menu {
-                    title: "Moderate " + root.item.name;
-                    MenuItem { title: "Kick"; activated => { root.action("kick", root.item.id); } }
-                    MenuItem { title: "Ban"; activated => { root.action("ban", root.item.id); } }
+                if root.shown.mine || root.can-moderate: MenuItem { title: "Delete"; activated => { root.action("delete", root.shown.id); } }
+                if !root.shown.mine && root.can-moderate: Menu {
+                    title: "Moderate " + root.shown.name;
+                    MenuItem { title: "Kick"; activated => { root.action("kick", root.shown.id); } }
+                    MenuItem { title: "Ban"; activated => { root.action("ban", root.shown.id); } }
                 }
-                if Prefs.menu-profile: MenuItem { title: "View profile"; activated => { root.action("profile", root.item.id); } }
-                if Prefs.menu-copy-id: MenuItem { title: "Copy user id"; activated => { root.copy(root.item.sender); } }
-                if Prefs.menu-source: MenuItem { title: "Show source"; activated => { root.action("source", root.item.id); } }
+                if Prefs.menu-profile: MenuItem { title: "View profile"; activated => { root.action("profile", root.shown.id); } }
+                if Prefs.menu-copy-id: MenuItem { title: "Copy user id"; activated => { root.copy(root.shown.sender); } }
+                if Prefs.menu-source: MenuItem { title: "Show source"; activated => { root.action("source", root.shown.id); } }
             }
 
             VerticalLayout {
@@ -1307,6 +1316,26 @@ component RailAccount inherits Rectangle {
             if root.item.is-agent && root.item.avatar.width > 0: AiBadge { avatar-size: 42px; x: parent.width - self.width + 2px; y: parent.height - self.height + 2px; }
         }
         if root.item.unread > 0: Pill { x: 38px; y: 6px; text: root.item.unread > 99 ? "99+" : root.item.unread; strong: true; }
+        // Its tags, so accounts with the same picture can be told apart.
+        if root.item.tags != "": Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: parent.height - self.height;
+            width: min(60px, tag.preferred-width + 8px);
+            height: 13px;
+            border-radius: 6px;
+            background: Theme.panel;
+            border-width: 1px;
+            border-color: Theme.border;
+            tag := Text {
+                width: parent.width - 6px;
+                text: root.item.tags;
+                font-size: 9px;
+                color: Theme.text;
+                overflow: elide;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
     }
     // Drag up or down to reorder; the others slide aside like tabs. The
     // TouchArea takes every button, so it opens the right-click menu itself

@@ -159,7 +159,8 @@ export component Btn inherits Rectangle {
     in property <bool> danger;
     in property <bool> enabled: true;
     callback clicked;
-    height: 34px;
+    // Taller under a finger, which also reaches a little past its edges.
+    height: Prefs.touch ? 40px : 34px;
     min-width: label.preferred-width + 28px;
     border-radius: 8px;
     opacity: enabled ? 1 : 0.45;
@@ -172,7 +173,13 @@ export component Btn inherits Rectangle {
         font-weight: 600;
         font-size: 13px;
     }
-    ta := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { root.clicked(); } }
+    ta := TouchArea {
+        y: Prefs.touch ? -4px : 0px;
+        height: parent.height + (Prefs.touch ? 8px : 0px);
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
 }
 
 export component IconBtn inherits Rectangle {
@@ -207,7 +214,17 @@ export component IconBtn inherits Rectangle {
         stroke-width: 1.8px;
         commands: "M 19.26 9.74 L 21.82 10.13 L 21.82 13.87 L 19.26 14.26 L 18.73 15.54 L 20.27 17.62 L 17.62 20.27 L 15.54 18.73 L 14.26 19.26 L 13.87 21.82 L 10.13 21.82 L 9.74 19.26 L 8.46 18.73 L 6.38 20.27 L 3.73 17.62 L 5.27 15.54 L 4.74 14.26 L 2.18 13.87 L 2.18 10.13 L 4.74 9.74 L 5.27 8.46 L 3.73 6.38 L 6.38 3.73 L 8.46 5.27 L 9.74 4.74 L 10.13 2.18 L 13.87 2.18 L 14.26 4.74 L 15.54 5.27 L 17.62 3.73 L 20.27 6.38 L 18.73 8.46 Z M 15.2 12 A 3.2 3.2 0 1 0 8.8 12 A 3.2 3.2 0 1 0 15.2 12 Z";
     }
-    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    // Phones: small buttons take a touch a little outside themselves too
+    // (up to 44px across), so a fingertip doesn't have to be exact.
+    property <length> reach: Prefs.touch ? min(8px, max(0px, (44px - root.size) / 2)) : 0px;
+    ta := TouchArea {
+        x: -root.reach;
+        y: -root.reach;
+        width: parent.width + root.reach * 2;
+        height: parent.height + root.reach * 2;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
 }
 
 // A light text field: no frame, just a rounded fill.

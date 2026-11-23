@@ -1,6 +1,8 @@
 # Android settings for xbuild (`x build --platform android`). xbuild reads
 # this file, not [package.metadata.android] in Cargo.toml.
 android:
+  # The app's icon (square, at least 512 px; xbuild makes the sizes Android wants).
+  icon: assets/icon.png
   manifest:
     package: io.github.antighostsec.whisker
     # Android 8.0 and later: playing sound inside Whisker uses AAudio,

@@ -1,8 +1,10 @@
 //! Plays videos inside the window, in the message itself: ffmpeg decodes
 //! the picture (paced to real time) into frames shown over the preview, and
 //! sends the sound straight to the system (PulseAudio, else ALSA), drawing
-//! any subtitles onto the picture. Videos start muted. Pausing, seeking,
-//! muting, subtitles and the large view restart ffmpeg at the right place.
+//! any subtitles onto the picture. Videos start muted. Seeking, subtitles,
+//! the large view and turning the sound on restart ffmpeg at the right
+//! place; pausing holds it where it is, and a new sound level is told to
+//! it as it plays, so neither has to load the video again.
 //!
 //! A video plays either from a downloaded file or while it streams, read
 //! through a [`Relay`] (the login never leaves Whisker). Sound alone (voice
@@ -41,6 +43,10 @@ struct Playing {
     /// Meant to be playing (ffmpeg may still be starting).
     playing: bool,
     child: Option<Child>,
+    /// `child` is held still (paused), to carry on from where it is.
+    frozen: bool,
+    /// `child` sends sound to the system, so it can be told a new level.
+    sounding: bool,
     /// Bumped on every (re)start, so an old reader stops showing frames.
     generation: u64,
 }
@@ -105,7 +111,7 @@ fn start(ui: Weak<AppWindow>, id: String, input: OsString, relay: Option<Relay>)
     // when streaming, they're there to turn on, not on at the start.
     let shown = has_subtitles && !(relay.is_some() && info.subtitles == Some(Subtitles::Text));
     // Everything starts muted (no sudden loud sound); the speaker turns it on.
-    let playing = Playing { id: id.clone(), input, _relay: relay, info, at: 0.0, muted: true, subtitles: shown, large: false, playing: false, child: None, generation: 0 };
+    let playing = Playing { id: id.clone(), input, _relay: relay, info, at: 0.0, muted: true, subtitles: shown, large: false, playing: false, child: None, frozen: false, sounding: false, generation: 0 };
     *NOW.lock().unwrap() = Some(playing);
     let _ = ui.upgrade_in_event_loop(move |u| {
         let p = u.global::<Player>();
@@ -146,9 +152,7 @@ pub fn mute(ui: &Weak<AppWindow>) {
         let mut now = NOW.lock().unwrap();
         let Some(p) = now.as_mut() else { return };
         p.muted = !p.muted;
-        let running = p.playing;
-        kill(p);
-        (p.muted, running)
+        (p.muted, retune(p))
     };
     let _ = ui.upgrade_in_event_loop(move |u| u.global::<Player>().set_muted(muted));
     if running {
@@ -156,15 +160,18 @@ pub fn mute(ui: &Weak<AppWindow>) {
     }
 }
 
-/// A new sound level (0–100): turns the sound on (0 turns it off), and
-/// restarts ffmpeg with it.
+/// A new sound level (0–100): turns the sound on (0 turns it off). ffmpeg
+/// takes it as it plays; only sound that was off has to start.
 pub fn set_volume(ui: &Weak<AppWindow>, level: i32) {
     // Down to 0 is "off": the level before stays for turning it back on.
     if level > 0 {
         crate::ui::VOLUME.store(level.min(100) as u32, std::sync::atomic::Ordering::Relaxed);
     }
     let muted = level <= 0;
-    let changed = restart_with(|p| p.muted = muted).map(|c| c.running);
+    let changed = NOW.lock().unwrap().as_mut().map(|p| {
+        p.muted = muted;
+        retune(p)
+    });
     let _ = ui.upgrade_in_event_loop(move |u| {
         let p = u.global::<Player>();
         p.set_muted(muted);
@@ -227,16 +234,94 @@ pub fn stop(ui: &Weak<AppWindow>) {
     });
 }
 
+/// After the sound was turned on or off, or its level changed: an ffmpeg
+/// that's sending sound is told the new level and plays on (starting it
+/// again for every step of the slider stopped the video each time, and
+/// asked the server for it again). Otherwise it's stopped, to start with
+/// sound. Says whether to start it again now.
+fn retune(p: &mut Playing) -> bool {
+    let level = if p.muted { 0 } else { crate::ui::volume() };
+    if p.sounding && tell_volume(p, level) {
+        return false;
+    }
+    // Silent, and meant to be.
+    if p.muted && !p.sounding {
+        return false;
+    }
+    let running = p.playing;
+    kill(p);
+    running
+}
+
+/// Tells the running ffmpeg a new sound level: its "c" key sends a
+/// command to a filter, here the volume one.
+fn tell_volume(p: &mut Playing, level: u32) -> bool {
+    use std::io::Write;
+    let Some(stdin) = p.child.as_mut().and_then(|c| c.stdin.as_mut()) else { return false };
+    let command = format!("cvolume -1 volume {:.5}\n", crate::ui::gain(level));
+    stdin.write_all(command.as_bytes()).and_then(|()| stdin.flush()).is_ok()
+}
+
+/// Holds ffmpeg still, or lets it carry on. False when it can't be (it
+/// has ended, or this isn't Linux): then it's stopped and started again.
+#[cfg(target_os = "linux")]
+fn freeze(p: &mut Playing, on: bool) -> bool {
+    let Some(c) = p.child.as_mut() else { return false };
+    if !matches!(c.try_wait(), Ok(None)) {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(c.id()) else { return false };
+    // SAFETY: a signal to a child that hasn't been waited for, so the
+    // number is still its own.
+    let done = unsafe { libc::kill(pid, if on { libc::SIGSTOP } else { libc::SIGCONT }) } == 0;
+    if done {
+        p.frozen = on;
+    }
+    done
+}
+
+#[cfg(not(target_os = "linux"))]
+fn freeze(_p: &mut Playing, _on: bool) -> bool {
+    false
+}
+
+/// ffmpeg goes when Whisker does, however Whisker ends: one held still
+/// by a pause would otherwise stay for good. (The signal comes when the
+/// thread that started it ends, and that thread reads from it until it's
+/// gone.)
+#[cfg(target_os = "linux")]
+fn tie_to_whisker(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: only prctl, which is safe to call between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tie_to_whisker(_cmd: &mut Command) {}
+
 fn pause(ui: &Weak<AppWindow>) {
     if let Some(p) = NOW.lock().unwrap().as_mut() {
         p.playing = false;
-        kill(p);
+        // A video is held where it is: stopping ffmpeg meant opening the
+        // video and finding the place again on every play, and a few
+        // pauses in a row had the server asked over and over. (Sound alone
+        // is timed by the clock, and starts again quickly.)
+        if !(p.info.width > 0 && freeze(p, true)) {
+            kill(p);
+        }
     }
     let _ = ui.upgrade_in_event_loop(|u| u.global::<Player>().set_playing(false));
 }
 
 fn kill(p: &mut Playing) {
     p.generation += 1;
+    p.frozen = false;
+    p.sounding = false;
     if let Some(mut c) = p.child.take() {
         let _ = c.kill();
         let _ = c.wait();
@@ -283,31 +368,41 @@ fn filter_path(path: &OsStr) -> String {
     escape(&escape(&path.to_string_lossy(), "\\':"), "\\'[],;")
 }
 
+/// The longest wait the pacing makes up for by hurrying, in seconds:
+/// after anything longer (a pause) it carries on at the normal speed.
+const PACE_LIMIT: &str = "0.5";
+
+fn size_filter(size: (u32, u32)) -> String {
+    format!("fps={FPS},scale={}:{}", size.0, size.1)
+}
+
 fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtitles: Option<Subtitles>) -> std::io::Result<Child> {
     let mut cmd = Command::new("ffmpeg");
-    let fit = format!("fps={FPS},scale={}:{}", size.0, size.1);
-    cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{at:.3}")]);
+    // Paced by the `realtime` filters, not `-re`: after a pause they carry
+    // on at the normal speed, where `-re` raced to make up the time.
+    let fit = format!("fps={FPS},scale={}:{},realtime=limit={PACE_LIMIT}", size.0, size.1);
+    cmd.args(["-v", "error", "-ss", &format!("{at:.3}")]);
     // Text subtitles are drawn by time, so the times must stay the file's.
     if subtitles == Some(Subtitles::Text) {
         cmd.arg("-copyts");
     }
     cmd.args(whisker_core::timeline::ffmpeg_guard(path));
-    cmd.args(["-re", "-i"]).arg(path);
+    cmd.arg("-i").arg(path);
     match subtitles {
-        Some(Subtitles::Text) => cmd.args(["-map", "0:v:0", "-vf", &format!("{fit},subtitles=filename={}:si=0", filter_path(path))]),
+        Some(Subtitles::Text) => cmd.args(["-map", "0:v:0", "-vf", &format!("{},subtitles=filename={}:si=0,realtime=limit={PACE_LIMIT}", size_filter(size), filter_path(path))]),
         Some(Subtitles::Bitmap) => cmd.args(["-filter_complex", &format!("[0:v:0][0:s:0]overlay,{fit}[v]"), "-map", "[v]"]),
         None => cmd.args(["-map", "0:v:0", "-vf", &fit]),
     };
     cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"]);
     if let Some(out) = sound {
         cmd.args(["-map", "0:a:0"]);
-        let level = crate::ui::volume();
-        if level < 100 {
-            cmd.args(["-filter:a", &format!("volume={:.5}", crate::ui::gain(level))]);
-        }
+        // The volume filter is always there, to be told a new level.
+        cmd.args(["-filter:a", &format!("volume={:.5},arealtime=limit={PACE_LIMIT}", crate::ui::gain(crate::ui::volume()))]);
         cmd.args(out);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+    tie_to_whisker(&mut cmd);
+    // Its keys are read from a pipe: that's how it's told a new sound level.
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
 }
 
 /// Plays from where it is.
@@ -315,6 +410,13 @@ fn resume(ui: &Weak<AppWindow>) {
     let (input, at, info, muted, subtitles, large, generation) = {
         let mut now = NOW.lock().unwrap();
         let Some(p) = now.as_mut() else { return };
+        // Paused: it carries on from where it was held.
+        if p.frozen && freeze(p, false) {
+            p.playing = true;
+            drop(now);
+            let _ = ui.upgrade_in_event_loop(|u| u.global::<Player>().set_playing(true));
+            return;
+        }
         kill(p);
         p.playing = true;
         // Played to the end: start over.
@@ -351,6 +453,7 @@ fn run(ui: Weak<AppWindow>, input: OsString, at: f64, info: VideoInfo, muted: bo
         match now.as_mut() {
             Some(p) if p.generation == generation => {
                 p.child = Some(child);
+                p.sounding = sound.is_some();
                 Some(out)
             }
             _ => {
@@ -406,19 +509,21 @@ fn ended(ui: &Weak<AppWindow>, generation: u64, shown: u64) {
 fn play_sound(ui: &Weak<AppWindow>, input: &OsStr, at: f64, muted: bool, generation: u64) -> u64 {
     let Some(out) = sound_output() else { return 0 };
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{at:.3}")]);
+    cmd.args(["-v", "error", "-ss", &format!("{at:.3}")]);
     cmd.args(whisker_core::timeline::ffmpeg_guard(input));
     cmd.args(["-re", "-i"]).arg(input).args(["-map", "0:a:0"]);
     let level = if muted { 0 } else { crate::ui::volume() };
-    if level < 100 {
-        cmd.args(["-filter:a", &format!("volume={:.5}", crate::ui::gain(level))]);
-    }
+    cmd.args(["-filter:a", &format!("volume={:.5}", crate::ui::gain(level))]);
     cmd.args(out);
-    let Ok(child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return 0 };
+    tie_to_whisker(&mut cmd);
+    let Ok(child) = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return 0 };
     {
         let mut now = NOW.lock().unwrap();
         match now.as_mut() {
-            Some(p) if p.generation == generation => p.child = Some(child),
+            Some(p) if p.generation == generation => {
+                p.child = Some(child);
+                p.sounding = true;
+            }
             _ => {
                 let mut child = child;
                 let _ = child.kill();

@@ -47,6 +47,9 @@ i-slint-core = "=1.19.0"
 [target.'cfg(target_os = "linux")'.dependencies]
 # Already in the tree (accessibility, file dialogs); used for notifications.
 zbus = "5"
+# Pausing a video holds ffmpeg still with a signal (player.rs); already in
+# the tree.
+libc = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 slint = { version = "1.19.0", features = ["backend-android-activity-06"] }

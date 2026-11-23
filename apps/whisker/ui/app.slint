@@ -1557,7 +1557,11 @@ component UnlockScreen inherits Rectangle {
             VerticalLayout {
                 width: min(340px, root.width - 32px);
                 spacing: 14px;
-                HorizontalLayout { alignment: center; Avatar { initial: "W"; hue: 0; size: 64px; } }
+                HorizontalLayout {
+                    alignment: center;
+                    if Prefs.logo.width > 0: Image { source: Prefs.logo; width: 96px; height: 96px; image-fit: contain; }
+                    if Prefs.logo.width == 0: Avatar { initial: "W"; hue: 0; size: 64px; }
+                }
                 Text { text: "Whisker"; font-size: 26px; font-weight: 800; horizontal-alignment: center; color: Theme.text; }
                 Text {
                     text: root.first-run ? "Pick a passphrase. It encrypts every account on this device." : "Enter your passphrase";
@@ -3884,12 +3888,22 @@ export component AppWindow inherits Window {
             HorizontalLayout { alignment: end; Btn { text: "Close"; primary: true; clicked => { root.readers-open = false; } } }
         }
 
-        if root.viewer-open: Rectangle {
+        if root.viewer-open: viewer := Rectangle {
             background: #000000e0;
-            // (Not on phones: a second finger landing to pinch ends the first
-            // one's touch, which counted as a tap and closed the picture
-            // before it could be zoomed. There, ✕ or Back closes it.)
-            TouchArea { clicked => { if !Prefs.touch { root.viewer-open = false; } } }
+            // A tap around the picture closes it. On phones it waits a moment
+            // first: a second finger landing to pinch ends the first one's
+            // touch, which counts as a tap, and so does the first tap of a
+            // double tap; neither should close it.
+            property <bool> closing;
+            Timer {
+                interval: 300ms;
+                running: viewer.closing;
+                triggered => {
+                    viewer.closing = false;
+                    if !zoomer.dragged && !pic.pressed && zoomer.zoom <= 1.01 && !root.viewer-menu { root.viewer-open = false; }
+                }
+            }
+            TouchArea { clicked => { if Prefs.touch { viewer.closing = true; } else { root.viewer-open = false; } } }
             if root.viewer-image.width == 0: Text { text: root.viewer-percent > 0 ? "Loading… " + root.viewer-percent + "%" : "Loading…"; color: white; }
             vcm := ContextMenuArea {
                 x: (parent.width - self.width) / 2;
@@ -3945,7 +3959,10 @@ export component AppWindow inherits Window {
                         y: (parent.height - self.height) / 2 + parent.pan-y;
                         image-fit: contain;
                     }
-                    TouchArea {
+                    pic := TouchArea {
+                        // How big the picture is drawn, fitted in here.
+                        property <float> fit: root.viewer-image.width == 0 || root.viewer-image.height == 0 ? 0 : min(self.width / 1px / root.viewer-image.width, self.height / 1px / root.viewer-image.height);
+                        property <bool> beside: abs(self.mouse-x - self.width / 2) > root.viewer-image.width * self.fit * 0.5px || abs(self.mouse-y - self.height / 2) > root.viewer-image.height * self.fit * 0.5px;
                         pointer-event(e) => {
                             if e.kind == PointerEventKind.down {
                                 parent.base-x = parent.pan-x;
@@ -3963,9 +3980,13 @@ export component AppWindow inherits Window {
                                 parent.dragged = true;
                             }
                         }
-                        // A tap on the unzoomed picture closes it, as around it.
+                        // A tap on the unzoomed picture closes it, as around it;
+                        // on phones (where a tap on it is how a zoom or a hold
+                        // begins) only a tap beside it does.
                         clicked => {
-                            if !Prefs.touch && !parent.dragged && parent.zoom <= 1.01 { root.viewer-open = false; }
+                            if !parent.dragged && parent.zoom <= 1.01 {
+                                if !Prefs.touch { root.viewer-open = false; } else if self.beside { viewer.closing = true; }
+                            }
                         }
                         // Phones: holding the picture brings up what can be done with it.
                         Timer {

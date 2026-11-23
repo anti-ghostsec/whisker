@@ -7612,6 +7612,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_forward_as_is(prefs.forward_as_is);
     ui.global::<Prefs>().set_auto_update(prefs.auto_update);
     ui.global::<Prefs>().set_app_version(s(whisker_core::update::current()));
+    // Whisker's own picture, for the screen that asks for the passphrase.
+    if let Some(logo) = decode(include_bytes!("../assets/icon.png"), 192, 192, false) {
+        ui.global::<Prefs>().set_logo(Image::from_rgba8(logo));
+    }
     #[cfg(target_os = "android")]
     droid::allow_screenshots(prefs.allow_screenshots);
     ui.global::<Prefs>().set_dev_mode(prefs.developer_mode);

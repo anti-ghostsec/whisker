@@ -4,8 +4,10 @@
 //! image reader and are drawn over the preview in the message, like the
 //! desktop player, and the sound goes out through AAudio. The same controls
 //! work: play and pause, seek, mute, loop and the large view. Videos start
-//! muted. Pausing, seeking, muting and the large view restart the decoders
-//! at the right place, as on the desktop.
+//! muted. Seeking and the large view restart the decoders at the right
+//! place; pausing holds them where they are, and the sound is turned on,
+//! off, up and down beside a picture that plays on, so none of those has
+//! to read the video from its server again.
 //!
 //! The file stays in Whisker's private folder: nothing is handed to other apps.
 //! Or, on Android 9 and newer, nothing is saved at all: the extractor reads
@@ -59,8 +61,25 @@ struct Playing {
     large: bool,
     /// Meant to be playing (the decoders may still be starting).
     playing: bool,
+    /// Decoders are running for `generation` (till it plays out).
+    live: bool,
+    /// They're held where they are (paused), to carry on from there.
+    paused: bool,
+    /// One of them is the sound's (it may be playing silently).
+    sounding: bool,
     /// Bumped on every (re)start, so old decoders stop.
     generation: u64,
+}
+
+impl Playing {
+    /// Ends the decoders that are running (their threads see the new
+    /// number and stop).
+    fn end_decoders(&mut self) {
+        self.generation += 1;
+        self.live = false;
+        self.paused = false;
+        self.sounding = false;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +106,8 @@ static NOW: Mutex<Option<Playing>> = Mutex::new(None);
 static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Videos start over when they end.
 static LOOP: AtomicBool = AtomicBool::new(false);
+/// The sound is off: what's decoded is played at no level.
+static MUTED: AtomicBool = AtomicBool::new(true);
 /// When the picture's first frame (of a start, or of each time round when
 /// looping) came up: (start, time round, the moment it stands for). The
 /// sound waits for it, so it never runs ahead of the picture.
@@ -136,7 +157,8 @@ fn start(ui: Weak<AppWindow>, id: String, src: Src) -> bool {
     });
     let Some(info) = probe(&src) else { return false };
     // Everything starts muted (no sudden loud sound); the speaker turns it on.
-    *NOW.lock().unwrap() = Some(Playing { id: id.clone(), src, info, at: 0.0, muted: true, large: false, playing: false, generation: 0 });
+    *NOW.lock().unwrap() = Some(Playing { id: id.clone(), src, info, at: 0.0, muted: true, large: false, playing: false, live: false, paused: false, sounding: false, generation: 0 });
+    MUTED.store(true, Ordering::Relaxed);
     let muted = true;
     let _ = ui.upgrade_in_event_loop(move |u| {
         let p = u.global::<Player>();
@@ -165,24 +187,38 @@ pub fn seek(ui: &Weak<AppWindow>, fraction: f32) {
         let mut now = NOW.lock().unwrap();
         let Some(p) = now.as_mut() else { return };
         p.at = (f64::from(fraction.clamp(0.0, 1.0)) * p.info.duration).min((p.info.duration - 0.5).max(0.0));
-        p.generation += 1;
+        p.end_decoders();
     }
     resume(ui);
 }
 
-/// Turns the sound off or on.
+/// Turns the sound off or on. The picture plays on either way.
 pub fn mute(ui: &Weak<AppWindow>) {
-    let (muted, running) = {
+    let muted = {
         let mut now = NOW.lock().unwrap();
         let Some(p) = now.as_mut() else { return };
         p.muted = !p.muted;
-        p.generation += 1;
-        (p.muted, p.playing)
+        sound_switched(p);
+        p.muted
     };
     let _ = ui.upgrade_in_event_loop(move |u| u.global::<Player>().set_muted(muted));
-    if running {
-        resume(ui);
+}
+
+/// After the sound was turned on or off. Its decoder, once running, plays
+/// on at no level while it's off; turned on for the first time beside a
+/// picture that's playing, it starts and joins the picture where that is.
+/// (Starting everything again for it stopped the video, and read it from
+/// its server again.)
+fn sound_switched(p: &mut Playing) {
+    MUTED.store(p.muted, Ordering::Relaxed);
+    if p.muted || !p.live || p.sounding || p.info.audio.is_none() || p.info.video.is_none() {
+        return;
     }
+    p.sounding = true;
+    let (src, info, at, generation) = (p.src.clone(), p.info, p.at, p.generation);
+    std::thread::spawn(move || {
+        play_sound(&src, info, at, Instant::now(), generation, true, None);
+    });
 }
 
 /// A new sound level (0–100): taken up by the sound as it plays, so
@@ -193,18 +229,10 @@ pub fn set_volume(ui: &Weak<AppWindow>, level: i32) {
         crate::ui::VOLUME.store(level.min(100) as u32, std::sync::atomic::Ordering::Relaxed);
     }
     let muted = level <= 0;
-    let restart = {
-        let mut now = NOW.lock().unwrap();
-        match now.as_mut() {
-            // Turning the sound on or off starts or stops its decoder.
-            Some(p) if p.muted != muted => {
-                p.muted = muted;
-                p.generation += 1;
-                p.playing
-            }
-            _ => false,
-        }
-    };
+    if let Some(p) = NOW.lock().unwrap().as_mut().filter(|p| p.muted != muted) {
+        p.muted = muted;
+        sound_switched(p);
+    }
     let _ = ui.upgrade_in_event_loop(move |u| {
         let p = u.global::<Player>();
         p.set_muted(muted);
@@ -212,9 +240,6 @@ pub fn set_volume(ui: &Weak<AppWindow>, level: i32) {
             p.set_volume(level);
         }
     });
-    if restart {
-        resume(ui);
-    }
 }
 
 /// No subtitles on phones yet.
@@ -226,7 +251,7 @@ pub fn set_large(ui: &Weak<AppWindow>, large: bool) {
         let mut now = NOW.lock().unwrap();
         let Some(p) = now.as_mut() else { return };
         p.large = large;
-        p.generation += 1;
+        p.end_decoders();
         p.playing
     };
     let _ = ui.upgrade_in_event_loop(move |u| u.global::<Player>().set_large(large));
@@ -251,7 +276,15 @@ pub fn stop(ui: &Weak<AppWindow>) {
 fn pause(ui: &Weak<AppWindow>) {
     if let Some(p) = NOW.lock().unwrap().as_mut() {
         p.playing = false;
-        p.generation += 1;
+        // The decoders are held where they are, to carry on from there:
+        // ending them meant opening the video and finding the place again
+        // on every play, which on a video read from its server took longer
+        // each time.
+        if p.live {
+            p.paused = true;
+        } else {
+            p.end_decoders();
+        }
     }
     let _ = ui.upgrade_in_event_loop(|u| u.global::<Player>().set_playing(false));
 }
@@ -261,8 +294,18 @@ fn resume(ui: &Weak<AppWindow>) {
     let (src, at, info, muted, large, generation) = {
         let mut now = NOW.lock().unwrap();
         let Some(p) = now.as_mut() else { return };
-        p.generation += 1;
+        // Paused: it carries on from where it was held.
+        if p.paused && p.live {
+            p.paused = false;
+            p.playing = true;
+            drop(now);
+            let _ = ui.upgrade_in_event_loop(|u| u.global::<Player>().set_playing(true));
+            return;
+        }
+        p.end_decoders();
+        p.live = true;
         p.playing = true;
+        p.sounding = p.info.audio.is_some() && (!p.muted || p.info.video.is_none());
         // Played to the end: start over.
         if p.info.duration > 0.0 && p.at >= p.info.duration - 0.2 {
             p.at = 0.0;
@@ -277,7 +320,7 @@ fn resume(ui: &Weak<AppWindow>) {
         // With a picture, the picture's thread says when it's over.
         let leads = info.video.is_none();
         std::thread::spawn(move || {
-            let played = play_sound(&src, info, at, start, generation, muted, leads.then_some(&ui));
+            let played = play_sound(&src, info, at, start, generation, false, leads.then_some(&ui));
             if leads {
                 finished(&ui, generation, played);
             }
@@ -297,6 +340,28 @@ fn current(generation: u64) -> bool {
     NOW.lock().unwrap().as_ref().is_some_and(|p| p.generation == generation)
 }
 
+/// Whether start `generation` is paused: its decoders wait where they are.
+fn paused(generation: u64) -> bool {
+    NOW.lock().unwrap().as_ref().is_some_and(|p| p.generation == generation && p.paused)
+}
+
+/// Waits out a pause. Returns how long it was (nothing when not paused).
+fn held(generation: u64) -> Option<Duration> {
+    if !paused(generation) {
+        return None;
+    }
+    let since = Instant::now();
+    while paused(generation) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(since.elapsed())
+}
+
+/// Where start `generation`'s picture is, in seconds.
+fn picture_at(generation: u64) -> f64 {
+    NOW.lock().unwrap().as_ref().filter(|p| p.generation == generation).map_or(0.0, |p| p.at)
+}
+
 /// It played out (not replaced): back to the preview, or from the top
 /// again when looping (not when nothing could be played).
 fn finished(ui: &Weak<AppWindow>, generation: u64, played: u64) {
@@ -306,6 +371,9 @@ fn finished(ui: &Weak<AppWindow>, generation: u64, played: u64) {
             Some(p) if p.generation == generation => {
                 p.at = 0.0;
                 p.playing = false;
+                p.live = false;
+                p.paused = false;
+                p.sounding = false;
                 true
             }
             _ => false,
@@ -587,10 +655,13 @@ fn wait_turn(follows: bool, start: Instant, generation: u64, round: u32) -> bool
     if !follows {
         return wait_until(start, 0.0, generation);
     }
-    let began = Instant::now();
+    let mut began = Instant::now();
     loop {
         if !current(generation) {
             return false;
+        }
+        if let Some(pause) = held(generation) {
+            began += pause;
         }
         let clock = *CLOCK.lock().unwrap();
         if let Some((g, r, at)) = clock
@@ -751,13 +822,22 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, mut at: f64, mut
     let mut rendered = 0u64;
     let mut outputs = 0u64;
     let mut last_drawn = f64::NEG_INFINITY;
-    let began = Instant::now();
+    let mut began = Instant::now();
     let mut outcome = None;
     // Times round (when looping), and whether this time's first frame is still to come.
     let (mut loops, mut first_due) = (0u32, true);
     loop {
         if !current(generation) {
             break;
+        }
+        // Paused: the clock picks up where it left off.
+        if let Some(pause) = held(generation) {
+            start += pause;
+            began += pause;
+            if !first_due {
+                *CLOCK.lock().unwrap() = Some((generation, loops, start));
+            }
+            continue;
         }
         // Nothing out of the decoder, or pictures that can't be read: give
         // up on this way. (Frames before a seek point are only skipped.)
@@ -961,10 +1041,12 @@ impl Planes<'_> {
 
 /// Decodes the sound from `at` and plays it, starting at `start`. With
 /// `ui` (sound only, no picture) it also moves the position along. Returns
-/// how many pieces it played.
-/// `muted` (sound alone, which still has to move the position along): silence.
+/// how many pieces it played. While the sound is off ([`MUTED`]) it plays
+/// at no level (sound alone still has to move the position along).
+/// `joins`: beside a picture that's already playing; what's before the
+/// place the picture has got to is skipped, and it plays from there.
 #[allow(clippy::too_many_arguments)]
-fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, muted: bool, ui: Option<&Weak<AppWindow>>) -> u64 {
+fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, joins: bool, ui: Option<&Weak<AppWindow>>) -> u64 {
     let Some(ex) = Extractor::open(path) else { return 0 };
     let Some(track) = info.audio else { return 0 };
     let Some(mut format) = ex.format(track) else { return 0 };
@@ -983,13 +1065,26 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
     let mut played = 0u64;
     let mut last_shown = 0.0f64;
     let follows = info.video.is_some();
-    let mut loops = 0u32;
-    if !wait_turn(follows, start, generation, loops) {
+    // Joining: on the picture's time round, with no start to wait for.
+    let mut loops = if joins { CLOCK.lock().unwrap().filter(|c| c.0 == generation).map_or(0, |c| c.1) } else { 0 };
+    let mut caught_up = !joins;
+    if !joins && !wait_turn(follows, start, generation, loops) {
         return 0;
     }
     loop {
         if !current(generation) {
             break;
+        }
+        // Paused: the sound stops where it is, and carries on from there.
+        if paused(generation) {
+            if let Some(s) = &stream {
+                let _ = s.request_pause();
+            }
+            held(generation);
+            if let Some(s) = &stream {
+                let _ = s.request_start();
+            }
+            continue;
         }
         if more {
             more = feed(&codec, &ex, &mut buf);
@@ -1010,7 +1105,10 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
         let pts = out.info().presentation_time_us();
         let end = out.info().flags() & END_OF_STREAM != 0;
         let (offset, size) = (out.info().offset().max(0) as usize, out.info().size().max(0) as usize);
-        if pts >= at_us && size > 0 {
+        if !caught_up && pts as f64 / 1e6 >= picture_at(generation) {
+            caught_up = true;
+        }
+        if pts >= at_us && size > 0 && caught_up {
             if stream.is_none() {
                 stream = AudioStreamBuilder::new()
                     .ok()
@@ -1023,7 +1121,7 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
             if let Some(s) = &stream {
                 let raw = &out.buffer()[offset..(offset + size).min(out.buffer().len())];
                 // Below full level, the samples are scaled down here.
-                let level = if muted { 0 } else { crate::ui::volume() };
+                let level = if MUTED.load(Ordering::Relaxed) { 0 } else { crate::ui::volume() };
                 let gain = crate::ui::gain(level);
                 let scaled: Vec<u8>;
                 let data = if level < 100 {

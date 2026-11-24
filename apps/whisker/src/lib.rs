@@ -449,7 +449,11 @@ fn open_link(url: &str) {
     let r = std::process::Command::new("explorer").arg(url).spawn();
     #[cfg(target_os = "macos")]
     let r = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    // Phones: handed to the browser (this did nothing before: links could
+    // only be copied).
+    #[cfg(target_os = "android")]
+    let r: std::io::Result<()> = if droid::open_url(url) { Ok(()) } else { Err(std::io::Error::other("no app on this phone opens links")) };
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos", target_os = "android")))]
     let r: std::io::Result<()> = Ok(());
     if let Err(e) = r {
         tracing::warn!("couldn't open link: {e}");

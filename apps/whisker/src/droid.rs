@@ -192,6 +192,24 @@ pub fn to_background() {
 
 /// Whether the user let Whisker see every file (Android 11 and later):
 /// documents and key files too, not just photos, videos and music.
+/// Opens a web (or mailto:) link in the app the phone picks for it: the
+/// browser. False if nothing could take it.
+pub fn open_url(url: &str) -> bool {
+    with_env(|env, activity| {
+        let text = env.new_string(url)?;
+        let uri = env.call_static_method("android/net/Uri", "parse", "(Ljava/lang/String;)Landroid/net/Uri;", &[JValue::Object(&text)])?.l()?;
+        let action = env.new_string("android.intent.action.VIEW")?;
+        let intent = env.new_object("android/content/Intent", "(Ljava/lang/String;Landroid/net/Uri;)V", &[JValue::Object(&action), JValue::Object(&uri)])?;
+        // Only an app that's meant to be opened from outside (a browser),
+        // never one that just happens to say it can view links.
+        let category = env.new_string("android.intent.category.BROWSABLE")?;
+        env.call_method(&intent, "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", &[JValue::Object(&category)])?;
+        env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
+        Ok(())
+    })
+    .is_some()
+}
+
 pub fn has_all_files() -> bool {
     sdk() >= 30 && with_env(|env, _| env.call_static_method("android/os/Environment", "isExternalStorageManager", "()Z", &[])?.z()).unwrap_or(false)
 }

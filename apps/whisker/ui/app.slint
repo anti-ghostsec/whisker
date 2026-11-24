@@ -3032,7 +3032,11 @@ export component AppWindow inherits Window {
                             // Grows with what's typed (on phones up to 40% of the
                             // screen), then scrolls.
                             property <length> tallest: root.narrow ? max(160px, (root.height - Safe.top - Safe.bottom) * 0.4) : 160px;
-                            height: min(self.tallest, max(40px, compose.preferred-height + 20px));
+                            // Tall enough for the cursor's line too: a word the phone's
+                            // keyboard is still composing isn't in the text the box is
+                            // measured by, and one that wrapped to a new line was hidden
+                            // under the box's edge until it was finished.
+                            height: min(self.tallest, max(40px, max(compose.preferred-height, compose-flick.cursor-bottom) + 20px));
                             border-radius: 12px;
                             background: Theme.raised;
                             border-width: compose.has-focus ? 1px : 0px;
@@ -3047,7 +3051,9 @@ export component AppWindow inherits Window {
                                 // a mouse drag selects text instead.
                                 mouse-drag-pan-enabled: Prefs.touch;
                                 content-width: self.width;
-                                content-height: max(self.height, compose.preferred-height);
+                                content-height: max(self.height, max(compose.preferred-height, self.cursor-bottom));
+                                // The bottom of the cursor's line, in the text.
+                                property <length> cursor-bottom: 0px;
                                 // The cursor is on the last line: what's typed there stays
                                 // in view as the text grows. Going by cursor moves alone
                                 // missed text still being composed by a phone's keyboard,
@@ -3093,7 +3099,8 @@ export component AppWindow inherits Window {
                                         edited => { root.draft-edited(self.text); }
                                         // Long messages: what you're typing stays in view.
                                         cursor-position-changed(p) => {
-                                            compose-flick.at-end = p.y + 30px >= self.preferred-height;
+                                            compose-flick.cursor-bottom = p.y + 20px;
+                                            compose-flick.at-end = p.y + 30px >= max(self.preferred-height, compose-flick.cursor-bottom);
                                             if p.y + compose-flick.content-y < 0px {
                                                 compose-flick.content-y = -p.y;
                                             } else if p.y + 20px + compose-flick.content-y > compose-flick.height {

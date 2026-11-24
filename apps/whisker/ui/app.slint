@@ -342,6 +342,13 @@ component Blocks inherits VerticalLayout {
     // height at the width it will really have.
     in property <length> avail;
     callback link(string);
+    // Phones: text with links takes every touch on it (Slint's StyledText
+    // keeps them), so the message under it never saw a hold and its menu
+    // couldn't be opened. There a layer over the text takes the touch
+    // instead: `press` hands it on to the message (a hold opens its menu),
+    // and a tap is `tapped` (the message opens its link).
+    callback press(PointerEvent);
+    callback tapped();
     // Names this message's text for selecting across messages ("list|id").
     in property <string> key;
     // The text selected in one of the blocks ("" when none is).
@@ -357,6 +364,10 @@ component Blocks inherits VerticalLayout {
                 default-color: b.kind == 1 || root.faint ? Theme.muted : Theme.text;
                 link-color: Theme.accent;
                 link-clicked(l) => { root.link(l); }
+                if Prefs.touch: TouchArea {
+                    pointer-event(e) => { root.press(e); }
+                    clicked => { root.tapped(); }
+                }
             }
         }
         if !b.linked && b.kind == 0: TextInput {
@@ -1056,7 +1067,9 @@ component MessageRow inherits Rectangle {
                             spacing: 4px;
                             for pic in root.item.big-emoji: Image { source: pic; width: 40px; height: 40px; }
                         }
-                        if (root.item.media == 0 || root.item.caption) && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.go(l); } selected(t) => { root.selection = t; } }
+                        if (root.item.media == 0 || root.item.caption) && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.go(l); } selected(t) => { root.selection = t; } press(e) => { root.press(e); }
+                            // A tap on text with links: its one link opens, or the menu with them all.
+                            tapped => { if !root.held { if root.item.links.length == 1 { root.link(root.item.links[0]); } else if root.item.links.length > 1 { root.held = true; root.hold(root.item); } } } }
                         if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }
                         if root.item.link-card > 0: Rectangle {
                             property <length> card-w: min(400px, root.width - 32px - 36px - 12px);

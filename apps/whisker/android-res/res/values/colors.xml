@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The disc of assets/icon.png. -->
+    <color name="icon_background">#FF181C21</color>
+</resources>

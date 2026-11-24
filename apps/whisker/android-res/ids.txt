@@ -1,0 +1,3 @@
+io.github.antighostsec.whisker:mipmap/icon = 0x7f010000
+io.github.antighostsec.whisker:mipmap/icon_foreground = 0x7f010001
+io.github.antighostsec.whisker:color/icon_background = 0x7f020000

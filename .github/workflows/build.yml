@@ -214,6 +214,41 @@ jobs:
           WHISKER_DEX_DIR: target/x/release/android
         run: x build -p whisker --platform android --arch arm64 --release --format apk
 
+      # xbuild only makes a plain icon, which launchers shrink onto a plate
+      # of their own (the round artwork sat inside the shape). Whisker's
+      # adaptive icon (apps/whisker/android-res) is compiled here and takes
+      # its place, under the id xbuild's manifest already points to; the APK
+      # is then aligned and signed again (the signing job below signs
+      # releases with the release key).
+      - name: Adaptive icon
+        run: |
+          set -eu
+          apk="$PWD/target/x/release/android/whisker.apk"
+          icon="$PWD/apps/whisker/android-res"
+          tools="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)"
+          jar="$(ls "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -1)"
+          work="$RUNNER_TEMP/icon"
+          rm -rf "$work"; mkdir -p "$work/out"
+          printf '%s\n' '<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.github.antighostsec.whisker"><application/></manifest>' > "$work/AndroidManifest.xml"
+          "${tools}aapt2" compile --dir "$icon/res" --legacy -o "$work/res.zip"
+          "${tools}aapt2" link -o "$work/res.apk" -I "$jar" --manifest "$work/AndroidManifest.xml" \
+            --min-sdk-version 26 --stable-ids "$icon/ids.txt" "$work/res.zip"
+          "${tools}aapt2" dump resources "$work/res.apk"
+          # The manifest's icon and the new table agree.
+          "${tools}aapt2" dump xmltree --file AndroidManifest.xml "$apk" | grep -q 'android:icon(0x01010002)=@0x7f010000' || { echo "::error::xbuild's manifest no longer points at 0x7f010000 for its icon"; exit 1; }
+          "${tools}aapt2" dump resources "$work/res.apk" | grep -Eq 'resource 0x7f010000 ([^ ]*:)?mipmap/icon( |$)' || { echo "::error::The adaptive icon isn't at 0x7f010000"; exit 1; }
+          (cd "$work/out" && unzip -q "$work/res.apk" 'resources.arsc' 'res/*')
+          zip -q -d "$apk" 'resources.arsc' 'res/*'
+          (cd "$work/out" && zip -q -X -0 "$apk" resources.arsc && zip -q -X -r "$apk" res)
+          "${tools}zipalign" -p -f 4 "$apk" "$work/aligned.apk"
+          keytool -genkeypair -keystore "$work/debug.p12" -storetype PKCS12 -storepass android -keypass android \
+            -alias debug -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=Android Debug" >/dev/null 2>&1
+          "${tools}apksigner" sign --ks "$work/debug.p12" --ks-pass pass:android --ks-key-alias debug --out "$apk" "$work/aligned.apk"
+          "${tools}apksigner" verify "$apk"
+          "${tools}aapt2" dump badging "$apk" | grep -E "^application(-icon-[0-9]+)?:" || true
+          "${tools}aapt2" dump badging "$apk" | grep -q "icon='res/mipmap-anydpi[^']*/icon.xml'" || { echo "::error::The APK's icon isn't the adaptive one"; exit 1; }
+          rm -rf "$work"
+
       # Slint's Java helper is ordinary code in the APK, so nothing is
       # loaded from memory when Whisker starts (hardened systems such as
       # GrapheneOS can refuse that, and Whisker then didn't open).

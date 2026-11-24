@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Whisker's launcher icon: the launcher's own shape (circle, squircle,
+     rounded square…) is filled edge to edge. The background is the colour of
+     the round artwork's disc, so the disc's edge doesn't show. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/icon_background" />
+    <foreground android:drawable="@mipmap/icon_foreground" />
+</adaptive-icon>

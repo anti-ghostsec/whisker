@@ -227,6 +227,11 @@ class SlintInputView extends View {
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI;
         outAttrs.initialSelStart = mCursorPosition;
         outAttrs.initialSelEnd = mAnchorPosition;
+        // Whisker: the keyboard starts from the real text around the cursor
+        // (for its capitals and suggestions), not from what it last saw.
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            outAttrs.setInitialSurroundingText(mEditable);
+        }
         return new BaseInputConnection(this, true) {
             @Override
             public Editable getEditable() {
@@ -275,16 +280,20 @@ class SlintInputView extends View {
         mHasPreedit = preeditStart != preeditEnd;
         mInputType = inputType;
 
-        if (typeChanged) {
+        // Whisker: the text changed from the app's side (cleared after a
+        // message is sent, or rewritten by autocorrect or a :shortcode:), not
+        // by the keyboard (its own edits come back here with the same text).
+        // Only moving the cursor left the keyboard with its old idea of the
+        // text and of the word it was composing: the sent message came back
+        // at the start of the next one, autocorrect "fixed" words from it, and
+        // capitals came up mid-word. Starting the keyboard over drops all that.
+        if (typeChanged || textChanged) {
             mEditable = new SlintEditable();
             Selection.setSelection(mEditable, cursorPosition, anchorPosition);
             getContext().getSystemService(InputMethodManager.class).restartInput(this);
-        } else if (textChanged || selectionChanged) {
+        } else if (selectionChanged) {
             mInBatch += 1;
             try {
-                if (textChanged) {
-                    mEditable.replace(0, mEditable.length(), text);
-                }
                 if (Selection.getSelectionStart(mEditable) != cursorPosition
                         || Selection.getSelectionEnd(mEditable) != anchorPosition) {
                     Selection.setSelection(mEditable, cursorPosition, anchorPosition);

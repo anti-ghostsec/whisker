@@ -54,6 +54,10 @@ const KEEP_OPEN_ROOM: usize = 50_000;
 /// scrolling up waits this long before asking again.
 const OLDER_RETRY: Duration = Duration::from_secs(30);
 const PAGE: u32 = 50;
+const REPLY_RETRY: Duration = Duration::from_secs(60);
+/// How far back a click on a reply looks for the message it answers
+/// (times [`Whisker::load_older`], each up to 20 pages).
+const JUMP_LOOKS: usize = 10;
 /// Opening a room draws this many of its newest messages at once, then the
 /// rest a few at a time, so a long room doesn't hold up the window.
 const ROWS_FIRST: usize = 20;
@@ -113,6 +117,9 @@ struct State {
     /// Messages replied to that aren't loaded, fetched on their own: sender
     /// and text (`None`: being fetched, or it couldn't be).
     reply_cache: HashMap<OwnedEventId, Option<(String, String)>>,
+    /// Replied-to messages that couldn't be fetched, and when: tried again
+    /// after [`REPLY_RETRY`] (a server may have been down).
+    reply_failed: HashMap<OwnedEventId, Instant>,
     /// Emoji reactions seen in each opened room.
     reactions: HashMap<RoomKey, Vec<timeline::Reaction>>,
     /// The message the "Forward to…" dialog is for.
@@ -1310,7 +1317,13 @@ impl Ctl {
         self.mgr.lock_all().await;
         spell::clear_custom();
         whisker_core::stores::shred_dir(&media_dir(self.mgr.data_dir()));
-        *self.st.lock().unwrap() = State::default();
+        {
+            // The tag filter stays as it was (its control still shows it),
+            // so the list after unlocking is the filtered one.
+            let mut st = self.st.lock().unwrap();
+            let tag_filter = st.tag_filter.take();
+            *st = State { tag_filter, ..State::default() };
+        }
         // Your emoji leave with the vault: from messages and the React menu.
         timeline::set_custom_emoji(Vec::new());
         self.show_quick_reactions();
@@ -1662,7 +1675,12 @@ impl Ctl {
                 let first = !day.is_empty()
                     || m.reply_to.is_some()
                     || prev.is_none_or(|p| p.notice || p.sender != m.sender || i64::from(m.ts.get()) - i64::from(p.ts.get()) > 5 * 60 * 1000);
-                let reply = m.reply_to.as_ref().map(|r| match by_id.get(r) {
+                // Loaded but not shown here (in a thread, say) still says what
+                // it was; a hidden event only when those are shown.
+                let found = |r: &OwnedEventId| {
+                    by_id.get(r).copied().or_else(|| st.messages.get(key)?.iter().find(|o| &o.event_id == r && (show_hidden || !o.is_hidden_event())))
+                };
+                let reply = m.reply_to.as_ref().map(|r| match found(r) {
                     Some(o) => (o.sender_label().to_owned(), o.body.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned()),
                     None => match st.reply_cache.get(r) {
                         Some(Some((name, text))) => (name.clone(), text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned()),
@@ -1773,7 +1791,12 @@ impl Ctl {
                 .iter()
                 .rev()
                 .filter_map(|r| r.item.reply_to.clone())
-                .filter(|id| !have.contains(id) && !st.reply_cache.contains_key(id) && seen.insert(id.clone()))
+                .filter(|id| {
+                    !have.contains(id)
+                        && !st.reply_cache.contains_key(id)
+                        && st.reply_failed.get(id).is_none_or(|t| t.elapsed() >= REPLY_RETRY)
+                        && seen.insert(id.clone())
+                })
                 .take(30)
                 .collect();
             for id in &wanted {
@@ -1809,7 +1832,15 @@ impl Ctl {
                         st.reply_cache.insert(id, Some(got));
                         found = true;
                     }
-                    Err(e) => tracing::debug!("couldn't fetch the replied-to message {id}: {e:#}"),
+                    Err(e) => {
+                        tracing::debug!("couldn't fetch the replied-to message {id}: {e:#}");
+                        // Not "being fetched" for ever: tried again later.
+                        let mut st = c.st.lock().unwrap();
+                        if c.locks.load(std::sync::atomic::Ordering::SeqCst) == locks {
+                            st.reply_cache.remove(&id);
+                            st.reply_failed.insert(id, Instant::now());
+                        }
+                    }
                 }
             }
             if found && c.current().as_ref() == Some(&key) {
@@ -1818,13 +1849,35 @@ impl Ctl {
         });
     }
 
-    /// A click on a reply's line: goes to the message it answers when
-    /// that's loaded, or shows it in a window of its own.
+    /// A click on a reply's line: scrolls to the message it answers,
+    /// loading older history until it's there; one that isn't in this
+    /// view (in a thread, say, or too far back) shows in a window of its own.
     async fn jump_to(&self, key: &RoomKey, room: &matrix_sdk::Room, target: OwnedEventId) {
-        let loaded = self.st.lock().unwrap().messages.get(key).is_some_and(|l| l.iter().any(|m| m.event_id == target && m.thread.is_none()));
-        if loaded {
-            let id = target.to_string();
-            return self.ui(move |u| u.set_jump_id(s(id)));
+        let loaded = |c: &Self| c.st.lock().unwrap().messages.get(key).is_some_and(|l| l.iter().any(|m| m.event_id == target));
+        if !loaded(self) && self.current().as_ref() == Some(key) {
+            self.status("Looking for the message…");
+            for _ in 0..JUMP_LOOKS {
+                let more = self.st.lock().unwrap().older.get(key).cloned().flatten().is_some();
+                if !more || self.current().as_ref() != Some(key) {
+                    break;
+                }
+                self.load_older().await;
+                if loaded(self) {
+                    break;
+                }
+            }
+            self.status("");
+        }
+        if loaded(self) && self.current().as_ref() == Some(key) {
+            // All of it drawn (a room that's still opening draws a few at a
+            // time), then scrolled to if it's a row here.
+            self.st.lock().unwrap().row_limit = None;
+            self.show_messages().await;
+            let shown = self.rows(key).await.iter().any(|r| r.item.event_id == target);
+            if shown {
+                let id = target.to_string();
+                return self.ui(move |u| u.set_jump_id(s(id)));
+            }
         }
         let locks = self.locks.load(std::sync::atomic::Ordering::SeqCst);
         let cached = self.st.lock().unwrap().reply_cache.get(&target).cloned().flatten();

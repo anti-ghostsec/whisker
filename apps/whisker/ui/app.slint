@@ -2006,11 +2006,17 @@ export component AppWindow inherits Window {
     // The screen's edges (status and navigation bars), and on phones the
     // on-screen keyboard: what it covers is kept clear, so the message box
     // sits above it while you type.
+    // Only while something is being typed in: leaving a room took the
+    // message box away at once, but the phone says its keyboard has gone
+    // only a while later, and until then the room list was laid out short
+    // with a black band where the keyboard had been.
     function fit-insets() {
         Safe.top = self.safe-area-insets.top;
         Safe.bottom = max(self.safe-area-insets.bottom,
-            self.virtual-keyboard-size.height > 0 ? max(0px, self.height - self.virtual-keyboard-position.y) : 0px);
+            self.typing-in && self.virtual-keyboard-size.height > 0 ? max(0px, self.height - self.virtual-keyboard-position.y) : 0px);
     }
+    property <bool> typing-in: TextInputInterface.text-input-focused;
+    changed typing-in => { root.fit-insets(); }
     changed safe-area-insets => { root.fit-insets(); }
     changed virtual-keyboard-size => { root.fit-insets(); }
     changed virtual-keyboard-position => { root.fit-insets(); }

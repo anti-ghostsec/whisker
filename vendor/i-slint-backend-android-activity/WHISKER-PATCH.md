@@ -15,8 +15,8 @@ app's class loader finds it and nothing is loaded dynamically.
 Drop this copy once Slint can use a helper shipped in the APK itself.
 
 The second, in `java/SlintAndroidJavaHelper.java` (`SlintInputView.setText` and
-`onCreateInputConnection`): when the text changes from the app's side (cleared
-after sending, or rewritten by autocorrect), the keyboard is restarted
+`onCreateInputConnection`): when the app rewrites the text (clears it after
+sending, or replaces a word: autocorrect, a :shortcode:), the keyboard is restarted
 (`restartInput`) with a fresh editable, and on Android 11+ is given the text
 around the cursor when it connects. Upstream only told the keyboard the cursor
 had moved, so it kept composing from the old text: a sent message came back at
@@ -27,3 +27,7 @@ Text that Slint says back while the keyboard is already further on (an
 older text the keyboard itself sent in the last 1.5 s, as when delete is
 held down) is left alone rather than taken as the app's change: restarting
 the keyboard for it stopped a held key from repeating.
+
+Deleting and typing by key (a keyboard holding delete sends key presses,
+which Slint carries out and says back) is passed on as upstream does, not
+restarted: a restart for each one stopped a held key after one character.

@@ -306,15 +306,14 @@ class SlintInputView extends View {
         boolean typeChanged = mInputType != inputType;
         boolean textChanged = !mText.equals(text);
         // Whisker: an older text the keyboard itself made, said back by
-        // Slint while the keyboard was already further on (holding delete
-        // sends edits faster than they come back). Taken as the app's own
-        // change, it restarted the keyboard, which stopped the held key
-        // repeating. The keyboard's newer text stands.
-        // (Never an empty text: that's the box cleared after sending.)
+        // Slint while the keyboard was already further on. The keyboard's
+        // newer text stands. (Never an empty text: that's the box cleared
+        // after sending.)
         if (!typeChanged && textChanged && !text.isEmpty() && staleEcho(text)) {
             return;
         }
         boolean selectionChanged = mCursorPosition != cursorPosition || mAnchorPosition != anchorPosition;
+        boolean rewritten = textChanged && rewrittenByApp(mText, text);
 
         mText = text;
         mCursorPosition = cursorPosition;
@@ -322,20 +321,25 @@ class SlintInputView extends View {
         mHasPreedit = preeditStart != preeditEnd;
         mInputType = inputType;
 
-        // Whisker: the text changed from the app's side (cleared after a
-        // message is sent, or rewritten by autocorrect or a :shortcode:), not
-        // by the keyboard (its own edits come back here with the same text).
-        // Only moving the cursor left the keyboard with its old idea of the
-        // text and of the word it was composing: the sent message came back
-        // at the start of the next one, autocorrect "fixed" words from it, and
-        // capitals came up mid-word. Starting the keyboard over drops all that.
-        if (typeChanged || textChanged) {
+        // Whisker: the app rewrote the text (cleared it after a message was
+        // sent, or replaced a word: autocorrect, a :shortcode:). Only telling
+        // the keyboard the cursor moved left it with its old idea of the text
+        // and of the word it was composing: the sent message came back at the
+        // start of the next one, autocorrect "fixed" words from it, and
+        // capitals came up mid-word. Starting the keyboard over drops that.
+        // Deleting and typing by key (what a keyboard does while delete is
+        // held) is only passed on, as before: restarting the keyboard for
+        // each one stopped the held key after one character.
+        if (typeChanged || rewritten) {
             mEditable = new SlintEditable();
             Selection.setSelection(mEditable, cursorPosition, anchorPosition);
             getContext().getSystemService(InputMethodManager.class).restartInput(this);
-        } else if (selectionChanged) {
+        } else if (textChanged || selectionChanged) {
             mInBatch += 1;
             try {
+                if (textChanged) {
+                    mEditable.replace(0, mEditable.length(), text);
+                }
                 if (Selection.getSelectionStart(mEditable) != cursorPosition
                         || Selection.getSelectionEnd(mEditable) != anchorPosition) {
                     Selection.setSelection(mEditable, cursorPosition, anchorPosition);
@@ -347,6 +351,35 @@ class SlintInputView extends View {
             getContext().getSystemService(InputMethodManager.class)
                     .updateSelection(this, cursorPosition, anchorPosition, preeditStart, preeditEnd);
         }
+    }
+
+    // Whisker: whether going from `before` to `after` is the app rewriting
+    // the text rather than a key doing its job: the text emptied, or a
+    // piece replaced by something else. Deleting a piece, or putting in a
+    // few characters (a hardware key), is what keys do.
+    private static boolean rewrittenByApp(String before, String after) {
+        if (after.isEmpty()) {
+            return !before.isEmpty();
+        }
+        int start = 0;
+        int max = Math.min(before.length(), after.length());
+        while (start < max && before.charAt(start) == after.charAt(start)) {
+            start++;
+        }
+        int end = 0;
+        while (end < max - start
+                && before.charAt(before.length() - 1 - end) == after.charAt(after.length() - 1 - end)) {
+            end++;
+        }
+        int removed = before.length() - start - end;
+        int added = after.length() - start - end;
+        if (added == 0) {
+            return false;
+        }
+        if (removed == 0 && added <= 4) {
+            return false;
+        }
+        return true;
     }
 
     @Override

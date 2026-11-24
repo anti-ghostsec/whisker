@@ -465,6 +465,10 @@ async fn get_once(
         p.total.store(whole.unwrap_or(0), Ordering::Relaxed);
     }
     let mut resumed = 0;
+    // Where the last carry-on started: one that brought more counts as a
+    // fresh start (a server may send a big file a part at a time, each
+    // part answering a carry-on), not as another try.
+    let mut resumed_at = 0;
     loop {
         let broke = match tokio::time::timeout(STALL, res.chunk()).await {
             Err(_) => "the download stalled".to_owned(),
@@ -486,10 +490,14 @@ async fn get_once(
         // A long download (a video) that breaks partway carries on from
         // where it got to, or from the start if the server can't do that,
         // rather than failing.
+        if out.len() > resumed_at {
+            resumed = 0;
+        }
         if out.is_empty() || resumed >= RESUMES {
             return Err(Failed::Unreachable(broke));
         }
         resumed += 1;
+        resumed_at = out.len();
         tracing::debug!("{}: {broke} after {} bytes; carrying on", url.path(), out.len());
         let mut again = client.http_client().get(url.clone()).timeout(WHOLE).header(reqwest::header::RANGE, format!("bytes={}-", out.len()));
         if let Some(t) = token {

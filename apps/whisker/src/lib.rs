@@ -205,6 +205,10 @@ struct State {
     linked: HashMap<OwnedMxcUri, Option<files::LinkedFile>>,
     /// Previews whose server didn't answer: how many times tried.
     picture_tries: HashMap<OwnedEventId, u8>,
+    /// Pictures that downloaded but couldn't be read (a kind Whisker can't
+    /// show, or too big): a click opens the viewer, which says why or shows
+    /// a smaller copy, rather than fetching the same file again.
+    picture_unreadable: HashSet<OwnedEventId>,
     /// Decoded image previews, by event.
     pictures: HashMap<OwnedEventId, Option<Pixels>>,
     /// Previews of web links (YouTube and others), by event.
@@ -329,16 +333,38 @@ fn split_tags(t: &str) -> Vec<String> {
 }
 
 fn decode(bytes: &[u8], max_w: u32, max_h: u32, square: bool) -> Option<Pixels> {
+    decode_within(bytes, max_w, max_h, square, false).ok()
+}
+
+/// How much a picture opened on its own (the viewer) may take to decode:
+/// a big photo or a panorama is over [`decode`]'s limits for previews.
+#[cfg(not(target_os = "android"))]
+const BIG_PICTURE_ALLOC: u64 = 1024 * 1024 * 1024;
+#[cfg(target_os = "android")]
+const BIG_PICTURE_ALLOC: u64 = 512 * 1024 * 1024;
+
+/// [`decode`], saying why it couldn't; `big`: with the viewer's higher limits.
+fn decode_within(bytes: &[u8], max_w: u32, max_h: u32, square: bool, big: bool) -> Result<Pixels, String> {
     // Limits first: a small file can claim a picture of billions of pixels.
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string())?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
-    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits.max_image_width = Some(if big { 65_535 } else { 16_384 });
+    limits.max_image_height = Some(if big { 65_535 } else { 16_384 });
+    limits.max_alloc = Some(if big { BIG_PICTURE_ALLOC } else { 256 * 1024 * 1024 });
     reader.limits(limits);
+    let format = reader.format();
     let img = match reader.decode() {
         Ok(img) => img,
-        Err(_) => image::DynamicImage::ImageRgba8(svg(bytes, max_w, max_h)?),
+        Err(e) => match svg(bytes, max_w, max_h) {
+            Some(px) => image::DynamicImage::ImageRgba8(px),
+            None => {
+                return Err(match (format, &e) {
+                    (_, image::ImageError::Limits(_)) => "it's too big to show".to_owned(),
+                    (None, _) => "Whisker can't read this kind of image".to_owned(),
+                    (Some(f), _) => format!("its {f:?} data couldn't be read ({e})"),
+                });
+            }
+        },
     };
     let img = if square {
         img.resize_to_fill(max_w, max_h, image::imageops::FilterType::Triangle)
@@ -351,7 +377,7 @@ fn decode(bytes: &[u8], max_w: u32, max_h: u32, square: bool) -> Option<Pixels> 
     if square {
         round(&mut img);
     }
-    Some(Pixels::clone_from_slice(img.as_raw(), img.width(), img.height()))
+    Ok(Pixels::clone_from_slice(img.as_raw(), img.width(), img.height()))
 }
 
 /// Cuts a square picture (an avatar) to a circle with a smooth edge, so it
@@ -963,6 +989,9 @@ impl Ctl {
                     }
                     {
                         let mut st = c.st.lock().unwrap();
+                        if decoded.0.is_none() && !failed {
+                            st.picture_unreadable.insert(id.clone());
+                        }
                         st.pictures.insert(id.clone(), decoded.0);
                         if let Some(f) = decoded.1 {
                             st.animations.insert(id.clone(), f);
@@ -4190,6 +4219,7 @@ impl Ctl {
                     Err(e) => self.status(format!("Failed: {e}")),
                 }
             }
+            "retry-media" if self.st.lock().unwrap().picture_unreadable.contains(&m.event_id) => self.view_image(&key, m).await,
             "retry-media" => self.retry_picture(&key, m),
             "link-preview" => {
                 let url = {
@@ -5097,7 +5127,10 @@ impl Ctl {
         let got = whisker_core::media_fetch::with_progress(progress, timeline::download_in(&client, &key.1, &media.source, None)).await;
         watching.abort();
         self.ui(|u| u.set_viewer_percent(0));
-        let decoded = match got {
+        let kind = media.mime.clone().unwrap_or_else(|| media.name.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default());
+        // Why the file itself couldn't be shown, when it couldn't.
+        let mut problem: Option<String> = None;
+        let mut decoded = match got {
             Ok(b) => {
                 // A GIF whose message shows it still (it couldn't be fetched
                 // before): the message plays it too from now on.
@@ -5105,18 +5138,65 @@ impl Ctl {
                 let r = tokio::task::spawn_blocking(move || {
                     let big = ui::decode_frames(&b, 1600, 1200);
                     let small = if small && big.is_some() { ui::decode_frames(&b, 720, 600) } else { None };
-                    (decode(&b, 2560, 2560, false), big, small)
+                    // A big photo or a panorama: again with room for it.
+                    let still = decode_within(&b, 2560, 2560, false, false).or_else(|_| decode_within(&b, 2560, 2560, false, true));
+                    (still, big, small)
                 })
                 .await
-                .unwrap_or((None, None, None));
+                .unwrap_or_else(|_| (Err("it couldn't be read".to_owned()), None, None));
                 if let Some(f) = r.2 {
                     self.st.lock().unwrap().animations.insert(m.event_id.clone(), f);
                     self.update_message(key, &m.event_id);
                 }
-                (r.0, r.1)
+                match r.0 {
+                    Ok(px) => (Some(px), r.1),
+                    Err(why) => {
+                        tracing::warn!("couldn't show the image {} ({kind}, {} bytes): {why}", m.event_id, media.size.unwrap_or_default());
+                        problem = Some(why);
+                        (None, None)
+                    }
+                }
             }
-            Err(_) => (None, None),
+            Err(e) => {
+                tracing::warn!("couldn't download the image {} ({}): {e:#}", m.event_id, media_address(&media.source));
+                problem = Some(format!("it couldn't be downloaded: {e:#}"));
+                (None, None)
+            }
         };
+        // The file couldn't be shown: a smaller copy can (the sender's
+        // thumbnail, or one the server makes), as other apps would show.
+        let mut smaller = false;
+        if decoded.0.is_none() {
+            let mut ways: Vec<(MediaSource, Option<u32>)> = Vec::new();
+            if let Some(t) = &media.thumbnail {
+                ways.push((t.clone(), None));
+            }
+            if matches!(media.source, MediaSource::Plain(_)) {
+                ways.push((media.source.clone(), Some(1600)));
+            }
+            for (src, thumb) in ways {
+                if self.current().as_ref() != Some(key) {
+                    break;
+                }
+                if let Ok(b) = timeline::download_in(&client, &key.1, &src, thumb).await
+                    && let Some(px) = tokio::task::spawn_blocking(move || decode(&b, 2560, 2560, false)).await.ok().flatten()
+                {
+                    decoded.0 = Some(px);
+                    smaller = true;
+                    break;
+                }
+            }
+        }
+        let save_hint = if cfg!(target_os = "android") { "hold it and pick Save or Share" } else { "right-click it and pick Save image…" };
+        if let Some(why) = &problem {
+            let kind = if kind.is_empty() { String::new() } else { format!(" ({kind})") };
+            let m = if smaller {
+                format!("Showing a smaller copy: the image itself{kind} can't be shown, as {why}. To see it whole, {save_hint} to open it in another app.")
+            } else {
+                format!("Couldn't open that image{kind}: {why}. To open it in another app, {save_hint}.")
+            };
+            self.status(m);
+        }
         match decoded.0 {
             Some(px) => self.ui(move |u| {
                 u.set_viewer_image(Image::from_rgba8(px));
@@ -5125,10 +5205,7 @@ impl Ctl {
                 u.set_viewer_frames(ModelRc::new(VecModel::from(frames)));
                 u.set_viewer_frame_ms(ms as i32);
             }),
-            None => {
-                self.ui(|u| u.set_viewer_open(false));
-                self.status("Couldn't open that image.");
-            }
+            None => self.ui(|u| u.set_viewer_open(false)),
         }
     }
 

@@ -689,14 +689,11 @@ fn wait_turn(follows: bool, start: Instant, generation: u64, round: u32) -> bool
     if !follows {
         return wait_until(start, 0.0, generation);
     }
-    let mut began = Instant::now();
     loop {
         if !current(generation) {
             return false;
         }
-        if let Some(pause) = held(generation) {
-            began += pause;
-        }
+        held(generation);
         let clock = *CLOCK.lock().unwrap();
         if let Some((g, r, at)) = clock
             && g == generation
@@ -704,8 +701,11 @@ fn wait_turn(follows: bool, start: Instant, generation: u64, round: u32) -> bool
         {
             return wait_until(at, 0.0, generation);
         }
-        // No picture coming: the sound goes on its own.
-        if VIDEO_GONE.load(Ordering::Relaxed) == generation || began.elapsed() > Duration::from_secs(8) {
+        // No picture coming: the sound goes on its own. (Not after a while
+        // of waiting: a video still loading from its server, or moving to
+        // the software decoder, can take longer than any wait, and sound
+        // that started without it stayed ahead of it.)
+        if VIDEO_GONE.load(Ordering::Relaxed) == generation {
             return true;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -1124,7 +1124,10 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
     // Joining: on the picture's time round, with no start to wait for.
     let mut loops = if joins { CLOCK.lock().unwrap().filter(|c| c.0 == generation).map_or(0, |c| c.1) } else { 0 };
     let mut caught_up = !joins;
-    if !joins && !wait_turn(follows, start, generation, loops) {
+    // Turned on while the picture is still loading: it waits for the
+    // picture like a fresh start does, rather than playing ahead of it.
+    let loading = joins && follows && SHOWN.load(Ordering::Relaxed) != generation;
+    if (!joins || loading) && !wait_turn(follows, start, generation, loops) {
         return 0;
     }
     loop {

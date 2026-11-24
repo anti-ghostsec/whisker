@@ -1964,6 +1964,8 @@ export component AppWindow inherits Window {
     callback open-stickers();
     callback send-sticker(string);
     callback remove-sticker(string);
+    // The sticker or emoji whose row asks "Remove?" (held, or right-clicked).
+    property <string> sticker-confirm;
     in property <string> current-account-name;
     in property <string> current-account-user;
     in property <bool> loading-rooms;
@@ -3774,24 +3776,44 @@ export component AppWindow inherits Window {
 
         if root.stickers-open: Overlay {
             card-width: 460px;
-            dismiss => { root.stickers-open = false; }
+            dismiss => { root.stickers-open = false; root.sticker-confirm = ""; }
             Text { text: "Stickers and emoji"; font-size: 18px; font-weight: 800; color: Theme.text; }
             if root.stickers.length == 0: Text {
                 text: "No stickers or emoji yet. Right-click a picture in a chat and pick \"Save as sticker…\" or \"Save as emoji…\".";
                 color: Theme.muted; font-size: 12px; wrap: word-wrap;
             }
             if root.stickers.length > 0: Text {
-                text: root.reply-to != "" ? "Click one to send it as your reply." : "Click one to send it, or type :name: in a message.";
+                text: (root.reply-to != "" ? "Click one to send it as your reply." : "Click one to send it, or type :name: in a message.")
+                    + (Prefs.touch ? " Hold one to remove it." : " Right-click one (or ✕) to remove it.");
                 color: Theme.muted; font-size: 12px; wrap: word-wrap;
             }
             Flickable {
                 height: min(root.stickers.length * 72px, root.height - 240px);
                 VerticalLayout {
-                    for x in root.stickers: Rectangle {
+                    for x in root.stickers: srow := Rectangle {
+                        property <string> key: x.emoji ? "emoji:" + x.name : x.name;
+                        property <bool> confirming: root.sticker-confirm == self.key;
                         height: 72px;
                         border-radius: 8px;
-                        background: xta.has-hover ? Theme.hover : transparent;
-                        xta := TouchArea { mouse-cursor: pointer; clicked => { root.send-sticker(x.emoji ? "emoji:" + x.name : x.name); } }
+                        background: self.confirming ? Theme.danger.transparentize(0.85) : xta.has-hover ? Theme.hover : transparent;
+                        // Phones: held still for a moment, it asks to be removed
+                        // (and letting go then doesn't send it).
+                        Timer {
+                            interval: 450ms;
+                            running: Prefs.touch && xta.pressed && !srow.confirming;
+                            triggered => { root.sticker-confirm = srow.key; }
+                        }
+                        xta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                if root.sticker-confirm == srow.key { return; }
+                                root.sticker-confirm = "";
+                                root.send-sticker(srow.key);
+                            }
+                            pointer-event(e) => {
+                                if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { root.sticker-confirm = srow.key; }
+                            }
+                        }
                         HorizontalLayout {
                             padding: 6px;
                             spacing: 12px;
@@ -3802,12 +3824,18 @@ export component AppWindow inherits Window {
                                 if x.picture.width == 0: Text { text: "…"; color: Theme.muted; }
                             }
                             Text { text: ":" + x.name + ":" + (x.emoji ? "  · emoji" : ""); color: Theme.text; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                            VerticalLayout { alignment: center; IconBtn { icon: "✕"; size: 28px; clicked => { root.remove-sticker(x.emoji ? "emoji:" + x.name : x.name); } } }
+                            if !srow.confirming: VerticalLayout { alignment: center; IconBtn { icon: "✕"; size: 28px; clicked => { root.sticker-confirm = srow.key; } } }
+                            if srow.confirming: HorizontalLayout {
+                                alignment: end;
+                                spacing: 6px;
+                                VerticalLayout { alignment: center; Btn { text: "Remove"; danger: true; clicked => { root.remove-sticker(root.sticker-confirm); root.sticker-confirm = ""; } } }
+                                VerticalLayout { alignment: center; Btn { text: "Cancel"; clicked => { root.sticker-confirm = ""; } } }
+                            }
                         }
                     }
                 }
             }
-            HorizontalLayout { alignment: end; Btn { text: "Close"; primary: true; clicked => { root.stickers-open = false; } } }
+            HorizontalLayout { alignment: end; Btn { text: "Close"; primary: true; clicked => { root.stickers-open = false; root.sticker-confirm = ""; } } }
         }
 
         if root.topic-open: Overlay {

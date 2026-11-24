@@ -204,7 +204,18 @@ export component IconBtn inherits Rectangle {
     height: size;
     border-radius: 10px;
     background: active ? Theme.accent-soft : ta.has-hover ? Theme.hover : transparent;
-    if !root.padlock && !root.gear: Text { text: root.icon; font-size: root.size * 0.48; color: root.active ? Theme.accent : Theme.muted; }
+    // ✕ is drawn too: some phones' fonts don't have it, and the button
+    // showed nothing (a sticker couldn't be removed).
+    if !root.padlock && !root.gear && root.icon != "✕": Text { text: root.icon; font-size: root.size * 0.48; color: root.active ? Theme.accent : Theme.muted; }
+    if !root.padlock && !root.gear && root.icon == "✕": Path {
+        width: root.size * 0.4;
+        height: root.size * 0.4;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        stroke: root.active ? Theme.accent : Theme.muted;
+        stroke-width: 2px;
+        commands: "M 5 5 L 19 19 M 19 5 L 5 19";
+    }
     if root.padlock: Path {
         width: root.size * 0.5;
         height: root.size * 0.5;

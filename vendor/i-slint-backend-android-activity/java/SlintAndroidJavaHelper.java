@@ -142,6 +142,38 @@ class SlintInputView extends View {
     private boolean mPending = false;
     private boolean mHasPreedit = false;
     private SlintEditable mEditable;
+    // Whisker: texts the keyboard made, sent to Slint in the last moment
+    // (see setText), newest last.
+    private final java.util.ArrayDeque<String> mSentTexts = new java.util.ArrayDeque<>();
+    private final java.util.ArrayDeque<Long> mSentAt = new java.util.ArrayDeque<>();
+    private static final long ECHO_MS = 1500;
+    private static final int ECHO_KEEP = 32;
+
+    private void rememberSent(String text) {
+        long now = android.os.SystemClock.uptimeMillis();
+        mSentTexts.addLast(text);
+        mSentAt.addLast(now);
+        while (mSentTexts.size() > ECHO_KEEP || (!mSentAt.isEmpty() && now - mSentAt.peekFirst() > ECHO_MS)) {
+            mSentTexts.pollFirst();
+            mSentAt.pollFirst();
+        }
+    }
+
+    // A text the keyboard made a moment ago, not the newest: Slint saying
+    // back an edit it hadn't caught up with yet.
+    private boolean staleEcho(String text) {
+        long now = android.os.SystemClock.uptimeMillis();
+        java.util.Iterator<String> texts = mSentTexts.iterator();
+        java.util.Iterator<Long> at = mSentAt.iterator();
+        while (texts.hasNext()) {
+            String t = texts.next();
+            long when = at.next();
+            if (now - when <= ECHO_MS && t.equals(text)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     private InputHandle mCursorHandle;
     private InputHandle mLeftHandle;
@@ -182,6 +214,7 @@ class SlintInputView extends View {
             int composingStart = BaseInputConnection.getComposingSpanStart(this);
             int composingEnd = BaseInputConnection.getComposingSpanEnd(this);
             mHasPreedit = composingStart != composingEnd;
+            rememberSent(mText);
             SlintAndroidJavaHelper.updateText(mText, mCursorPosition, mAnchorPosition, composingStart, composingEnd);
         }
 
@@ -272,6 +305,15 @@ class SlintInputView extends View {
             int inputType) {
         boolean typeChanged = mInputType != inputType;
         boolean textChanged = !mText.equals(text);
+        // Whisker: an older text the keyboard itself made, said back by
+        // Slint while the keyboard was already further on (holding delete
+        // sends edits faster than they come back). Taken as the app's own
+        // change, it restarted the keyboard, which stopped the held key
+        // repeating. The keyboard's newer text stands.
+        // (Never an empty text: that's the box cleared after sending.)
+        if (!typeChanged && textChanged && !text.isEmpty() && staleEcho(text)) {
+            return;
+        }
         boolean selectionChanged = mCursorPosition != cursorPosition || mAnchorPosition != anchorPosition;
 
         mText = text;

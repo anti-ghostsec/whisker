@@ -22,3 +22,8 @@ around the cursor when it connects. Upstream only told the keyboard the cursor
 had moved, so it kept composing from the old text: a sent message came back at
 the start of the next one, autocorrect worked from stale words, and capitals
 came up in the middle of words.
+
+Text that Slint says back while the keyboard is already further on (an
+older text the keyboard itself sent in the last 1.5 s, as when delete is
+held down) is left alone rather than taken as the app's change: restarting
+the keyboard for it stopped a held key from repeating.

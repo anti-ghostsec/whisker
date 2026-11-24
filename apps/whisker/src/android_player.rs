@@ -112,6 +112,40 @@ static MUTED: AtomicBool = AtomicBool::new(true);
 /// looping) came up: (start, time round, the moment it stands for). The
 /// sound waits for it, so it never runs ahead of the picture.
 static CLOCK: Mutex<Option<(u64, u32, Instant)>> = Mutex::new(None);
+/// What the speaker is playing (from AAudio's own timestamps): start, time
+/// round, the moment in the video, when that was heard, and when this was
+/// last told. The picture keeps to it, so it stays with the sound: written
+/// sound comes out of the speaker a while later (the phone's buffers, and
+/// more with Bluetooth), and the phone's sound clock drifts from its timer.
+static HEARD: Mutex<Option<Heard>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct Heard {
+    generation: u64,
+    round: u32,
+    media: f64,
+    at: Instant,
+    told: Instant,
+}
+
+/// How old what the speaker said may be and still be kept to (it's told
+/// every few hundredths of a second while sound plays).
+const HEARD_FRESH: Duration = Duration::from_millis(300);
+
+/// The `Instant` of a `CLOCK_MONOTONIC` time from AAudio (what `Instant`
+/// counts in on Android), or `None` if the clock can't be read.
+fn instant_of_monotonic(nanos: i64) -> Option<Instant> {
+    let mut ts = ffi::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid timespec for clock_gettime to fill in.
+    if unsafe { ffi::clock_gettime(ffi::CLOCK_MONOTONIC as ffi::clockid_t, &mut ts) } != 0 {
+        return None;
+    }
+    let now_nanos = ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64;
+    let now = Instant::now();
+    let ago = now_nanos - nanos;
+    if ago >= 0 { now.checked_sub(Duration::from_nanos(ago as u64)) } else { now.checked_add(Duration::from_nanos((-ago) as u64)) }
+}
+
 /// The last start whose picture stopped (the sound needn't wait for it).
 static VIDEO_GONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -878,6 +912,24 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, mut at: f64, mut
             start = Instant::now().checked_sub(Duration::from_secs_f64((t - at).max(0.0))).unwrap_or_else(Instant::now);
             *CLOCK.lock().unwrap() = Some((generation, loops, start));
         }
+        // With sound playing, the picture keeps to what the speaker is at.
+        if !first_due {
+            let heard = *HEARD.lock().unwrap();
+            if let Some(h) = heard
+                && h.generation == generation
+                && h.round == loops
+                && h.told.elapsed() < HEARD_FRESH
+            {
+                // The moment `at` stands for, by the speaker.
+                let by_sound = match h.media - at {
+                    d if d >= 0.0 => h.at.checked_sub(Duration::from_secs_f64(d)),
+                    d => h.at.checked_add(Duration::from_secs_f64(-d)),
+                };
+                if let Some(s) = by_sound {
+                    start = s;
+                }
+            }
+        }
         let late = start.elapsed().as_secs_f64() > t - at + 0.1;
         let skip = pts < at_us || empty || t - last_drawn < 1.0 / FPS || (late && t - last_drawn < 0.5);
         if skip {
@@ -1060,6 +1112,10 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
     let mut rate = format.i32("sample-rate").unwrap_or(48000);
     let mut channels = format.i32("channel-count").unwrap_or(2);
     let mut stream: Option<ndk::audio::AudioStream> = None;
+    // Frames written to `stream`, and which of them is which moment of the
+    // video (frame, seconds): set by the first written after it's opened or
+    // after going round again.
+    let (mut written, mut base): (i64, Option<(i64, f64)>) = (0, None);
     let mut buf = Vec::new();
     let mut more = true;
     let mut played = 0u64;
@@ -1080,6 +1136,8 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
             if let Some(s) = &stream {
                 let _ = s.request_pause();
             }
+            // Nothing is heard while paused: the picture holds by itself.
+            HEARD.lock().unwrap().take_if(|h| h.generation == generation);
             held(generation);
             if let Some(s) = &stream {
                 let _ = s.request_start();
@@ -1097,6 +1155,7 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
                 channels = f.i32("channel-count").unwrap_or(channels);
                 let _ = f.str("mime");
                 stream = None;
+                (written, base) = (0, None);
                 continue;
             }
             Ok(_) => continue,
@@ -1117,8 +1176,12 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
                 if let Some(s) = &stream {
                     let _ = s.request_start();
                 }
+                (written, base) = (0, None);
             }
             if let Some(s) = &stream {
+                if base.is_none() {
+                    base = Some((written, pts as f64 / 1e6));
+                }
                 let raw = &out.buffer()[offset..(offset + size).min(out.buffer().len())];
                 // Below full level, the samples are scaled down here.
                 let level = if MUTED.load(Ordering::Relaxed) { 0 } else { crate::ui::volume() };
@@ -1143,7 +1206,19 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
                         Err(_) => break,
                     }
                 }
+                written += i64::from(done);
                 played += 1;
+                // Which moment the speaker is at, for the picture to keep to.
+                if follows
+                    && let Some((from_frame, from_t)) = base
+                    && let Ok(ts) = s.timestamp(ndk::audio::Clockid::Monotonic)
+                    && ts.frame_position >= from_frame
+                    && rate > 0
+                    && let Some(heard_at) = instant_of_monotonic(ts.time_nanoseconds)
+                {
+                    let media = from_t + (ts.frame_position - from_frame) as f64 / f64::from(rate);
+                    *HEARD.lock().unwrap() = Some(Heard { generation, round: loops, media, at: heard_at, told: Instant::now() });
+                }
             }
             let t = pts as f64 / 1e6;
             if let Some(ui) = ui
@@ -1175,6 +1250,7 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
                 ex.seek(0);
                 more = true;
                 loops += 1;
+                base = None;
                 if !wait_turn(follows, Instant::now(), generation, loops) {
                     break;
                 }

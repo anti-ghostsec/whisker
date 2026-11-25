@@ -1106,10 +1106,20 @@ impl AccountManager {
             let worked = Arc::new(std::sync::atomic::AtomicBool::new(false));
             // Unreachable since when, and when its address was last checked.
             let (mut down_since, mut checked): (Option<std::time::Instant>, Option<std::time::Instant>) = (None, None);
+            // Failed tries in a row that couldn't reach the server. One alone
+            // isn't news: a connection the server (or a proxy in front of it)
+            // closed while idle fails once and the retry just works, so
+            // "Reconnecting…" waits for a second failure.
+            let mut misses = 0u32;
+            // After a failure the next try doesn't wait for news (a long poll
+            // can sit 30 seconds when nothing's said): one quick sync shows
+            // at once that the server's back, then the usual waiting ones.
+            let mut quick = false;
             loop {
                 let (tx2, c2, worked2) = (tx.clone(), sync_client.clone(), worked.clone());
+                let these = if quick { settings.clone().timeout(std::time::Duration::ZERO) } else { settings.clone() };
                 let res = sync_client
-                    .sync_with_callback(settings.clone(), move |resp| {
+                    .sync_with_callback(these, move |resp| {
                         let (tx, c) = (tx2.clone(), c2.clone());
                         worked2.store(true, std::sync::atomic::Ordering::Relaxed);
                         async move {
@@ -1136,13 +1146,15 @@ impl AccountManager {
                                 }
                             }
                             let _ = tx.send(ClientEvent::Synced { account });
-                            LoopCtrl::Continue
+                            if quick { LoopCtrl::Break } else { LoopCtrl::Continue }
                         }
                     })
                     .await;
+                quick = res.is_err();
                 if worked.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     delay = 1;
                     down_since = None;
+                    misses = 0;
                 }
                 if let Err(e) = res {
                     if unreachable(&e) {
@@ -1154,13 +1166,19 @@ impl AccountManager {
                             let mgr = mgr.clone();
                             tokio::spawn(async move { mgr.follow_move(account).await });
                         }
+                        misses += 1;
                     } else {
                         down_since = None;
+                        misses = 0;
                     }
-                    let _ = tx.send(ClientEvent::AccountError { account, message: e.to_string() });
+                    if misses != 1 {
+                        let _ = tx.send(ClientEvent::AccountError { account, message: e.to_string() });
+                    } else {
+                        tracing::debug!("sync for {account} failed once, retrying: {e}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    delay = (delay * 2).min(60);
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                delay = (delay * 2).min(60);
             }
         });
 

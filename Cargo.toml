@@ -10,7 +10,7 @@ members = [
 exclude = ["vendor/i-slint-backend-android-activity"]
 
 [workspace.package]
-version = "0.41.18"
+version = "0.41.19"
 edition = "2024"
 license = "GPL-3.0-or-later"
 

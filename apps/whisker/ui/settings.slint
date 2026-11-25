@@ -1,5 +1,5 @@
 import { ComboBox, SpinBox, Switch, TextEdit, ScrollView, ListView } from "std-widgets.slint";
-import { Theme, Prefs, Avatar, AiBadge, Btn, IconBtn, Input } from "theme.slint";
+import { Theme, Prefs, Avatar, AiBadge, Btn, IconBtn, Input, Keyfiles, KeyfileRow } from "theme.slint";
 
 // One entry in the settings sidebar. `id` is "general", "account:<id>" or "ai:<id>".
 export struct NavItem {
@@ -701,14 +701,20 @@ component GeneralPage inherits VerticalLayout {
             label: "Change passphrase";
             hint: "Changes the vault that holds the selected account.";
             old-pass := Input { password: true; placeholder: "Current passphrase"; }
+            KeyfileRow { slot: "old"; names: Keyfiles.old; can-make: false; }
             new-pass := Input { password: true; placeholder: "New passphrase (8+ characters)"; }
             new-pass2 := Input { password: true; placeholder: "Repeat new passphrase"; }
+            KeyfileRow { slot: "new"; names: Keyfiles.new; }
+            Text {
+                text: "Keyfiles (optional, like VeraCrypt's): any files, all needed to unlock, in any order. Only their first megabyte counts, and they mustn't change. Lose one and the vault can't be opened, so keep copies. With keyfiles the passphrase may be left empty.";
+                wrap: word-wrap; font-size: 11px; color: Theme.muted;
+            }
         }
         HorizontalLayout {
             alignment: start;
             Btn {
                 text: "Change passphrase";
-                enabled: old-pass.text != "" && new-pass.text != "" && new-pass.text == new-pass2.text;
+                enabled: (old-pass.text != "" || Keyfiles.old.length > 0) && (new-pass.text != "" || Keyfiles.new.length > 0) && new-pass.text == new-pass2.text;
                 clicked => { root.change-passphrase(old-pass.text, new-pass.text); old-pass.text = ""; new-pass.text = ""; new-pass2.text = ""; }
             }
         }
@@ -717,15 +723,16 @@ component GeneralPage inherits VerticalLayout {
         title: "Hidden vaults";
         subtitle: "Accounts in a hidden vault only appear after you enter its own passphrase, and disappear when you lock. Nothing in your main vault mentions them.";
         hidden-pass := Input { password: true; placeholder: "Hidden vault passphrase"; }
+        KeyfileRow { slot: "hidden"; names: Keyfiles.hidden; }
         HorizontalLayout {
             spacing: 8px;
             alignment: start;
-            Btn { text: "Unlock"; enabled: hidden-pass.text != ""; clicked => { root.unlock-hidden(hidden-pass.text); hidden-pass.text = ""; } }
-            Btn { text: "Create new"; enabled: hidden-pass.text != ""; clicked => { root.create-hidden(hidden-pass.text); hidden-pass.text = ""; } }
+            Btn { text: "Unlock"; enabled: hidden-pass.text != "" || Keyfiles.hidden.length > 0; clicked => { root.unlock-hidden(hidden-pass.text); hidden-pass.text = ""; } }
+            Btn { text: "Create new"; enabled: hidden-pass.text != "" || Keyfiles.hidden.length > 0; clicked => { root.create-hidden(hidden-pass.text); hidden-pass.text = ""; } }
         }
         if Prefs.hidden-vaults > 0: Text {
             text: (Prefs.hidden-vaults == 1 ? "A hidden vault is unlocked." : Prefs.hidden-vaults + " hidden vaults are unlocked.")
-                + " To put accounts you already have in it, open the account below and pick it under Vault. Locking hides its accounts again; the rest stay signed in.";
+                + " To put accounts you already have in it, open the account on the left and pick it under Vault. Locking hides its accounts again; the rest stay signed in.";
             wrap: word-wrap;
             font-size: 12px;
             color: Theme.muted;
@@ -975,6 +982,10 @@ component AccountPage inherits VerticalLayout {
             if !root.account.is-agent: Btn { text: "Use this account as an AI"; clicked => { root.profile-edit("make-ai", root.account.id, ""); } }
             if root.account.is-agent: Btn { text: "Turn back into a normal account"; clicked => { root.profile-edit("make-human", root.account.id, ""); } }
         }
+    }
+    if root.account.vaults.length <= 1 && !root.account.is-agent: Card {
+        title: "Vault";
+        subtitle: "To move this account into a hidden vault, first create or unlock one under General → Hidden vaults. Then pick it here.";
     }
     if root.account.vaults.length > 1 && !root.account.is-agent: Card {
         title: "Vault";

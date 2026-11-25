@@ -193,6 +193,9 @@ struct State {
     vault_stickers: HashMap<VaultId, (Vec<Sticker>, Vec<Sticker>)>,
     /// The vault each signed-in account is kept in.
     account_vaults: HashMap<AccountId, VaultId>,
+    /// Keyfiles picked for each passphrase box ("unlock", "hidden", "old",
+    /// "new"), forgotten once used.
+    keyfiles: HashMap<String, Vec<PathBuf>>,
     /// Whose profile card is open, and from which room.
     profile_user: Option<(RoomKey, OwnedUserId)>,
     /// The vaults last listed in settings, in order, with their names.
@@ -1235,6 +1238,15 @@ impl Ctl {
             u.set_busy(true);
             u.set_error(s(""));
         });
+        let pass = match self.with_keyfiles("unlock", &pass) {
+            Ok(p) => p,
+            Err(e) => {
+                return self.ui(move |u| {
+                    u.set_busy(false);
+                    u.set_error(s(e));
+                });
+            }
+        };
         let res = if self.mgr.is_empty() { self.mgr.create_vault(&pass).await.map(|v| vec![v]) } else { self.mgr.unlock(&pass).await };
         match res {
             Ok(v) if v.is_empty() => self.ui(|u| {
@@ -1349,6 +1361,19 @@ impl Ctl {
         self.st.lock().unwrap().vault_names.get(i).cloned()
     }
 
+    /// Draws the settings page that's open again (an account's page then
+    /// offers the vaults open now).
+    async fn reopen_settings(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let _ = tx.send(ui.upgrade().map(|u| u.get_nav_selected().to_string()));
+        });
+        if let Ok(Some(id)) = rx.await {
+            self.open_settings(id).await;
+        }
+    }
+
     /// Says in settings how many hidden vaults are open.
     async fn show_hidden_count(&self) {
         let n = self.vault_list().await.iter().filter(|(_, n)| n != "Main vault").count() as i32;
@@ -1430,11 +1455,20 @@ impl Ctl {
     }
 
     async fn unlock_more(&self, pass: String) {
+        let pass = match self.with_keyfiles("hidden", &pass) {
+            Ok(p) => p,
+            Err(e) => return self.settings_msg(e),
+        };
         match self.mgr.unlock(&pass).await {
+            // Already open (just made, say): that's not "no vault".
+            Ok(v) if v.is_empty() && self.mgr.passphrase_in_use(&pass, None).await.unwrap_or(false) => {
+                self.settings_msg("That vault is already unlocked. To put an account in it, open the account on the left and pick the vault under Vault.");
+            }
             Ok(v) if v.is_empty() => self.settings_msg("No locked vault opens with that passphrase."),
             Ok(v) => {
                 self.after_unlock(v).await;
                 self.show_hidden_count().await;
+                self.reopen_settings().await;
                 self.settings_msg("Hidden vault unlocked. New accounts go into it until you lock it, and accounts you have can be moved into it (open one below, then Vault).");
             }
             Err(e) => self.settings_msg(format!("{e:#}")),
@@ -1442,9 +1476,14 @@ impl Ctl {
     }
 
     async fn create_hidden(&self, pass: String) {
-        if pass.len() < 8 {
-            return self.settings_msg("Use at least 8 characters.");
+        let keyed = self.st.lock().unwrap().keyfiles.get("hidden").is_some_and(|k| !k.is_empty());
+        if pass.chars().count() < 8 && !keyed {
+            return self.settings_msg("Use at least 8 characters (or keyfiles).");
         }
+        let pass = match self.with_keyfiles("hidden", &pass) {
+            Ok(p) => p,
+            Err(e) => return self.settings_msg(e),
+        };
         // One passphrase opening two vaults (the main one included, which
         // is open now) would open both: handing it over would give the
         // hidden one away.
@@ -1458,6 +1497,7 @@ impl Ctl {
             Ok(v) => {
                 self.st.lock().unwrap().active_vault = Some(v);
                 self.show_hidden_count().await;
+                self.reopen_settings().await;
                 self.settings_msg("Hidden vault created. Accounts you add now go into it, and accounts you have can be moved into it (open one below, then Vault).");
             }
             Err(e) => self.settings_msg(format!("{e:#}")),
@@ -1482,6 +1522,9 @@ impl Ctl {
             let mut st = self.st.lock().unwrap();
             let tag_filter = st.tag_filter.take();
             *st = State { tag_filter, ..State::default() };
+        }
+        self.show_keyfiles();
+        {
         }
         // Your emoji leave with the vault: from messages and the React menu.
         timeline::set_custom_emoji(Vec::new());
@@ -7660,6 +7703,14 @@ impl Ctl {
     }
 
     async fn change_passphrase(&self, old: String, new: String) {
+        let keyed = self.st.lock().unwrap().keyfiles.get("new").is_some_and(|k| !k.is_empty());
+        if new.chars().count() < 8 && !keyed {
+            return self.settings_msg("Use at least 8 characters for the new passphrase (or keyfiles).");
+        }
+        let (old, new) = match (self.with_keyfiles("old", &old), self.with_keyfiles("new", &new)) {
+            (Ok(o), Ok(n)) => (o, n),
+            (Err(e), _) | (_, Err(e)) => return self.settings_msg(e),
+        };
         let account = self.st.lock().unwrap().account;
         let vault = match account {
             Some(a) => self.vault_of(a).await,
@@ -7669,6 +7720,76 @@ impl Ctl {
         self.settings_msg(match self.mgr.change_passphrase(&vault, &old, &new).await {
             Ok(()) => "Passphrase changed.".to_owned(),
             Err(e) => format!("{e:#}"),
+        });
+    }
+
+    /// `pass` with the keyfiles picked for `slot` (which are then
+    /// forgotten), or why a keyfile couldn't be read.
+    fn with_keyfiles(&self, slot: &str, pass: &str) -> Result<zeroize::Zeroizing<String>, String> {
+        let files = self.st.lock().unwrap().keyfiles.remove(slot).unwrap_or_default();
+        self.show_keyfiles();
+        whisker_core::vault::with_keyfiles(pass, &files).map_err(|e| format!("Couldn't read a keyfile: {e}"))
+    }
+
+    /// Shows the keyfiles picked for each passphrase box (their names).
+    fn show_keyfiles(&self) {
+        let names = |k: &str| -> Vec<SharedString> {
+            self.st.lock().unwrap().keyfiles.get(k).map(|l| l.iter().map(|p| s(p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())).collect()).unwrap_or_default()
+        };
+        let all = [names("unlock"), names("hidden"), names("old"), names("new")];
+        self.ui(move |u| {
+            let [a, b, c, d] = all.clone();
+            let k = u.global::<Keyfiles>();
+            k.set_unlock(ModelRc::new(VecModel::from(a)));
+            k.set_hidden(ModelRc::new(VecModel::from(b)));
+            k.set_old(ModelRc::new(VecModel::from(c)));
+            k.set_new(ModelRc::new(VecModel::from(d)));
+        });
+    }
+
+    async fn add_keyfiles(&self, slot: String) {
+        let picked = pick_paths("Pick keyfiles", &[], true).await;
+        if picked.is_empty() {
+            return;
+        }
+        {
+            let mut st = self.st.lock().unwrap();
+            let list = st.keyfiles.entry(slot).or_default();
+            for p in picked {
+                if !list.contains(&p) {
+                    list.push(p);
+                }
+            }
+        }
+        self.show_keyfiles();
+    }
+
+    async fn clear_keyfiles(&self, slot: String) {
+        self.st.lock().unwrap().keyfiles.remove(&slot);
+        self.show_keyfiles();
+    }
+
+    /// Writes a new random keyfile where the user says.
+    async fn make_keyfile(&self) {
+        let Some(path) = save_file_as("Save the new keyfile", "whisker.key".to_owned()).await else { return };
+        if let Err(e) = whisker_core::vault::make_keyfile(&path) {
+            return self.keyfile_msg(format!("Couldn't write the keyfile: {e}"));
+        }
+        let msg = match finish_save(&path, "application/octet-stream").await {
+            Ok(shown) => format!("Keyfile saved to {shown}. Add it with Keyfiles… Keep a copy somewhere safe: without it the vault won't open."),
+            Err(e) => format!("Couldn't save the keyfile: {e}"),
+        };
+        self.keyfile_msg(msg);
+    }
+
+    /// Said where the keyfile was asked for: the unlock screen, or settings.
+    fn keyfile_msg(&self, m: String) {
+        self.ui(move |u| {
+            if u.get_screen() == 0 {
+                u.set_error(s(&m));
+            } else {
+                u.set_settings_message(s(&m));
+            }
         });
     }
 
@@ -8323,6 +8444,24 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     }
     on!(on_unlock_more, |p| unlock_more);
     on!(on_lock_hidden, lock_hidden);
+    {
+        let k = ui.global::<Keyfiles>();
+        let c = ctl.clone();
+        k.on_add(move |slot| {
+            let (c2, slot) = (c.clone(), slot.to_string());
+            c.spawn(async move { c2.add_keyfiles(slot).await });
+        });
+        let c = ctl.clone();
+        k.on_clear(move |slot| {
+            let (c2, slot) = (c.clone(), slot.to_string());
+            c.spawn(async move { c2.clear_keyfiles(slot).await });
+        });
+        let c = ctl.clone();
+        k.on_make(move || {
+            let c2 = c.clone();
+            c.spawn(async move { c2.make_keyfile().await });
+        });
+    }
     on!(on_profile_picture, |a| profile_picture);
     on!(on_create_hidden, |p| create_hidden);
     on!(on_select_account, |id| select_account);

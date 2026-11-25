@@ -18,6 +18,7 @@ whisker-agent.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 # SVG pictures (Slint already builds these): drawn here, never fetching
 # anything an SVG names.

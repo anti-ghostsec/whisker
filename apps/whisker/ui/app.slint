@@ -1,5 +1,6 @@
 import { ListView, ScrollView, Palette, TextEdit, Switch, ComboBox } from "std-widgets.slint";
-import { Theme, Prefs, TextTools, Avatar, AiBadge, Btn, IconBtn, Input, Pill } from "theme.slint";
+import { Theme, Prefs, TextTools, Avatar, AiBadge, Btn, IconBtn, Input, Pill, Keyfiles, KeyfileRow } from "theme.slint";
+export { Keyfiles }
 import { SettingsPage, AccountForm, AgentForm, NavItem, ModelInfo, DeviceRow } from "settings.slint";
 // Colour emoji for all text (a trimmed Noto Color Emoji: no letters, digits
 // or spaces, so text still comes from the normal fonts). See assets/fonts.
@@ -1674,6 +1675,8 @@ component UnlockScreen inherits Rectangle {
                     enabled: !root.busy;
                     accepted(t) => { root.submit(t); self.text = ""; }
                 }
+                // Optional: files that are needed too (VeraCrypt-style).
+                KeyfileRow { slot: "unlock"; names: Keyfiles.unlock; can-make: root.first-run; }
                 Btn {
                     text: root.busy ? "Unlocking…" : root.first-run ? "Create vault" : "Unlock";
                     primary: true;

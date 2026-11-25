@@ -9961,6 +9961,7 @@ dependencies = [
  "whisker-agent",
  "whisker-core",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]

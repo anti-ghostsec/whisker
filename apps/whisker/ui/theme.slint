@@ -41,6 +41,18 @@ export global TextTools {
     in-out property <int> shade-version;
 }
 
+// VeraCrypt-style keyfiles picked for a passphrase box: their names, per
+// box ("unlock", "hidden", "old", "new"). The files themselves stay in Rust.
+export global Keyfiles {
+    in-out property <[string]> unlock;
+    in-out property <[string]> hidden;
+    in-out property <[string]> old;
+    in-out property <[string]> new;
+    callback add(string);
+    callback clear(string);
+    callback make();
+}
+
 export global Prefs {
     // A touch screen (Android): no mouse, so no drag-selecting text.
     in-out property <bool> touch: false;
@@ -324,4 +336,20 @@ export component Pill inherits Rectangle {
     border-radius: 9px;
     background: strong ? Theme.accent : Theme.accent-soft;
     t := Text { text: root.text; font-size: 10px; font-weight: 700; color: root.strong ? Theme.on-accent : Theme.text; }
+}
+
+// The keyfiles for one passphrase box: what's picked, add more, forget them.
+export component KeyfileRow inherits VerticalLayout {
+    in property <string> slot;
+    in property <[string]> names;
+    in property <bool> can-make: true;
+    spacing: 4px;
+    HorizontalLayout {
+        spacing: 6px;
+        alignment: start;
+        Btn { text: root.names.length == 0 ? "Keyfiles…" : "Add keyfile…"; clicked => { Keyfiles.add(root.slot); } }
+        if root.names.length > 0: Btn { text: "Clear"; clicked => { Keyfiles.clear(root.slot); } }
+        if root.names.length == 0 && root.can-make: Btn { text: "Make a keyfile…"; clicked => { Keyfiles.make(); } }
+    }
+    for n in root.names: Text { text: "🔑 " + n; font-size: 12px; color: Theme.text; overflow: elide; }
 }

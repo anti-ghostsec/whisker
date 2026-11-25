@@ -459,6 +459,50 @@ fn derive(
     Ok(key)
 }
 
+/// How much of a keyfile counts (as in VeraCrypt): its first 1 MiB.
+const KEYFILE_BYTES: u64 = 1024 * 1024;
+
+/// The secret a vault is keyed by: the passphrase alone, or with keyfiles
+/// (VeraCrypt-style: any files, in any order, all needed). Each keyfile's
+/// first MiB is hashed; the hashes, sorted, are hashed together and joined
+/// to the passphrase. The vault file looks the same either way, so nothing
+/// on disk says keyfiles are used. An empty file is refused (every empty
+/// file would do).
+pub fn with_keyfiles(passphrase: &str, keyfiles: &[PathBuf]) -> std::io::Result<Zeroizing<String>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    if keyfiles.is_empty() {
+        return Ok(Zeroizing::new(passphrase.to_owned()));
+    }
+    let mut hashes = Vec::new();
+    for k in keyfiles {
+        let mut bytes = Zeroizing::new(Vec::new());
+        std::fs::File::open(k)?.take(KEYFILE_BYTES).read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{} is empty, so it can't be a keyfile", k.file_name().map(|n| n.to_string_lossy()).unwrap_or_default())));
+        }
+        let mut h = Sha256::new();
+        h.update(b"whisker keyfile v1\0");
+        h.update(&*bytes);
+        hashes.push(<[u8; 32]>::from(h.finalize()));
+    }
+    hashes.sort();
+    let mut all = Sha256::new();
+    all.update(b"whisker keyfiles v1\0");
+    for h in &hashes {
+        all.update(h);
+    }
+    let mixed: String = all.finalize().iter().map(|x| format!("{x:02x}")).collect();
+    Ok(Zeroizing::new(format!("{passphrase}\0keyfiles:{mixed}")))
+}
+
+/// Writes a new keyfile: 64 random bytes.
+pub fn make_keyfile(path: &Path) -> std::io::Result<()> {
+    let mut b = Zeroizing::new([0u8; 64]);
+    getrandom::fill(&mut *b).map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(path, &*b)
+}
+
 /// Random secret for things like per-account store passphrases.
 pub fn random_secret() -> String {
     let mut b = [0u8; 32];
@@ -468,6 +512,27 @@ pub fn random_secret() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyfiles() {
+        let dir = std::env::temp_dir().join(format!("whisker-keyfiles-{}", super::random_secret()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, empty) = (dir.join("a"), dir.join("b"), dir.join("e"));
+        super::make_keyfile(&a).unwrap();
+        std::fs::write(&b, b"a photo, say").unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        let none = super::with_keyfiles("pass", &[]).unwrap();
+        assert_eq!(*none, "pass");
+        let ab = super::with_keyfiles("pass", &[a.clone(), b.clone()]).unwrap();
+        // Any order; every file needed; the passphrase still counts.
+        assert_eq!(*ab, *super::with_keyfiles("pass", &[b.clone(), a.clone()]).unwrap());
+        assert_ne!(*ab, *super::with_keyfiles("pass", std::slice::from_ref(&a)).unwrap());
+        assert_ne!(*ab, *super::with_keyfiles("other", &[a.clone(), b.clone()]).unwrap());
+        // Without a passphrase, keyfiles alone.
+        assert!(super::with_keyfiles("", std::slice::from_ref(&a)).unwrap().len() > 8);
+        assert!(super::with_keyfiles("pass", &[empty]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_crashed_save_is_finished_by_its_own_passphrase_only() {
         let dir = std::env::temp_dir().join(format!("whisker-journal-test-{}", random_secret()));

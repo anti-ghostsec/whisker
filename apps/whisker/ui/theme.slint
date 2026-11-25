@@ -29,6 +29,10 @@ export global TextTools {
     in-out property <bool> spanning;
     // Copies the dragged selection, or `fallback` when there is none.
     callback copy-selection(string);
+    // Bumped by the menu's Copy when the selection is in text with links
+    // (a StyledText, whose selected text can't be read out): the one that
+    // has a selection copies it itself.
+    in-out property <int> copy-styled;
     // Shading over selected text that can't show a selection itself:
     // whether piece "list|id|part" is shaded (asked again when the
     // version changes).

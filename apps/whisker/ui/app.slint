@@ -349,6 +349,8 @@ component Blocks inherits VerticalLayout {
     // and a tap is `tapped` (the message opens its link).
     callback press(PointerEvent);
     callback tapped();
+    // Text with links got or lost a selection (the menu's Copy then copies it).
+    callback styled(bool);
     // Names this message's text for selecting across messages ("list|id").
     in property <string> key;
     // The text selected in one of the blocks ("" when none is).
@@ -364,6 +366,13 @@ component Blocks inherits VerticalLayout {
                 default-color: b.kind == 1 || root.faint ? Theme.muted : Theme.text;
                 link-color: Theme.accent;
                 link-clicked(l) => { root.link(l); }
+                // Selectable with the mouse, like the rest of the text (a
+                // click that doesn't drag still follows a link).
+                selectable: !Prefs.touch;
+                selection-background-color: Theme.accent.transparentize(0.55);
+                property <int> copy-asked: TextTools.copy-styled;
+                changed copy-asked => { if self.has-selection { self.copy(); } }
+                changed has-selection => { root.styled(self.has-selection); }
                 if Prefs.touch: TouchArea {
                     pointer-event(e) => { root.press(e); }
                     clicked => { root.tapped(); }
@@ -738,6 +747,8 @@ component MessageRow inherits Rectangle {
     property <bool> sounding: root.item.media == 3 && Player.id == root.item.id;
     // Text selected in the message, for the menu's Copy.
     property <string> selection;
+    // Text with links selected in the message (it copies itself).
+    property <bool> styled-selection;
     // Lit for a moment: a click on a reply to it just scrolled here.
     in property <bool> flash;
     // Scrolled well out of view. Nothing of it is drawn then (without the
@@ -774,8 +785,8 @@ component MessageRow inherits Rectangle {
             // Phones get the big menu instead.
             enabled: !Prefs.touch;
             Menu {
-                if root.selection != "" || TextTools.spanning: MenuItem { title: "Copy"; activated => { TextTools.copy-selection(root.selection); } }
-                if root.selection != "" || TextTools.spanning: MenuSeparator {}
+                if root.selection != "" || root.styled-selection || TextTools.spanning: MenuItem { title: "Copy"; activated => { if root.styled-selection && !TextTools.spanning { TextTools.copy-styled += 1; } else { TextTools.copy-selection(root.selection); } } }
+                if root.selection != "" || root.styled-selection || TextTools.spanning: MenuSeparator {}
                 if root.shown.media == 1: MenuItem { title: "Save image…"; activated => { root.action("save", root.shown.id); } }
                 if root.shown.media == 1: MenuItem { title: "Save as sticker…"; activated => { root.action("save-sticker", root.shown.id); } }
                 if root.shown.media == 1: MenuItem { title: "Save as emoji…"; activated => { root.action("save-emoji", root.shown.id); } }
@@ -1067,7 +1078,7 @@ component MessageRow inherits Rectangle {
                             spacing: 4px;
                             for pic in root.item.big-emoji: Image { source: pic; width: 40px; height: 40px; }
                         }
-                        if (root.item.media == 0 || root.item.caption) && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.go(l); } selected(t) => { root.selection = t; } press(e) => { root.press(e); }
+                        if (root.item.media == 0 || root.item.caption) && root.item.big-emoji.length == 0: Blocks { key: root.list + "|" + root.item.id; avail: root.width - 32px - 36px - 12px; blocks: root.item.blocks; faint: root.item.faint; link(l) => { root.go(l); } selected(t) => { root.selection = t; } styled(on) => { root.styled-selection = on; } press(e) => { root.press(e); }
                             // A tap on text with links: its one link opens, or the menu with them all.
                             tapped => { if !root.held { if root.item.links.length == 1 { root.link(root.item.links[0]); } else if root.item.links.length > 1 { root.held = true; root.hold(root.item); } } } }
                         if root.item.edited: Text { text: "(edited)"; font-size: 10px; color: Theme.muted; }

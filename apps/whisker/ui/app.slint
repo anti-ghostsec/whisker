@@ -594,55 +594,6 @@ component VolumeSlider inherits Rectangle {
     }
 }
 
-// The sound level as a bar across (in the video's own control bar).
-component LevelSlider inherits Rectangle {
-    in-out property <int> value;
-    callback committed(int);
-    callback touched();
-    height: 24px;
-    property <length> pad: 8px;
-    property <length> track: self.width - 2 * self.pad;
-    function at(x: length) {
-        root.value = round(max(0, min(100, (x - root.pad) / root.track * 100)));
-    }
-    Rectangle {
-        x: root.pad;
-        y: (parent.height - 4px) / 2;
-        width: root.track;
-        height: 4px;
-        border-radius: 2px;
-        background: #ffffff40;
-        Rectangle {
-            x: 0;
-            width: parent.width * root.value / 100;
-            border-radius: 2px;
-            background: Theme.accent;
-        }
-    }
-    Rectangle {
-        width: 16px;
-        height: 16px;
-        border-radius: 8px;
-        background: white;
-        x: root.pad + root.track * root.value / 100 - self.width / 2;
-        y: (parent.height - self.height) / 2;
-    }
-    TouchArea {
-        mouse-cursor: pointer;
-        pointer-event(e) => {
-            root.touched();
-            if e.kind == PointerEventKind.down {
-                root.at(self.mouse-x);
-            } else if e.kind == PointerEventKind.up {
-                root.committed(root.value);
-            }
-        }
-        moved => {
-            if self.pressed { root.at(self.mouse-x); root.touched(); }
-        }
-    }
-}
-
 // Play/pause, time, seek bar, length, repeat, subtitles, sound and size, over a playing video.
 component VideoBar inherits Rectangle {
     in property <string> id;
@@ -658,10 +609,6 @@ component VideoBar inherits Rectangle {
     TouchArea {}
     // Lets the controls hide again a few seconds after the level was last touched.
     property <int> idle;
-    // The sound level is showing, over the bar. (Not a popup: one in a
-    // scrolled chat came up far from the video.)
-    property <bool> level-open;
-    changed idle => { if root.idle >= 4 { root.level-open = false; } }
     Timer {
         interval: 1s;
         running: Player.bar-hold;
@@ -732,7 +679,38 @@ component VideoBar inherits Rectangle {
                 clicked => {
                     root.idle = 0;
                     Player.bar-hold = true;
-                    root.level-open = true;
+                    volume-popup.show();
+                }
+            }
+            // The level, with the speaker below it to turn the sound off and on.
+            volume-popup := PopupWindow {
+                x: (parent.width - 44px) / 2;
+                y: -186px;
+                width: 44px;
+                height: 180px;
+                close-policy: close-on-click-outside;
+                Rectangle {
+                    border-radius: 10px;
+                    background: #000000d0;
+                    VerticalLayout {
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        alignment: center;
+                        Text { text: Player.muted ? "off" : Player.volume + "%"; color: white; font-size: 10px; horizontal-alignment: center; }
+                        HorizontalLayout {
+                            alignment: center;
+                            VolumeSlider {
+                                value: Player.muted ? 0 : Player.volume;
+                                committed(v) => { Player.set-volume(v); }
+                                touched => { root.idle = 0; }
+                            }
+                        }
+                        Rectangle {
+                            height: 22px;
+                            Text { text: Player.muted ? "Unmute" : "Mute"; color: Player.muted ? Theme.accent : white; font-size: 10px; font-weight: 600; }
+                            TouchArea { mouse-cursor: pointer; clicked => { root.idle = 0; Player.mute(); } }
+                        }
+                    }
                 }
             }
         }
@@ -749,40 +727,6 @@ component VideoBar inherits Rectangle {
                     : "M 1 5 L 1 1 L 5 1 M 9 1 L 13 1 L 13 5 M 1 9 L 1 13 L 5 13 M 13 9 L 13 13 L 9 13";
             }
             TouchArea { mouse-cursor: pointer; clicked => { Player.set-large(!Player.large); } }
-        }
-    }
-    // The sound level, across the whole bar: off and on, the level, done.
-    if root.level-open: Rectangle {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        height: parent.height;
-        background: #000000e0;
-        TouchArea { clicked => { root.idle = 0; } }
-        HorizontalLayout {
-            y: root.stacked ? 12px : 0px;
-            height: 30px;
-            padding-left: 8px;
-            padding-right: 8px;
-            spacing: 6px;
-            Rectangle {
-                width: 52px;
-                Text { text: Player.muted ? "Unmute" : "Mute"; color: Player.muted ? Theme.accent : white; font-size: 11px; font-weight: 600; }
-                TouchArea { mouse-cursor: pointer; clicked => { root.idle = 0; Player.mute(); } }
-            }
-            LevelSlider {
-                horizontal-stretch: 1;
-                y: 3px;
-                value: Player.muted ? 0 : Player.volume;
-                committed(v) => { Player.set-volume(v); }
-                touched => { root.idle = 0; }
-            }
-            Text { width: 34px; text: Player.muted ? "off" : Player.volume + "%"; color: white; font-size: 11px; vertical-alignment: center; horizontal-alignment: right; }
-            Rectangle {
-                width: 24px;
-                Text { text: "✕"; color: white; font-size: 13px; }
-                TouchArea { mouse-cursor: pointer; clicked => { root.level-open = false; } }
-            }
         }
     }
 }
@@ -3506,6 +3450,8 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     alignment: center;
                                     ContextMenuArea {
+                                        width: 112px;
+                                        height: 112px;
                                         enabled: root.profile.avatar.width > 0;
                                         Menu {
                                             MenuItem { title: "Open picture"; activated => { root.profile-picture("view"); } }

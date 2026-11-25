@@ -33,6 +33,9 @@ export struct AccountForm {
     recovery-on: bool,
     // A recovery key just made, to write down.
     recovery-key: string,
+    // The vaults open now ("Main vault", "Hidden vault 1"…), and which keeps this account.
+    vaults: [string],
+    vault: int,
 }
 
 // One of an account's sessions (logins), for the account page.
@@ -269,6 +272,7 @@ component GeneralPage inherits VerticalLayout {
     callback change-passphrase(string, string);
     callback unlock-hidden(string);
     callback create-hidden(string);
+    callback lock-hidden();
     callback new-ai();
     spacing: 14px;
 
@@ -719,6 +723,17 @@ component GeneralPage inherits VerticalLayout {
             Btn { text: "Unlock"; enabled: hidden-pass.text != ""; clicked => { root.unlock-hidden(hidden-pass.text); hidden-pass.text = ""; } }
             Btn { text: "Create new"; enabled: hidden-pass.text != ""; clicked => { root.create-hidden(hidden-pass.text); hidden-pass.text = ""; } }
         }
+        if Prefs.hidden-vaults > 0: Text {
+            text: (Prefs.hidden-vaults == 1 ? "A hidden vault is unlocked." : Prefs.hidden-vaults + " hidden vaults are unlocked.")
+                + " To put accounts you already have in it, open the account below and pick it under Vault. Locking hides its accounts again; the rest stay signed in.";
+            wrap: word-wrap;
+            font-size: 12px;
+            color: Theme.muted;
+        }
+        if Prefs.hidden-vaults > 0: HorizontalLayout {
+            alignment: start;
+            Btn { text: Prefs.hidden-vaults == 1 ? "Lock hidden vault" : "Lock hidden vaults"; clicked => { root.lock-hidden(); } }
+        }
     }
     Card {
         title: "Privacy & encryption";
@@ -959,6 +974,19 @@ component AccountPage inherits VerticalLayout {
             alignment: start;
             if !root.account.is-agent: Btn { text: "Use this account as an AI"; clicked => { root.profile-edit("make-ai", root.account.id, ""); } }
             if root.account.is-agent: Btn { text: "Turn back into a normal account"; clicked => { root.profile-edit("make-human", root.account.id, ""); } }
+        }
+    }
+    if root.account.vaults.length > 1 && !root.account.is-agent: Card {
+        title: "Vault";
+        subtitle: "Which of your unlocked vaults keeps this account. Moving it keeps it signed in, with its keys and messages: it then only appears when that vault is unlocked, and the other vault keeps nothing of it.";
+        HorizontalLayout {
+            alignment: start;
+            ComboBox {
+                width: 220px;
+                model: root.account.vaults;
+                current-index: root.account.vault;
+                selected => { if self.current-index != root.account.vault { root.profile-edit("move-vault", root.account.id, self.current-index); } }
+            }
         }
     }
     Card {
@@ -1517,6 +1545,7 @@ export component SettingsPage inherits Rectangle {
     callback change-passphrase(string, string);
     callback unlock-hidden(string);
     callback create-hidden(string);
+    callback lock-hidden();
 
     // On phones the sidebar and the page take turns.
     property <bool> show-nav: !narrow || selected == "";
@@ -1611,6 +1640,7 @@ export component SettingsPage inherits Rectangle {
                             change-passphrase(o, n) => { root.change-passphrase(o, n); }
                             unlock-hidden(p) => { root.unlock-hidden(p); }
                             create-hidden(p) => { root.create-hidden(p); }
+                            lock-hidden => { root.lock-hidden(); }
                             new-ai => { root.new-ai(); }
                         }
                         if root.selected != "" && root.account.id != "" && root.selected == "account:" + root.account.id: AccountPage {

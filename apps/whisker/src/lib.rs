@@ -193,6 +193,8 @@ struct State {
     vault_stickers: HashMap<VaultId, (Vec<Sticker>, Vec<Sticker>)>,
     /// The vault each signed-in account is kept in.
     account_vaults: HashMap<AccountId, VaultId>,
+    /// The vaults last listed in settings, in order, with their names.
+    vault_names: Vec<(VaultId, String)>,
     /// The vault `stickers` and `emoji` are from now.
     sticker_vault: Option<VaultId>,
     /// The save dialog is saving a custom emoji, not a sticker.
@@ -1305,10 +1307,124 @@ impl Ctl {
             }
         }
         self.refresh_accounts().await;
+        self.show_hidden_count().await;
         let waiting = !self.st.lock().unwrap().sharing.is_empty();
         if waiting {
             self.open_share().await;
         }
+    }
+
+    /// The open vaults, the one unlocked at the start first, with their
+    /// names as shown ("Main vault", "Hidden vault 1"…).
+    async fn vault_list(&self) -> Vec<(VaultId, String)> {
+        let mut open = self.mgr.open_vaults().await;
+        open.sort();
+        let main = self.st.lock().unwrap().main_vault.clone();
+        if let Some(m) = &main
+            && let Some(i) = open.iter().position(|v| v == m)
+        {
+            let m = open.remove(i);
+            open.insert(0, m);
+        }
+        let mut n = 0;
+        let list: Vec<(VaultId, String)> = open
+            .into_iter()
+            .map(|v| {
+                if Some(&v) == main.as_ref() {
+                    (v, "Main vault".to_owned())
+                } else {
+                    n += 1;
+                    (v, format!("Hidden vault {n}"))
+                }
+            })
+            .collect();
+        self.st.lock().unwrap().vault_names = list.clone();
+        list
+    }
+
+    /// The `i`th vault as last shown by [`Self::vault_list`].
+    fn vault_list_now(&self, i: usize) -> Option<(VaultId, String)> {
+        self.st.lock().unwrap().vault_names.get(i).cloned()
+    }
+
+    /// Says in settings how many hidden vaults are open.
+    async fn show_hidden_count(&self) {
+        let n = self.vault_list().await.iter().filter(|(_, n)| n != "Main vault").count() as i32;
+        self.ui(move |u| u.global::<Prefs>().set_hidden_vaults(n));
+    }
+
+    /// Locks every vault but the one unlocked at the start: their accounts
+    /// stop and vanish, the others keep running.
+    async fn lock_hidden(&self) {
+        let list = self.vault_list().await;
+        let hidden: Vec<VaultId> = list.into_iter().filter(|(_, n)| n != "Main vault").map(|(v, _)| v).collect();
+        if hidden.is_empty() {
+            return;
+        }
+        let gone: HashSet<AccountId> = self.mgr.accounts().await.into_iter().filter(|a| hidden.contains(&a.vault)).map(|a| a.id).collect();
+        // Their AI agents stop first.
+        {
+            let mut st = self.st.lock().unwrap();
+            for id in &gone {
+                if let Some(h) = st.agents.remove(id) {
+                    h.abort();
+                }
+            }
+        }
+        if self.current().is_some_and(|k| gone.contains(&k.0)) {
+            let ui = self.ui.clone();
+            let _ = tokio::task::spawn_blocking(move || stop_all_media(&ui)).await;
+        }
+        for v in &hidden {
+            self.mgr.lock_vault(v).await;
+        }
+        // Nothing of theirs stays in memory or on screen.
+        {
+            let mut st = self.st.lock().unwrap();
+            let theirs = |k: &RoomKey| gone.contains(&k.0);
+            st.messages.retain(|k, _| !theirs(k));
+            st.older.retain(|k, _| !theirs(k));
+            st.older_failed.retain(|k, _| !theirs(k));
+            st.reactions.retain(|k, _| !theirs(k));
+            st.votes.retain(|k, _| !theirs(k));
+            st.space_rooms.retain(|k, _| !theirs(k));
+            st.redecrypting.retain(|k| !theirs(k));
+            st.notified.retain(|k, _| !theirs(k));
+            st.typing.retain(|k, _| !theirs(k));
+            st.members_cache.retain(|k, _| !theirs(k));
+            st.marks.retain(|k, _| !theirs(k));
+            st.marks_pending.retain(|k| !theirs(k));
+            st.cleared.retain(|k, _| !theirs(k));
+            st.fresh.retain(|k, _| !theirs(k));
+            st.trust.retain(|k, _| !gone.contains(&k.0));
+            st.synced.retain(|a| !gone.contains(a));
+            st.offline.retain(|a| !gone.contains(a));
+            st.detected.retain(|a, _| !gone.contains(a));
+            st.pending_cards.retain(|a, _| !gone.contains(a));
+            st.twin_queue.retain(|(a, b), _| !gone.contains(a) && !gone.contains(b));
+            if st.files.as_ref().is_some_and(|f| theirs(&f.key)) {
+                st.files = None;
+            }
+            if st.account.is_some_and(|a| gone.contains(&a)) {
+                st.account = None;
+                st.room = None;
+                st.thread = None;
+                st.reply_to = None;
+                st.editing = None;
+            }
+            if st.active_vault.as_ref().is_some_and(|v| hidden.contains(v)) {
+                st.active_vault = st.main_vault.clone();
+            }
+            st.vault_stickers.retain(|v, _| !hidden.contains(v));
+        }
+        self.note_account_vaults().await;
+        self.sticker_vault_changed(true);
+        self.refresh_accounts().await;
+        self.refresh_rooms().await;
+        self.show_messages().await;
+        self.show_hidden_count().await;
+        self.open_settings("general".to_owned()).await;
+        self.settings_msg("Hidden vaults locked. Their accounts are gone until you unlock them again.");
     }
 
     async fn unlock_more(&self, pass: String) {
@@ -1316,7 +1432,8 @@ impl Ctl {
             Ok(v) if v.is_empty() => self.settings_msg("No locked vault opens with that passphrase."),
             Ok(v) => {
                 self.after_unlock(v).await;
-                self.settings_msg("Hidden vault unlocked. New accounts go into it until you lock.");
+                self.show_hidden_count().await;
+                self.settings_msg("Hidden vault unlocked. New accounts go into it until you lock it, and accounts you have can be moved into it (open one below, then Vault).");
             }
             Err(e) => self.settings_msg(format!("{e:#}")),
         }
@@ -1338,7 +1455,8 @@ impl Ctl {
         match self.mgr.create_vault(&pass).await {
             Ok(v) => {
                 self.st.lock().unwrap().active_vault = Some(v);
-                self.settings_msg("Hidden vault created. Accounts you add now go into it.");
+                self.show_hidden_count().await;
+                self.settings_msg("Hidden vault created. Accounts you add now go into it, and accounts you have can be moved into it (open one below, then Vault).");
             }
             Err(e) => self.settings_msg(format!("{e:#}")),
         }
@@ -2776,6 +2894,23 @@ impl Ctl {
                         self.settings_msg("This account is a normal account again.");
                     }
                     Err(e) => self.settings_msg(format!("{e:#}")),
+                }
+                return;
+            }
+            "move-vault" => {
+                let Some((to, name)) = value.parse::<usize>().ok().and_then(|i| self.vault_list_now(i)) else { return };
+                match self.mgr.move_to_vault(aid, &to).await {
+                    Ok(()) => {
+                        self.note_account_vaults().await;
+                        self.sticker_vault_changed(false);
+                        self.refresh_accounts().await;
+                        self.open_settings(format!("account:{aid}")).await;
+                        self.settings_msg(if name == "Main vault" { "Moved to your main vault.".to_owned() } else { format!("Moved to {name}. It now only shows while that vault is unlocked.") });
+                    }
+                    Err(e) => {
+                        self.open_settings(format!("account:{aid}")).await;
+                        self.settings_msg(format!("Couldn't move it: {e:#}"));
+                    }
                 }
                 return;
             }
@@ -6936,6 +7071,8 @@ impl Ctl {
 
         // Plain data for the account page; the Slint struct is built on the UI thread.
         let mut account_data: Option<(AccountSummary, Option<String>, Option<String>)> = None;
+        let vault_list = self.vault_list().await;
+        let vault_names: Vec<SharedString> = vault_list.iter().map(|(_, n)| s(n)).collect();
         // This login (session): 2 verified, 1 not, 0 not signed in; and its device id.
         let mut session = (0, String::new());
         let mut identity = (false, false);
@@ -7056,6 +7193,8 @@ impl Ctl {
                         has_identity: identity.0,
                         recovery_on: identity.1,
                         recovery_key: s(""),
+                        vault: vault_list.iter().position(|(v, _)| *v == a.vault).unwrap_or(0) as i32,
+                        vaults: ModelRc::new(VecModel::from(vault_names.clone())),
                     }
                 }
                 None => AccountForm::default(),
@@ -8110,6 +8249,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         }
     }
     on!(on_unlock_more, |p| unlock_more);
+    on!(on_lock_hidden, lock_hidden);
     on!(on_create_hidden, |p| create_hidden);
     on!(on_select_account, |id| select_account);
     on!(on_select_room, |id| select_room);

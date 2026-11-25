@@ -775,6 +775,54 @@ impl AccountManager {
         let _ = self.events.send(ClientEvent::AccountsChanged);
     }
 
+    /// Moves a signed-in account from its vault into another open one
+    /// (a hidden vault, say), session, keys and all: it keeps running, and
+    /// from now on appears only when that vault is unlocked. Its old vault
+    /// keeps nothing of it. Not AI accounts (their agent lives in the
+    /// vault's list of agents).
+    pub async fn move_to_vault(&self, id: AccountId, to: &str) -> Result<()> {
+        let from = {
+            let mut inner = self.inner.write().await;
+            let live = inner.live.get(&id).ok_or_else(|| anyhow!("that account isn't signed in"))?;
+            if live.record.kind == AccountKind::Agent {
+                bail!("AI accounts can't be moved to another vault yet");
+            }
+            let from = live.vault.clone();
+            if from == to {
+                return Ok(());
+            }
+            if !inner.vaults.contains_key(to) {
+                bail!("that vault is locked");
+            }
+            let src = inner.vaults.get_mut(&from).ok_or_else(|| anyhow!("the account's vault is locked"))?;
+            let Some(at) = src.profile.accounts.iter().position(|r| r.id == id) else { bail!("the account isn't in its vault") };
+            let record = src.profile.accounts.remove(at);
+            let packed: Vec<(String, Vec<u8>)> = [store_key(id), media_key(id)].into_iter().filter_map(|k| src.attachments.remove(&k).map(|v| (k, v))).collect();
+            // Things kept about this account alone (its card picture…).
+            let mine = id.to_string();
+            let extras: Vec<(String, serde_json::Value)> = src.profile.extras.keys().filter(|k| k.ends_with(&mine)).cloned().collect::<Vec<_>>().into_iter().filter_map(|k| src.profile.extras.remove(&k).map(|v| (k, v))).collect();
+            src.version += 1;
+            let dst = inner.vaults.get_mut(to).expect("checked above");
+            let mut record = record;
+            record.position = dst.profile.accounts.iter().map(|r| r.position + 1).max().unwrap_or(0);
+            dst.profile.accounts.push(record.clone());
+            dst.attachments.extend(packed);
+            dst.profile.extras.extend(extras);
+            dst.version += 1;
+            if let Some(l) = inner.live.get_mut(&id) {
+                l.vault = to.to_owned();
+                l.record = record;
+            }
+            from
+        };
+        // Into the new vault first: a crash in between leaves it in both,
+        // never in neither.
+        self.save_vault(to).await?;
+        self.save_vault(&from).await?;
+        let _ = self.events.send(ClientEvent::AccountsChanged);
+        Ok(())
+    }
+
     pub async fn open_vaults(&self) -> Vec<VaultId> {
         self.inner.read().await.vaults.keys().cloned().collect()
     }

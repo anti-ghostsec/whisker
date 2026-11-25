@@ -2357,6 +2357,7 @@ export component AppWindow inherits Window {
 
     callback unlock(string);
     callback unlock-more(string);
+    callback lock-hidden();
     callback create-hidden(string);
     callback lock();
     callback filter-tag(string);
@@ -3891,6 +3892,7 @@ export component AppWindow inherits Window {
             filter-image-models(q) => { root.filter-image-models(q); }
             change-passphrase(o, n) => { root.activity(); root.change-passphrase(o, n); }
             unlock-hidden(p) => { root.unlock-more(p); }
+            lock-hidden => { root.activity(); root.lock-hidden(); }
             create-hidden(p) => { root.create-hidden(p); }
         }
 

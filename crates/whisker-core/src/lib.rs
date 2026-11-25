@@ -3,6 +3,7 @@
 //! Shared by the GUI and the headless agent daemon.
 
 pub mod accounts;
+pub mod addresses;
 pub mod anoncat;
 pub mod devices;
 pub mod events;

@@ -132,6 +132,10 @@ pub struct AccountManager {
     /// Keep the media cache in the vault (packed in on lock, back at
     /// unlock) instead of only in memory.
     media_in_vault: Arc<std::sync::atomic::AtomicBool>,
+    /// anoncat's signed address list (see [`crate::addresses`]).
+    addresses: Arc<tokio::sync::Mutex<crate::addresses::Store>>,
+    /// Whether the daily address list check is running.
+    address_checks: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct LoginRequest<'a> {
@@ -208,6 +212,8 @@ impl AccountManager {
             key_sharing: Arc::new(std::sync::atomic::AtomicU8::new(1)),
             media_cache: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_MEDIA_CACHE)),
             media_in_vault: Arc::default(),
+            addresses: Arc::new(tokio::sync::Mutex::new(crate::addresses::Store::load(&data_dir.join("addresses.json")))),
+            address_checks: Arc::default(),
             data_dir,
             inner: Arc::default(),
             latest: Arc::default(),
@@ -867,6 +873,21 @@ impl AccountManager {
                 break;
             }
         }
+        // Not where the server says (or it couldn't be asked): where
+        // anoncat's signed list says, fetched again if it's been a while.
+        if found.is_none() && !better_only && crate::addresses::enabled() {
+            self.check_addresses(crate::addresses::AT_MOST).await;
+            let listed = {
+                let st = self.addresses.lock().await;
+                st.current().map(|l| crate::addresses::homeservers(l, &server, &record.homeserver, record.proxy.is_some())).unwrap_or_default()
+            };
+            for c in listed {
+                if crate::moves::confirm(&c, &record.user_id, &token, record.proxy.as_deref()).await {
+                    found = Some(c);
+                    break;
+                }
+            }
+        }
         let Some(now) = found else { return };
         // Locked, or signed out, while this was checking.
         if !self.inner.read().await.live.contains_key(&account) {
@@ -903,6 +924,51 @@ impl AccountManager {
             a.avatar = a.avatar.take().or(avatar);
         }
         let _ = self.events.send(ClientEvent::Moved { account });
+    }
+
+    /// Fetches anoncat's address list again if it's been `since` (and an
+    /// account here is on a server it's about). Through such an account's
+    /// proxy, if one has one.
+    async fn check_addresses(&self, since: std::time::Duration) {
+        if !crate::addresses::enabled() {
+            return;
+        }
+        let accounts: Vec<(String, Option<String>)> = self
+            .inner
+            .read()
+            .await
+            .live
+            .values()
+            .filter_map(|a| Some((a.record.user_id.split_once(':')?.1.to_owned(), a.record.proxy.clone())))
+            .collect();
+        let proxy = {
+            let st = self.addresses.lock().await;
+            if st.fetched.is_some_and(|t| t.elapsed() < since) {
+                return;
+            }
+            let ours: Vec<_> = accounts.into_iter().filter(|(s, _)| st.covers(s)).collect();
+            if ours.is_empty() {
+                return;
+            }
+            ours.into_iter().find_map(|(_, p)| p)
+        };
+        crate::addresses::fetch(&self.addresses, proxy.as_deref(), &self.data_dir.join("addresses.json")).await;
+    }
+
+    /// Starts the daily address list check, once.
+    fn start_address_checks(&self) {
+        if !crate::addresses::enabled() || self.address_checks.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            // Not with everything else that happens at unlock.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            loop {
+                mgr.check_addresses(crate::addresses::EVERY).await;
+                tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+            }
+        });
     }
 
     async fn restore(&self, vault: &str, mut record: AccountRecord) -> Result<()> {
@@ -945,6 +1011,7 @@ impl AccountManager {
 
     async fn go_live(&self, vault: &str, record: AccountRecord, client: Client) {
         let account = record.id;
+        self.start_address_checks();
 
         let (tx, latest) = (self.events.clone(), self.latest.clone());
         client.add_event_handler(move |ev: OriginalSyncRoomMessageEvent, room: Room, info: Option<matrix_sdk::deserialized_responses::EncryptionInfo>| {

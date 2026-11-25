@@ -68,6 +68,12 @@ pub struct AppSettings {
     /// can tell it's the same file.
     #[serde(default)]
     pub forward_as_is: bool,
+    /// Accounts with the same name on two servers (a main account and its
+    /// backup), signed in here in the same vault, copy each other's room
+    /// keys on this device, so each can read what the other can. Off by
+    /// default.
+    #[serde(default)]
+    pub twin_keys: bool,
     /// Looks for a newer Whisker once a day and installs it (phones: says
     /// so, and Android asks before installing). On by default.
     #[serde(default = "yes")]

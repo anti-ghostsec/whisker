@@ -242,6 +242,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-allow-screenshots(bool);
     callback set-typst(bool);
     callback set-forward-as-is(bool);
+    callback set-twin-keys(bool);
     callback set-auto-update(bool);
     callback check-update();
     callback install-update();
@@ -745,6 +746,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.forward-as-is;
                 toggled => { root.set-forward-as-is(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Share room keys between twin accounts"; color: Theme.text; }
+                Text {
+                    text: "For an account with the same name on two servers (a main account and its backup), both signed in here in the same vault. On: each copies the other's keys for the rooms both are in, on this device only (nothing is sent to a server), so the backup can read what was said before it first signed in. Its server-side key backup, if it has one, then keeps them too. Accounts in different vaults are never paired.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.twin-keys;
+                toggled => { root.set-twin-keys(self.checked); }
             }
         }
     }
@@ -1458,6 +1475,7 @@ export component SettingsPage inherits Rectangle {
     callback set-allow-screenshots(bool);
     callback set-typst(bool);
     callback set-forward-as-is(bool);
+    callback set-twin-keys(bool);
     callback set-auto-update(bool);
     callback check-update();
     callback install-update();
@@ -1571,6 +1589,7 @@ export component SettingsPage inherits Rectangle {
                             set-allow-screenshots(b) => { root.set-allow-screenshots(b); }
                             set-typst(b) => { root.set-typst(b); }
                             set-forward-as-is(b) => { root.set-forward-as-is(b); }
+                            set-twin-keys(b) => { root.set-twin-keys(b); }
                             set-auto-update(b) => { root.set-auto-update(b); }
                             check-update => { root.check-update(); }
                             install-update => { root.install-update(); }

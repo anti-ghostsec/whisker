@@ -234,6 +234,10 @@ struct State {
     /// rules alert for, so rooms set to mentions only never showed new
     /// messages.
     fresh: HashMap<RoomKey, HashSet<OwnedEventId>>,
+    /// Room keys waiting to be copied to a twin account: (from, to) → rooms
+    /// (`None`: every room they share). Gathered for a moment, since keys
+    /// come in bursts.
+    twin_queue: HashMap<(AccountId, AccountId), Option<HashSet<OwnedRoomId>>>,
     /// The verification on screen: (account, other user, flow id).
     verifying: Option<(AccountId, OwnedUserId, String)>,
     /// Public room directory: (server, query, next page token, results).
@@ -1973,6 +1977,11 @@ impl Ctl {
             c.show_thread().await;
             let rows = c.rows(&key).await;
             let Some(row) = rows.into_iter().find(|r| r.item.event_id == id) else { return };
+            // Its picture too: a message that came undecryptable (a file sent
+            // from another of our devices, before its key had come) is only
+            // now a picture or video, and nothing else would fetch it until
+            // the room was loaded again (it stayed a blank box till a restart).
+            c.fetch_pictures(&key, std::slice::from_ref(&row.item));
             let px = c.avatars.clone();
             c.ui(move |_| {
                 ui::with(|m| {
@@ -6226,6 +6235,64 @@ impl Ctl {
         self.spawn(async move { c.show_messages().await });
     }
 
+    /// Queues copying `account`'s room keys (for `rooms`, or every room)
+    /// to its twins, both ways when `both`. Nothing unless Settings → Share
+    /// room keys between twin accounts is on.
+    async fn queue_twin_keys(&self, account: AccountId, rooms: Option<Vec<OwnedRoomId>>, both: bool) {
+        if !self.settings.lock().unwrap().twin_keys {
+            return;
+        }
+        for twin in whisker_core::twins::twins_of(&self.mgr, account).await {
+            let pairs = if both { vec![(account, twin), (twin, account)] } else { vec![(account, twin)] };
+            for pair in pairs {
+                let start = {
+                    let mut st = self.st.lock().unwrap();
+                    let fresh = !st.twin_queue.contains_key(&pair);
+                    let entry = st.twin_queue.entry(pair).or_insert_with(|| Some(HashSet::new()));
+                    match (&rooms, entry.as_mut()) {
+                        (Some(r), Some(set)) => set.extend(r.iter().cloned()),
+                        _ => *entry = None,
+                    }
+                    fresh
+                };
+                if start {
+                    let c = self.clone();
+                    self.spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        let Some(rooms) = c.st.lock().unwrap().twin_queue.remove(&pair) else { return };
+                        let rooms: Option<Vec<OwnedRoomId>> = rooms.map(|r| r.into_iter().collect());
+                        match whisker_core::twins::copy_keys(&c.mgr, pair.0, pair.1, rooms.as_deref()).await {
+                            // The keys arriving set off the usual redecrypting.
+                            Ok((n, _)) if n > 0 => tracing::info!("copied {n} room keys to a twin account"),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("couldn't copy room keys to a twin account: {e:#}"),
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    fn set_twin_keys(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.twin_keys = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_twin_keys(on);
+        }
+        // Turned on: everything they share, both ways.
+        if on {
+            let c = self.clone();
+            self.spawn(async move {
+                let synced: Vec<AccountId> = c.st.lock().unwrap().synced.iter().copied().collect();
+                for a in synced {
+                    c.queue_twin_keys(a, None, false).await;
+                }
+            });
+        }
+    }
+
     fn set_forward_as_is(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.forward_as_is = on;
@@ -7332,6 +7399,8 @@ impl Ctl {
                     }
                     let first = self.st.lock().unwrap().synced.insert(account);
                     if first {
+                        // Signed in (or unlocked): what it and its twins share, both ways.
+                        self.queue_twin_keys(account, None, true).await;
                         self.refresh_accounts().await;
                         let c = self.clone();
                         tokio::spawn(async move {
@@ -7383,6 +7452,12 @@ impl Ctl {
                     // just joined, for its place in the room list; otherwise
                     // when it's next opened).
                     self.st.lock().unwrap().older.remove(&key);
+                    // Just joined: a twin may have the keys for what was said before.
+                    if joined {
+                        for twin in whisker_core::twins::twins_of(&self.mgr, key.0).await {
+                            self.queue_twin_keys(twin, Some(vec![key.1.clone()]), false).await;
+                        }
+                    }
                     if self.current().as_ref() == Some(&key) || joined {
                         self.fill_gap(key);
                     }
@@ -7404,6 +7479,7 @@ impl Ctl {
                     }
                 }
                 ClientEvent::RoomKeys { account, rooms } => {
+                    self.queue_twin_keys(account, Some(rooms.clone()), false).await;
                     for room_id in rooms {
                         self.redecrypt((account, room_id));
                     }
@@ -7778,6 +7854,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     ui.global::<Prefs>().set_allow_screenshots(prefs.allow_screenshots);
     ui.global::<Prefs>().set_typst(prefs.typst);
     ui.global::<Prefs>().set_forward_as_is(prefs.forward_as_is);
+    ui.global::<Prefs>().set_twin_keys(prefs.twin_keys);
     ui.global::<Prefs>().set_auto_update(prefs.auto_update);
     ui.global::<Prefs>().set_app_version(s(whisker_core::update::current()));
     // Whisker's own picture, for the screen that asks for the passphrase.
@@ -8092,6 +8169,10 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     {
         let c = ctl.clone();
         ui.on_set_forward_as_is(move |b| c.set_forward_as_is(b));
+    }
+    {
+        let c = ctl.clone();
+        ui.on_set_twin_keys(move |b| c.set_twin_keys(b));
     }
     {
         let c = ctl.clone();

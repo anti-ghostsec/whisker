@@ -57,6 +57,8 @@ export global Prefs {
     // Forwarding an encrypted file reuses it (same key) where that's safe,
     // instead of uploading a fresh copy.
     in-out property <bool> forward-as-is: false;
+    // Twin accounts (same name, two servers) copy each other's room keys here.
+    in-out property <bool> twin-keys: false;
     // Updates: looked for and installed without asking; this version; what
     // the last look found; the newer version waiting to be installed.
     in-out property <bool> auto-update: true;

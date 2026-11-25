@@ -2347,6 +2347,7 @@ export component AppWindow inherits Window {
     callback set-allow-screenshots(bool);
     callback set-typst(bool);
     callback set-forward-as-is(bool);
+    callback set-twin-keys(bool);
     callback set-auto-update(bool);
     callback check-update();
     callback install-update();
@@ -3730,6 +3731,7 @@ export component AppWindow inherits Window {
             set-allow-screenshots(b) => { root.set-allow-screenshots(b); }
             set-typst(b) => { root.set-typst(b); }
             set-forward-as-is(b) => { root.set-forward-as-is(b); }
+            set-twin-keys(b) => { root.set-twin-keys(b); }
             set-auto-update(b) => { root.set-auto-update(b); }
             check-update => { root.check-update(); }
             install-update => { root.install-update(); }

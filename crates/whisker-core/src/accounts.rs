@@ -212,7 +212,7 @@ impl AccountManager {
             key_sharing: Arc::new(std::sync::atomic::AtomicU8::new(1)),
             media_cache: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_MEDIA_CACHE)),
             media_in_vault: Arc::default(),
-            addresses: Arc::new(tokio::sync::Mutex::new(crate::addresses::Store::load(&data_dir.join("addresses.json")))),
+            addresses: Arc::default(),
             address_checks: Arc::default(),
             data_dir,
             inner: Arc::default(),
@@ -688,6 +688,9 @@ impl AccountManager {
                     Err(e) => tracing::warn!("could not prepare store of {}: {e:#}", rec.user_id),
                 }
             }
+            if let Some(kept) = profile.extras.get(crate::addresses::VAULT_KEY) {
+                self.addresses.lock().await.adopt(kept);
+            }
             self.inner.write().await.vaults.insert(id.clone(), OpenVault { vault, profile, attachments, version: 0, written: Default::default() });
             // All at once: one slow account shouldn't hold up the rest. Each
             // waits a moment first (up to 3 s, at random), so the servers
@@ -952,7 +955,37 @@ impl AccountManager {
             }
             ours.into_iter().find_map(|(_, p)| p)
         };
-        crate::addresses::fetch(&self.addresses, proxy.as_deref(), &self.data_dir.join("addresses.json")).await;
+        if crate::addresses::fetch(&self.addresses, proxy.as_deref()).await {
+            self.keep_addresses().await;
+        }
+    }
+
+    /// Puts the newest address list in each open vault with an account it's
+    /// about, where it isn't already.
+    async fn keep_addresses(&self) {
+        let (kept, ours) = {
+            let st = self.addresses.lock().await;
+            let Some(kept) = st.kept() else { return };
+            let inner = self.inner.read().await;
+            let ours: Vec<VaultId> = inner
+                .vaults
+                .iter()
+                .filter(|(_, ov)| ov.profile.extras.get(crate::addresses::VAULT_KEY) != Some(&kept))
+                .filter(|(_, ov)| ov.profile.accounts.iter().any(|r| r.user_id.split_once(':').is_some_and(|(_, s)| st.covers(s))))
+                .map(|(id, _)| id.clone())
+                .collect();
+            (kept, ours)
+        };
+        for vault in ours {
+            let k = kept.clone();
+            if let Err(e) = self.mutate_profile(&vault, |p| {
+                p.extras.insert(crate::addresses::VAULT_KEY.to_owned(), k);
+            })
+            .await
+            {
+                tracing::warn!("couldn't keep the address list in a vault: {e:#}");
+            }
+        }
     }
 
     /// Starts the daily address list check, once.
@@ -966,6 +999,8 @@ impl AccountManager {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             loop {
                 mgr.check_addresses(crate::addresses::EVERY).await;
+                // A vault unlocked since (or with a new account) gets the newest copy.
+                mgr.keep_addresses().await;
                 tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
             }
         });

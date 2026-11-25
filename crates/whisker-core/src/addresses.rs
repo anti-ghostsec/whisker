@@ -164,8 +164,12 @@ pub fn homeservers(list: &List, server: &str, current: &str, proxied: bool) -> V
         .collect()
 }
 
-/// The newest good copy seen: kept (in `addresses.json`, beside the
-/// vaults) so a restart can't be sent an older one.
+/// Where a vault keeps its copy, in [`crate::profile::Profile::extras`].
+pub const VAULT_KEY: &str = "anoncat_addresses";
+
+/// The newest good copy seen. Kept in the vaults of the accounts it's
+/// about (encrypted with them, so the disk doesn't say anoncat was used),
+/// so after unlocking an older one isn't taken either.
 #[derive(Default)]
 pub struct Store {
     pub signed: Option<Signed>,
@@ -176,13 +180,21 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn load(path: &std::path::Path) -> Self {
-        let Some(key) = key() else { return Self::default() };
-        let Some(signed) = std::fs::read(path).ok().and_then(|b| serde_json::from_slice::<Signed>(&b).ok()) else { return Self::default() };
-        match check(&signed, &key) {
-            Some(list) => Self { signed: Some(signed), list: Some(list), fetched: None },
-            None => Self::default(),
+    /// Takes a vault's kept copy if it's good and newer than this one
+    /// (expired or not: its `issued` is still the floor).
+    pub fn adopt(&mut self, kept: &serde_json::Value) {
+        let Some(key) = key() else { return };
+        let Ok(signed) = serde_json::from_value::<Signed>(kept.clone()) else { return };
+        let Some(list) = check(&signed, &key) else { return };
+        if self.list.as_ref().is_none_or(|l| list.issued > l.issued) {
+            self.signed = Some(signed);
+            self.list = Some(list);
         }
+    }
+
+    /// The copy as a vault keeps it.
+    pub fn kept(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(self.signed.as_ref()?).ok()
     }
 
     /// The list, if it hasn't expired.
@@ -202,16 +214,6 @@ impl Store {
         true
     }
 
-    pub fn save(&self, path: &std::path::Path) {
-        let Some(signed) = &self.signed else { return };
-        let Ok(json) = serde_json::to_vec(signed) else { return };
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            crate::vault::owner_only(&tmp, false);
-            let _ = std::fs::rename(&tmp, path);
-        }
-    }
-
     /// Whether `server` is one the list is about.
     pub fn covers(&self, server: &str) -> bool {
         let server = server.to_ascii_lowercase();
@@ -221,7 +223,7 @@ impl Store {
 
 /// Fetches every place the list is published (through `proxy` if there is
 /// one) and keeps the newest good copy. Says whether it changed.
-pub async fn fetch(store: &tokio::sync::Mutex<Store>, proxy: Option<&str>, path: &std::path::Path) -> bool {
+pub async fn fetch(store: &tokio::sync::Mutex<Store>, proxy: Option<&str>) -> bool {
     let Some(key) = key() else { return false };
     let urls = {
         let mut st = store.lock().await;
@@ -245,7 +247,6 @@ pub async fn fetch(store: &tokio::sync::Mutex<Store>, proxy: Option<&str>, path:
         let mut st = store.lock().await;
         if st.offer(&got.body, &key) {
             tracing::info!("address list from {u}: issued {}", st.list.as_ref().map_or(0, |l| l.issued));
-            st.save(path);
             changed = true;
         }
     }
@@ -293,6 +294,13 @@ mod tests {
         assert!(st.offer(&sign(&sk, &list(101, now + 3600)), &key));
         assert_eq!(st.current().unwrap().issued, 101);
         assert!(st.covers("Anoncat.Gleeze.com"));
+        // What a vault kept: taken only if newer, expired or not.
+        let mut other = Store::default();
+        other.offer(&good, &key);
+        if enabled() {
+            other.adopt(&st.kept().unwrap());
+            assert_eq!(other.list.as_ref().unwrap().issued, 101);
+        }
         assert!(!st.covers("matrix.org"));
     }
 

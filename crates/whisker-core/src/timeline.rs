@@ -116,6 +116,8 @@ pub struct HistoryItem {
     /// in developer mode, or a hidden event (see `hidden_item` and
     /// [`HistoryItem::is_hidden_event`]), shown only with "Show hidden events".
     pub dev_only: bool,
+    /// A poll: `body` is its question.
+    pub poll: Option<Box<crate::polls::Poll>>,
 }
 
 /// Element's warning shield on an encrypted message, in its lax mode: no
@@ -649,6 +651,8 @@ pub struct Page {
     /// Messages (and reactions) on this page that were deleted: whatever
     /// copy is already shown or kept must go too.
     pub gone: Vec<OwnedEventId>,
+    /// Poll votes and ends seen on this page.
+    pub votes: Vec<crate::polls::Vote>,
 }
 
 /// One person's emoji reaction to a message.
@@ -672,11 +676,13 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
     let mut out = Vec::new();
     let mut reactions = Vec::new();
     let mut gone = Vec::new();
+    let mut votes = Vec::new();
     let mut from = from;
     let mut saw_create = false;
     for _ in 0..5 {
-        let (mut items, mut r, older, created, mut g) = history_page(room, from.clone(), limit).await?;
+        let (mut items, mut r, older, created, mut g, mut v) = history_page(room, from.clone(), limit).await?;
         gone.append(&mut g);
+        votes.append(&mut v);
         saw_create |= created;
         reactions.append(&mut r);
         items.append(&mut out);
@@ -726,11 +732,12 @@ pub async fn history(room: &Room, from: Option<String>, limit: u32) -> Result<Pa
                     shield: None,
                     details: Vec::new(),
                     dev_only: false,
+                    poll: None,
                 },
             );
         }
     }
-    Ok(Page { items: out, reactions, older: from, gone })
+    Ok(Page { items: out, reactions, older: from, gone, votes })
 }
 
 /// One `/messages` request: its items, oldest first, and the token for the
@@ -748,7 +755,8 @@ const HISTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
 
 /// Also says whether the room's creation event was on it.
 #[allow(clippy::type_complexity)]
-async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(Vec<HistoryItem>, Vec<Reaction>, Option<String>, bool, Vec<OwnedEventId>)> {
+#[allow(clippy::type_complexity)]
+async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(Vec<HistoryItem>, Vec<Reaction>, Option<String>, bool, Vec<OwnedEventId>, Vec<crate::polls::Vote>)> {
     let mut opts = MessagesOptions::backward();
     opts.limit = UInt::from(limit);
     opts.from = from;
@@ -784,8 +792,22 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
     let mut created = false;
     let mut reactions = Vec::new();
     let mut gone = Vec::new();
+    let mut votes = Vec::new();
     // Newest first: an edit is seen before the message it changes.
     for ev in &msgs.chunk {
+        match poll_event(room, ev.raw(), &mut profiles).await {
+            Some(PollEvent::Start(item)) => {
+                let mut item = *item;
+                item.shield = shield(ev.encryption_info().map(|i| &**i));
+                out.push(item);
+                continue;
+            }
+            Some(PollEvent::Vote(v)) => {
+                votes.push(v);
+                continue;
+            }
+            None => {}
+        }
         let m = match ev.raw().deserialize() {
             Ok(AnySyncTimelineEvent::MessageLike(m)) if m.is_redacted() => {
                 gone.push(m.event_id().to_owned());
@@ -865,10 +887,11 @@ async fn history_page(room: &Room, from: Option<String>, limit: u32) -> Result<(
             shield: shield(ev.encryption_info().map(|i| &**i)),
             details: Vec::new(),
             dev_only: false,
+            poll: None,
         });
     }
     out.reverse();
-    Ok((out, reactions, if at_start { None } else { msgs.end }, created, gone))
+    Ok((out, reactions, if at_start { None } else { msgs.end }, created, gone, votes))
 }
 
 /// An event other apps don't show, for "Show hidden events": a message
@@ -882,7 +905,10 @@ pub async fn hidden_item(
     profiles: &mut HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)>,
 ) -> Option<HistoryItem> {
     let kind = raw.get_field::<String>("type").ok().flatten()?;
-    if raw.get_field::<serde_json::Value>("state_key").ok().flatten().is_some() || matches!(kind.as_str(), "m.reaction" | "m.room.redaction" | "m.room.encrypted") {
+    if raw.get_field::<serde_json::Value>("state_key").ok().flatten().is_some()
+        || matches!(kind.as_str(), "m.reaction" | "m.room.redaction" | "m.room.encrypted")
+        || crate::polls::is_poll_event(&kind)
+    {
         return None;
     }
     // Messages and stickers that read fine are shown as they are.
@@ -927,7 +953,57 @@ pub async fn hidden_item(
         shield: None,
         details: Vec::new(),
         dev_only: true,
+        poll: None,
     })
+}
+
+pub enum PollEvent {
+    /// A poll, as a message.
+    Start(Box<HistoryItem>),
+    Vote(crate::polls::Vote),
+}
+
+/// A poll, or a vote in one (or its end), from a timeline event.
+pub async fn poll_event(
+    room: &Room,
+    raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>,
+    profiles: &mut HashMap<OwnedUserId, (Option<String>, Option<OwnedMxcUri>)>,
+) -> Option<PollEvent> {
+    let kind = raw.get_field::<String>("type").ok().flatten()?;
+    if !crate::polls::is_poll_event(&kind) {
+        return None;
+    }
+    let event_id = raw.get_field::<OwnedEventId>("event_id").ok().flatten()?;
+    let sender = raw.get_field::<OwnedUserId>("sender").ok().flatten()?;
+    let ts = raw.get_field::<MilliSecondsSinceUnixEpoch>("origin_server_ts").ok().flatten()?;
+    let content = raw.get_field::<serde_json::Value>("content").ok().flatten()?;
+    if let Some(v) = crate::polls::parse_vote(&kind, &content, event_id.clone(), sender.clone(), ts) {
+        return Some(PollEvent::Vote(v));
+    }
+    let poll = crate::polls::parse_start(&kind, &content)?;
+    if !profiles.contains_key(&sender) {
+        profiles.insert(sender.clone(), member_profile(room, &sender).await);
+    }
+    let (sender_name, sender_avatar) = profiles[&sender].clone();
+    Some(PollEvent::Start(Box::new(HistoryItem {
+        event_id,
+        sender,
+        sender_name,
+        sender_avatar,
+        body: poll.question.clone(),
+        ts,
+        reply_to: None,
+        media: None,
+        edited: false,
+        notice: false,
+        member: None,
+        thread: content.get("m.relates_to").filter(|r| r.get("rel_type").and_then(|t| t.as_str()) == Some("m.thread")).and_then(|r| OwnedEventId::try_from(r.get("event_id")?.as_str()?).ok()),
+        pills: Vec::new(),
+        shield: None,
+        details: Vec::new(),
+        dev_only: false,
+        poll: Some(Box::new(poll)),
+    })))
 }
 
 /// A room (state) event from the timeline. Reads `prev_content` from the top
@@ -985,6 +1061,7 @@ pub async fn state_notice(
         shield: None,
         details,
         dev_only: true,
+        poll: None,
     })
 }
 
@@ -1036,6 +1113,7 @@ pub async fn notice_item(
         shield: None,
         details: Vec::new(),
         dev_only: false,
+        poll: None,
     })
 }
 

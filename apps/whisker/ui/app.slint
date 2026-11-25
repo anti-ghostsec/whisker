@@ -97,6 +97,20 @@ export struct PickEntry {
 }
 
 // An emoji reaction under a message: how many, and whether one is ours.
+// One answer of a poll.
+export struct PollOption {
+    id: string,
+    text: string,
+    count: int,
+    // Of everyone who voted, how many picked it (0 to 1).
+    share: float,
+    mine: bool,
+    // Counts may be seen (always, or once it ended).
+    show-count: bool,
+    // Ended, and picked most.
+    winner: bool,
+}
+
 export struct ReactionChip {
     key: string,
     count: int,
@@ -234,6 +248,13 @@ export struct MessageItem {
     all-readers: [Reader],
     more-readers: int,
     reactions: [ReactionChip],
+    // A poll: `body` is its question.
+    poll: bool,
+    poll-options: [PollOption],
+    poll-note: string,
+    poll-ended: bool,
+    // Ours and still open.
+    poll-can-end: bool,
     // A thread's first message: how many replies, and the newest ("Bob: hi").
     thread-replies: int,
     thread-last: string,
@@ -816,7 +837,8 @@ component MessageRow inherits Rectangle {
                     for l in root.shown.links: MenuItem { title: l; activated => { root.link(l); } }
                 }
                 if Prefs.menu-copy-link: MenuItem { title: "Copy link to message"; activated => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.shown.id); } }
-                if root.shown.mine: MenuItem { title: root.shown.media == 0 ? "Edit" : root.shown.caption ? "Edit caption" : "Add a caption"; activated => { root.action("edit", root.shown.id); } }
+                if root.shown.mine && !root.shown.poll: MenuItem { title: root.shown.media == 0 ? "Edit" : root.shown.caption ? "Edit caption" : "Add a caption"; activated => { root.action("edit", root.shown.id); } }
+                if root.shown.poll-can-end: MenuItem { title: "End poll"; activated => { root.action("end-poll", root.shown.id); } }
                 MenuSeparator {}
                 if root.shown.mine || root.can-moderate: MenuItem { title: "Delete"; activated => { root.action("delete", root.shown.id); } }
                 if !root.shown.mine && root.can-moderate: Menu {
@@ -1177,6 +1199,61 @@ component MessageRow inherits Rectangle {
                                     wrap: word-wrap;
                                 }
                             }
+                        }
+                        // A poll: its answers (tap to vote, again to take it back),
+                        // with the count once it may be seen.
+                        if root.item.poll: VerticalLayout {
+                            spacing: 4px;
+                            padding-top: 4px;
+                            for o in root.item.poll-options: Rectangle {
+                                height: max(34px, ot.preferred-height + 14px);
+                                min-width: 200px;
+                                max-width: 420px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: o.mine || o.winner ? Theme.accent : Theme.border;
+                                background: ot-ta.has-hover && !root.item.poll-ended ? Theme.hover : Theme.raised;
+                                clip: true;
+                                // How many picked it, as a bar behind the text.
+                                Rectangle {
+                                    x: 0;
+                                    width: parent.width * o.share;
+                                    background: Theme.accent-soft;
+                                    animate width { duration: 200ms; }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: o.mine ? "☑" : "☐";
+                                        color: o.mine ? Theme.accent : Theme.muted;
+                                        font-size: 14px;
+                                        vertical-alignment: center;
+                                    }
+                                    ot := Text {
+                                        horizontal-stretch: 1;
+                                        text: o.text + (o.winner ? "  🏆" : "");
+                                        color: Theme.text;
+                                        font-weight: o.mine || o.winner ? 700 : 400;
+                                        wrap: word-wrap;
+                                        vertical-alignment: center;
+                                    }
+                                    if o.show-count: Text {
+                                        text: o.count;
+                                        color: o.mine ? Theme.accent : Theme.muted;
+                                        font-size: 12px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                ot-ta := TouchArea {
+                                    mouse-cursor: root.item.poll-ended ? default : pointer;
+                                    clicked => { if !root.held && !root.item.poll-ended { root.act("vote:" + o.id, root.item.id); } }
+                                    pointer-event(e) => { root.press(e); if e.button == PointerEventButton.right && e.kind == PointerEventKind.down { cm.show({ x: self.absolute-position.x - root.absolute-position.x + self.mouse-x, y: self.absolute-position.y - root.absolute-position.y + self.mouse-y }); } }
+                                }
+                            }
+                            Text { text: root.item.poll-note; font-size: 11px; color: Theme.muted; }
                         }
                         if root.item.thread-replies > 0: Rectangle {
                             height: 26px;
@@ -1621,6 +1698,37 @@ global Safe {
     in-out property <length> right;
 }
 
+// The message box's "+": a file, or a poll.
+component AttachBtn inherits Rectangle {
+    callback file();
+    callback poll();
+    width: 38px;
+    height: 38px;
+    IconBtn { icon: "+"; size: 38px; clicked => { menu.show(); } }
+    menu := PopupWindow {
+        x: 0;
+        y: -96px;
+        width: 190px;
+        height: 88px;
+        Rectangle {
+            background: Theme.panel;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                padding: 4px;
+                for row[i] in ["Send a file…", "Create a poll…"]: Rectangle {
+                    height: 40px;
+                    border-radius: 8px;
+                    background: row-ta.has-hover ? Theme.hover : transparent;
+                    Text { x: 12px; text: row; color: Theme.text; vertical-alignment: center; }
+                    row-ta := TouchArea { mouse-cursor: pointer; clicked => { if i == 0 { root.file(); } else { root.poll(); } } }
+                }
+            }
+        }
+    }
+}
+
 component Overlay inherits Rectangle {
     in property <length> card-width: 380px;
     callback dismiss;
@@ -1905,7 +2013,8 @@ component MessageSheet inherits Rectangle {
                         if root.item.links.length > 1: SheetRow { text: "Open link ›"; clicked => { root.links-open = true; } }
                         if Prefs.menu-copy-file && root.item.media > 0: SheetRow { text: "Copy file link"; clicked => { root.run("copy-file"); } }
                         if Prefs.menu-copy-link: SheetRow { text: "Copy link to message"; clicked => { root.copy("https://matrix.to/#/" + root.room-id + "/" + root.item.id); root.close(); } }
-                        if root.item.mine && !root.item.notice: SheetRow { text: root.item.media == 0 ? "Edit" : root.item.caption ? "Edit caption" : "Add a caption"; clicked => { root.run("edit"); } }
+                        if root.item.mine && !root.item.notice && !root.item.poll: SheetRow { text: root.item.media == 0 ? "Edit" : root.item.caption ? "Edit caption" : "Add a caption"; clicked => { root.run("edit"); } }
+                        if root.item.poll-can-end: SheetRow { text: "End poll"; clicked => { root.run("end-poll"); } }
                         if Prefs.menu-profile: SheetRow { text: "View profile"; clicked => { root.run("profile"); } }
                         if Prefs.menu-copy-id: SheetRow { text: "Copy user id"; clicked => { root.copy(root.item.sender); root.close(); } }
                         if Prefs.menu-source: SheetRow { text: "Show source"; clicked => { root.run("source"); } }
@@ -2256,6 +2365,22 @@ export component AppWindow inherits Window {
     callback search-rooms(string);
     callback send(string);
     callback attach();
+    // "Create a poll" dialog.
+    in-out property <bool> poll-open;
+    in-out property <string> poll-question;
+    in-out property <string> poll-answers;
+    in-out property <bool> poll-disclosed: true;
+    in-out property <bool> poll-multi;
+    in-out property <string> poll-error;
+    callback create-poll(string, string, bool, bool);
+    function open-poll() {
+        root.poll-question = "";
+        root.poll-answers = "";
+        root.poll-disclosed = true;
+        root.poll-multi = false;
+        root.poll-error = "";
+        root.poll-open = true;
+    }
     // Files picked to go with the next message (names), and taking one off.
     in property <[string]> pending-files;
     callback remove-pending-file(int);
@@ -2308,6 +2433,7 @@ export component AppWindow inherits Window {
         if root.picker-open { root.picker-finish(false); return true; }
         if root.select-text != "" { root.select-text = ""; return true; }
         if root.sticker-save-open { root.sticker-save-open = false; return true; }
+        if root.poll-open { root.poll-open = false; return true; }
         if root.stickers-open { root.stickers-open = false; return true; }
         if root.topic-open { root.topic-open = false; return true; }
         if root.readers-open { root.readers-open = false; return true; }
@@ -3062,7 +3188,7 @@ export component AppWindow inherits Window {
                         alignment: stretch;
                         if !root.narrow: VerticalLayout {
                             alignment: end;
-                            IconBtn { icon: "+"; size: 38px; clicked => { root.activity(); root.attach(); } }
+                            AttachBtn { file => { root.activity(); root.attach(); } poll => { root.activity(); root.open-poll(); } }
                         }
                         Rectangle {
                             horizontal-stretch: 1;
@@ -3236,7 +3362,7 @@ export component AppWindow inherits Window {
                         padding-right: 12px;
                         padding-bottom: 10px;
                         spacing: 6px;
-                        IconBtn { icon: "+"; size: 38px; clicked => { root.activity(); root.attach(); } }
+                        AttachBtn { file => { root.activity(); root.attach(); } poll => { root.activity(); root.open-poll(); } }
                         IconBtn { icon: "🖼"; size: 38px; active: root.stickers-open; clicked => { root.activity(); root.open-stickers(); } }
                         if !Prefs.touch: IconBtn {
                             icon: "☺";
@@ -3792,6 +3918,40 @@ export component AppWindow inherits Window {
                 alignment: end;
                 Btn { text: "Copy all"; clicked => { root.copy-text(root.select-text); } }
                 Btn { text: "Close"; primary: true; clicked => { root.select-text = ""; root.select-title = "Select text"; } }
+            }
+        }
+
+        if root.poll-open: Overlay {
+            dismiss => { root.poll-open = false; }
+            Text { text: "Create a poll"; font-size: 18px; font-weight: 800; color: Theme.text; }
+            Input { text <=> root.poll-question; placeholder: "Question"; }
+            Text { text: "Answers, one per line (2 to 20)"; color: Theme.muted; font-size: 12px; }
+            TextEdit { text <=> root.poll-answers; height: 140px; wrap: word-wrap; }
+            HorizontalLayout {
+                spacing: 12px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Text { text: "Show results while it's open"; color: Theme.text; }
+                    Text { text: "Off: everyone sees the count only once you end it."; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+                }
+                Switch { checked <=> root.poll-disclosed; }
+            }
+            HorizontalLayout {
+                spacing: 12px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Text { text: "Allow more than one answer"; color: Theme.text; }
+                }
+                Switch { checked <=> root.poll-multi; }
+            }
+            if root.poll-error != "": Text { text: root.poll-error; color: Theme.danger; font-size: 12px; wrap: word-wrap; }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                Btn { text: "Cancel"; clicked => { root.poll-open = false; } }
+                Btn { text: "Create"; primary: true; enabled: root.poll-question != "" && root.poll-answers != ""; clicked => { root.create-poll(root.poll-question, root.poll-answers, root.poll-disclosed, root.poll-multi); } }
             }
         }
 

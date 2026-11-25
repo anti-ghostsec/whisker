@@ -1069,7 +1069,7 @@ impl AccountManager {
                     }
                     timeline::Parsed::New { body, is_text, reply_to, media, thread, pills } => {
                         let is_notice = matches!(ev.content.msgtype, matrix_sdk::ruma::events::room::message::MessageType::Notice(_));
-                        let m = Msg { body, is_text, is_notice, reply_to, media, thread, pills, shield: timeline::shield(info.as_ref()) };
+                        let m = Msg { body, is_text, is_notice, reply_to, media, thread, pills, shield: timeline::shield(info.as_ref()), poll: None };
                         publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
                     }
                 }
@@ -1081,7 +1081,7 @@ impl AccountManager {
             let (tx, latest) = (tx.clone(), latest.clone());
             async move {
                 if let timeline::Parsed::New { body, is_text, reply_to, media, thread, pills } = timeline::parse_sticker(&ev.content) {
-                    let m = Msg { body, is_text, is_notice: false, reply_to, media, thread, pills, shield: timeline::shield(info.as_ref()) };
+                    let m = Msg { body, is_text, is_notice: false, reply_to, media, thread, pills, shield: timeline::shield(info.as_ref()), poll: None };
                     publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
                 }
             }
@@ -1156,7 +1156,7 @@ impl AccountManager {
         client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
             let (tx, latest) = (tx.clone(), latest.clone());
             async move {
-                let m = Msg { body: timeline::UNDECRYPTABLE.into(), is_text: false, is_notice: false, reply_to: None, media: None, thread: None, pills: Vec::new(), shield: None };
+                let m = Msg { body: timeline::UNDECRYPTABLE.into(), is_text: false, is_notice: false, reply_to: None, media: None, thread: None, pills: Vec::new(), shield: None, poll: None };
                 publish(&tx, &latest, account, &room, ev.event_id, &ev.sender, m, ev.origin_server_ts).await;
             }
         });
@@ -1164,9 +1164,24 @@ impl AccountManager {
         // Events other apps don't show (made-up types, ones that don't read
         // as what they say), for "Show hidden events".
         let tx = self.events.clone();
-        client.add_event_handler(move |raw: matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnySyncTimelineEvent>, room: Room| {
-            let tx = tx.clone();
+        let latest = self.latest.clone();
+        client.add_event_handler(move |raw: matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnySyncTimelineEvent>, room: Room, info: Option<matrix_sdk::deserialized_responses::EncryptionInfo>| {
+            let (tx, latest) = (tx.clone(), latest.clone());
             async move {
+                // Polls: shown as one, votes and ends counted into it.
+                match timeline::poll_event(&room, &raw, &mut HashMap::new()).await {
+                    Some(timeline::PollEvent::Start(item)) => {
+                        let item = *item;
+                        let m = Msg { body: item.body, is_text: false, is_notice: false, reply_to: None, media: None, thread: item.thread, pills: Vec::new(), shield: timeline::shield(info.as_ref()), poll: item.poll };
+                        publish(&tx, &latest, account, &room, item.event_id, &item.sender, m, item.ts).await;
+                        return;
+                    }
+                    Some(timeline::PollEvent::Vote(vote)) => {
+                        let _ = tx.send(ClientEvent::Vote { account, room_id: room.room_id().to_owned(), vote });
+                        return;
+                    }
+                    None => {}
+                }
                 if let Some(item) = timeline::hidden_item(&room, &raw, &mut HashMap::new()).await {
                     let _ = tx.send(ClientEvent::Notice { account, room_id: room.room_id().to_owned(), item: Box::new(item) });
                 }
@@ -1855,6 +1870,7 @@ struct Msg {
     thread: Option<matrix_sdk::ruma::OwnedEventId>,
     pills: Vec<(String, String)>,
     shield: Option<timeline::Shield>,
+    poll: Option<Box<crate::polls::Poll>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1868,7 +1884,7 @@ async fn publish(
     msg: Msg,
     ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch,
 ) {
-    let Msg { body, is_text, is_notice, reply_to, media, thread, pills, shield } = msg;
+    let Msg { body, is_text, is_notice, reply_to, media, thread, pills, shield, poll } = msg;
     let (sender_name, sender_avatar) = timeline::member_profile(room, sender).await;
     let item = HistoryItem {
         event_id: event_id.clone(),
@@ -1887,6 +1903,7 @@ async fn publish(
         shield,
         details: Vec::new(),
         dev_only: false,
+        poll: poll.clone(),
     };
     {
         let mut l = latest.lock().unwrap();
@@ -1911,6 +1928,7 @@ async fn publish(
         thread,
         pills,
         shield,
+        poll,
     });
 }
 

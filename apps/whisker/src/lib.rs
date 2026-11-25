@@ -122,6 +122,8 @@ struct State {
     reply_failed: HashMap<OwnedEventId, Instant>,
     /// Emoji reactions seen in each opened room.
     reactions: HashMap<RoomKey, Vec<timeline::Reaction>>,
+    /// Poll votes (and ends) seen in each opened room.
+    votes: HashMap<RoomKey, Vec<whisker_core::polls::Vote>>,
     /// The message the "Forward to…" dialog is for.
     forwarding: Option<(RoomKey, OwnedEventId)>,
     /// The account that sends it (any signed-in one).
@@ -1735,6 +1737,18 @@ impl Ctl {
                     reply,
                     readers: readers.remove(&i).unwrap_or_default(),
                     reactions: reactions.remove(&m.event_id).unwrap_or_default(),
+                    poll: m.poll.as_ref().map(|p| {
+                        let votes: Vec<&whisker_core::polls::Vote> = st.votes.get(key).map(|l| l.iter().filter(|v| v.poll == m.event_id).collect()).unwrap_or_default();
+                        let t = whisker_core::polls::tally(p, &m.sender, &votes, me.as_ref());
+                        ui::PollView {
+                            options: p.answers.iter().enumerate().map(|(i, (id, text))| (id.clone(), text.clone(), t.counts[i], t.mine[i])).collect(),
+                            voters: t.voters,
+                            ended: t.ended,
+                            disclosed: p.disclosed,
+                            can_end: me.as_ref() == Some(&m.sender) && !t.ended,
+                            max: p.max_selections,
+                        }
+                    }),
                     thread: if thread.is_none() { threads.remove(&m.event_id) } else { None },
                     trust: st.trust.get(&(key.0, m.sender.clone())).copied().unwrap_or_default(),
                     item: m.clone(),
@@ -2030,6 +2044,7 @@ impl Ctl {
             c.mgr.note_history(key.0, &key.1, &page.items);
             c.merge(&key, page.items);
             c.merge_reactions(&key, page.reactions);
+            c.merge_votes(&key, page.votes);
             c.forget_deleted(&key, &page.gone);
             c.st.lock().unwrap().older.insert(key.clone(), page.older);
             if c.current().as_ref() == Some(&key) {
@@ -2111,6 +2126,16 @@ impl Ctl {
         for r in new {
             if !list.iter().any(|x| x.event_id == r.event_id) {
                 list.push(r);
+            }
+        }
+    }
+
+    fn merge_votes(&self, key: &RoomKey, new: Vec<whisker_core::polls::Vote>) {
+        let mut st = self.st.lock().unwrap();
+        let list = st.votes.entry(key.clone()).or_default();
+        for v in new {
+            if !list.iter().any(|x| x.event_id == v.event_id) {
+                list.push(v);
             }
         }
     }
@@ -2287,6 +2312,7 @@ impl Ctl {
                     self.mgr.note_history(account, &room_id, &page.items);
                     self.merge(&key, page.items);
                     self.merge_reactions(&key, page.reactions);
+                    self.merge_votes(&key, page.votes);
                     self.forget_deleted(&key, &page.gone);
                     self.st.lock().unwrap().older.insert(key.clone(), page.older);
                     if self.current().as_ref() == Some(&key) {
@@ -3317,6 +3343,7 @@ impl Ctl {
                 Ok(page) => {
                     let added = self.merge(&key, page.items);
                     self.merge_reactions(&key, page.reactions);
+                    self.merge_votes(&key, page.votes);
                     self.forget_deleted(&key, &page.gone);
                     let next = page.older.filter(|t| *t != token);
                     {
@@ -3497,6 +3524,7 @@ impl Ctl {
             shield: None,
             details: Vec::new(),
             dev_only: false,
+            poll: None,
         };
         self.merge(&key, vec![item]);
         self.ui(|u| u.set_stick_bottom(true));
@@ -3690,6 +3718,22 @@ impl Ctl {
     }
 
     /// Saves the picture whose menu was used as a sticker called `name`.
+    /// "Create a poll": `answers` one per line.
+    async fn create_poll(&self, question: String, answers: String, disclosed: bool, multi: bool) {
+        let Some(key) = self.current() else { return };
+        let Some(room) = self.mgr.client(key.0).await.and_then(|c| c.get_room(&key.1)) else { return };
+        let answers: Vec<String> = answers.lines().map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect();
+        let max = if multi { answers.len() } else { 1 };
+        self.ui(|u| u.set_poll_error(s("")));
+        match whisker_core::polls::send_poll(&room, &question, &answers, disclosed, max).await {
+            Ok(_) => self.ui(|u| u.set_poll_open(false)),
+            Err(e) => {
+                let e = format!("{e:#}");
+                self.ui(move |u| u.set_poll_error(s(e)));
+            }
+        }
+    }
+
     async fn save_sticker(&self, name: String) {
         let Some(media) = self.st.lock().unwrap().sticker_from.clone() else { return };
         if self.st.lock().unwrap().sticker_as_emoji {
@@ -4320,8 +4364,69 @@ impl Ctl {
             "forward" => self.open_forward(key, m.event_id).await,
             "thread" => self.open_thread(m.thread.clone().unwrap_or(m.event_id)).await,
             a if a.starts_with("react:") => self.toggle_reaction(&key, &room, &m.event_id, &a[6..]).await,
+            a if a.starts_with("vote:") => self.vote(&key, &room, m, &a[5..]).await,
+            "end-poll" => {
+                if let Err(e) = whisker_core::polls::end(&room, &m.event_id).await {
+                    self.status(format!("Couldn't end the poll: {e:#}"));
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Picks `answer` in a poll (or takes it back if it was picked). With
+    /// one answer allowed, picking another replaces it; with more, it's
+    /// added (while there's room).
+    async fn vote(&self, key: &RoomKey, room: &matrix_sdk::Room, m: HistoryItem, answer: &str) {
+        let Some(poll) = &m.poll else { return };
+        let me = room.own_user_id().to_owned();
+        let (picked, ended) = {
+            let st = self.st.lock().unwrap();
+            let votes: Vec<&whisker_core::polls::Vote> = st.votes.get(key).map(|l| l.iter().filter(|v| v.poll == m.event_id).collect()).unwrap_or_default();
+            let t = whisker_core::polls::tally(poll, &m.sender, &votes, Some(&me));
+            let picked: Vec<String> = poll.answers.iter().zip(&t.mine).filter(|(_, mine)| **mine).map(|((id, _), _)| id.clone()).collect();
+            (picked, t.ended)
+        };
+        if ended {
+            return self.status("This poll has ended.");
+        }
+        let mut now = picked.clone();
+        if now.iter().any(|a| a == answer) {
+            now.retain(|a| a != answer);
+        } else if poll.max_selections == 1 {
+            now = vec![answer.to_owned()];
+        } else if now.len() < poll.max_selections {
+            now.push(answer.to_owned());
+        } else {
+            return self.status(format!("You can pick at most {} answers: take one back first.", poll.max_selections));
+        }
+        // Shown at once; the server's copy replaces it.
+        let local = whisker_core::polls::Vote {
+            event_id: OwnedEventId::try_from(format!("{}vote-{}", timeline::LOCAL_ECHO, whisker_core::vault::random_secret())).unwrap_or_else(|_| m.event_id.clone()),
+            poll: m.event_id.clone(),
+            sender: me,
+            ts: MilliSecondsSinceUnixEpoch::now(),
+            answers: now.clone(),
+            end: false,
+        };
+        let local_id = local.event_id.clone();
+        self.merge_votes(key, vec![local]);
+        self.update_message(key, &m.event_id);
+        let res = whisker_core::polls::vote(room, &m.event_id, &now).await;
+        {
+            let mut st = self.st.lock().unwrap();
+            if let Some(list) = st.votes.get_mut(key) {
+                list.retain(|v| v.event_id != local_id);
+            }
+        }
+        match res {
+            Ok(id) => {
+                let vote = whisker_core::polls::Vote { event_id: id, poll: m.event_id.clone(), sender: room.own_user_id().to_owned(), ts: MilliSecondsSinceUnixEpoch::now(), answers: now, end: false };
+                self.merge_votes(key, vec![vote]);
+            }
+            Err(e) => self.status(format!("Couldn't vote: {e:#}")),
+        }
+        self.update_message(key, &m.event_id);
     }
 
     /// Adds our `emoji` reaction to a message, or takes it back if it's there.
@@ -6501,6 +6606,11 @@ impl Ctl {
             list.retain(|r| !ids.contains(&r.event_id) && !ids.contains(&r.target));
             changed |= list.len() != n;
         }
+        if let Some(list) = st.votes.get_mut(key) {
+            let n = list.len();
+            list.retain(|v| !ids.contains(&v.event_id) && !ids.contains(&v.poll));
+            changed |= list.len() != n;
+        }
         if let Some(f) = st.files.as_mut().filter(|f| &f.key == key) {
             f.items.retain(|m| !ids.contains(&m.event_id));
         }
@@ -6651,6 +6761,7 @@ impl Ctl {
             shield: None,
             details: Vec::new(),
             dev_only: false,
+            poll: None,
         };
         self.merge(&key, vec![item]);
         self.show_thread().await;
@@ -7411,7 +7522,7 @@ impl Ctl {
                         self.schedule_rooms();
                     }
                 }
-                ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, thread, pills, shield, .. } => {
+                ClientEvent::Message { account, room_id, event_id, sender, sender_name, sender_avatar, body, origin_server_ts, reply_to, media, thread, pills, shield, poll, .. } => {
                     {
                         let c = self.clone();
                         let (room_id, sender, name, body) = (room_id.clone(), sender.clone(), sender_name.clone(), body.clone());
@@ -7424,7 +7535,7 @@ impl Ctl {
                     if live && self.current().as_ref() != Some(&key) && !self.mgr.accounts().await.iter().any(|a| a.user_id == sender.as_str()) {
                         self.st.lock().unwrap().fresh.entry(key.clone()).or_default().insert(event_id.clone());
                     }
-                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone(), pills, shield, details: Vec::new(), dev_only: false };
+                    let item = HistoryItem { event_id, sender, sender_name, sender_avatar, body, ts: origin_server_ts, reply_to, media: media.map(|m| *m), edited: false, notice: false, member: None, thread: thread.clone(), pills, shield, details: Vec::new(), dev_only: false, poll };
                     // Kept for every room, so opening one shows something at once
                     // (its history still loads on first open).
                     self.merge(&key, vec![item]);
@@ -7512,8 +7623,28 @@ impl Ctl {
                         self.update_message(&key, &target);
                     }
                 }
+                ClientEvent::Vote { account, room_id, vote } => {
+                    let key = (account, room_id);
+                    if self.st.lock().unwrap().older.contains_key(&key) {
+                        let poll = vote.poll.clone();
+                        self.merge_votes(&key, vec![vote]);
+                        self.update_message(&key, &poll);
+                    }
+                }
                 ClientEvent::Redacted { account, room_id, target } => {
                     let key = (account, room_id);
+                    // A vote taken back by deleting it.
+                    let unvoted = {
+                        let mut st = self.st.lock().unwrap();
+                        let list = st.votes.entry(key.clone()).or_default();
+                        let hit = list.iter().find(|v| v.event_id == target).map(|v| v.poll.clone());
+                        list.retain(|v| v.event_id != target);
+                        hit
+                    };
+                    if let Some(poll) = unvoted {
+                        self.update_message(&key, &poll);
+                        continue;
+                    }
                     // A taken-back reaction, or a deleted message.
                     let unreacted = {
                         let mut st = self.st.lock().unwrap();
@@ -8098,6 +8229,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     on!(on_attach, attach);
     on!(on_cancel_reply, cancel_reply);
     on!(on_save_sticker, |n| save_sticker);
+    on!(on_create_poll, |q, a, d, m| create_poll);
     on!(on_remove_sticker, |n| remove_sticker);
     on!(on_send_sticker, |n| send_sticker);
     on!(on_open_stickers, open_stickers);
@@ -8542,6 +8674,7 @@ mod tests {
             shield: None,
             details: Vec::new(),
             dev_only: false,
+            poll: None,
         };
         let mut msgs = vec![
             item("join1", "nully", Some((true, true))),

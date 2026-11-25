@@ -5,7 +5,7 @@
 //! scrolling smooth and stops the scroll position jumping.
 
 use crate::format;
-use crate::{AccountItem, AppWindow, Block, ForwardItem, MessageItem, ReactionChip, Reader, RoomItem};
+use crate::{AccountItem, AppWindow, Block, ForwardItem, MessageItem, PollOption, ReactionChip, Reader, RoomItem};
 use matrix_sdk::ruma::OwnedMxcUri;
 use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use std::cell::RefCell;
@@ -294,10 +294,36 @@ pub struct MsgRow {
     pub readers: Vec<(String, String, Option<OwnedMxcUri>)>,
     /// Emoji reactions: (emoji, how many, one of them is ours, who).
     pub reactions: Vec<(String, usize, bool, String)>,
+    /// A poll's answers and their count.
+    pub poll: Option<PollView>,
     /// For a thread's first message: replies, and the newest one ("Bob: hi").
     pub thread: Option<(usize, String)>,
     pub trust: Trust,
     pub link_card: Option<LinkCard>,
+}
+
+/// A poll as shown: (answer id, text, votes, picked by us) per answer.
+#[derive(Debug, Clone, Hash)]
+pub struct PollView {
+    pub options: Vec<(String, String, usize, bool)>,
+    pub voters: usize,
+    pub ended: bool,
+    pub disclosed: bool,
+    pub can_end: bool,
+    pub max: usize,
+}
+
+/// What's said under a poll: how many voted, and when results show.
+fn poll_note(p: &PollView) -> String {
+    let n = if p.voters == 1 { "1 vote".to_owned() } else { format!("{} votes", p.voters) };
+    let voted = p.options.iter().any(|o| o.3);
+    match (p.ended, p.disclosed) {
+        (true, _) => format!("Ended · {n}"),
+        (false, true) if p.max > 1 => format!("{n} · pick up to {}", p.max),
+        (false, true) => n,
+        (false, false) if voted => format!("{n} · results when it ends"),
+        (false, false) => format!("{n} · results show when the poll ends"),
+    }
 }
 
 /// A preview of a web link in a message.
@@ -377,7 +403,7 @@ pub fn row_sig(r: &MsgRow, pixels: &PixelCache) -> u64 {
     let loaded = |m: &Option<OwnedMxcUri>| m.as_ref().is_some_and(|m| matches!(pixels.lock().unwrap().get(m), Some(Some(_))));
     let mut h = std::collections::hash_map::DefaultHasher::new();
     format!("{:?}", r.item).hash(&mut h);
-    (r.mine, r.first, r.picture_failed, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust).hash(&mut h);
+    (r.mine, r.first, r.picture_failed, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust, &r.poll).hash(&mut h);
     r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
     r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
     loaded(&r.item.sender_avatar).hash(&mut h);
@@ -473,6 +499,32 @@ impl Models {
                         ReactionChip { key: s(key), count: *n as i32, mine: *mine, who: s(who), name: s(name), picture, custom: custom.is_some() }
                     })
                     .collect::<Vec<_>>(),
+            )),
+            poll: r.poll.is_some(),
+            poll_note: s(r.poll.as_ref().map(poll_note).unwrap_or_default()),
+            poll_can_end: r.poll.as_ref().is_some_and(|p| p.can_end),
+            poll_ended: r.poll.as_ref().is_some_and(|p| p.ended),
+            poll_options: ModelRc::new(VecModel::from(
+                r.poll
+                    .as_ref()
+                    .map(|p| {
+                        // Counts only when they may be seen: always, or once it ended.
+                        let show = p.disclosed || p.ended;
+                        let most = p.options.iter().map(|o| o.2).max().unwrap_or(0);
+                        p.options
+                            .iter()
+                            .map(|(id, text, n, mine)| PollOption {
+                                id: s(id),
+                                text: s(text),
+                                count: *n as i32,
+                                share: if show && p.voters > 0 { *n as f32 / p.voters as f32 } else { 0.0 },
+                                mine: *mine,
+                                show_count: show,
+                                winner: p.ended && most > 0 && *n == most,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
             )),
             mine: r.mine,
             trust: match r.trust {

@@ -13,6 +13,7 @@ pub mod media_fetch;
 pub mod moves;
 pub mod moderation;
 pub mod notices;
+pub mod polls;
 pub mod profile;
 pub mod rooms;
 pub mod signup;

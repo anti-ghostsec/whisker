@@ -34,7 +34,11 @@ pub enum ClientEvent {
         pills: Vec<(String, String)>,
         /// A warning about who really sent it (encrypted messages).
         shield: Option<crate::timeline::Shield>,
+        /// A poll: `body` is its question.
+        poll: Option<Box<crate::polls::Poll>>,
     },
+    /// A vote in a poll, or its end.
+    Vote { account: AccountId, room_id: OwnedRoomId, vote: crate::polls::Vote },
     /// Messages in a room may have been missed: we just joined it (what was
     /// said while we were invited, or away, never comes by syncing), or a
     /// sync skipped some (`limited`, after being offline a while). Its

@@ -118,6 +118,15 @@ static CLOCK: Mutex<Option<(u64, u32, Instant)>> = Mutex::new(None);
 /// sound comes out of the speaker a while later (the phone's buffers, and
 /// more with Bluetooth), and the phone's sound clock drifts from its timer.
 static HEARD: Mutex<Option<Heard>> = Mutex::new(None);
+/// The picture's last frame drawn: start, time round, the moment in the
+/// video, and when. A picture stuck loading (its part of the file not here
+/// yet, from a server) stops moving this, and the sound waits for it rather
+/// than playing on and dragging the picture after it, skipping what it missed.
+static PICTURE: Mutex<Option<(u64, u32, f64, Instant)>> = Mutex::new(None);
+/// How far the sound may get ahead of a picture that's stopped moving, and
+/// for how long it may have stopped, before the sound waits for it.
+const PICTURE_STUCK_AHEAD: f64 = 0.4;
+const PICTURE_STUCK_FOR: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy)]
 struct Heard {
@@ -712,6 +721,18 @@ fn wait_turn(follows: bool, start: Instant, generation: u64, round: u32) -> bool
     }
 }
 
+/// Whether start `generation`'s picture has stopped moving (stuck loading)
+/// well behind `sound_at`, the moment the sound is about to play.
+fn picture_stuck(generation: u64, round: u32, sound_at: f64) -> bool {
+    if VIDEO_GONE.load(Ordering::Relaxed) == generation {
+        return false;
+    }
+    PICTURE
+        .lock()
+        .unwrap()
+        .is_some_and(|(g, r, media, when)| g == generation && r == round && sound_at > media + PICTURE_STUCK_AHEAD && when.elapsed() > PICTURE_STUCK_FOR)
+}
+
 /// How long a decoder drawing to the image reader may go without a
 /// picture before the software decoder (into memory) is tried instead.
 const NO_PICTURE_GIVE_UP: Duration = Duration::from_secs(4);
@@ -915,6 +936,13 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, mut at: f64, mut
         // With sound playing, the picture keeps to what the speaker is at.
         if !first_due {
             let heard = *HEARD.lock().unwrap();
+            let kept = heard.is_some_and(|h| h.generation == generation && h.round == loops && h.told.elapsed() < HEARD_FRESH);
+            // Not kept to sound (muted, or the sound waiting for it), and
+            // far behind its own clock: it was stuck loading. It carries on
+            // from here instead of skipping what it missed.
+            if !kept && last_drawn.is_finite() && start.elapsed().as_secs_f64() > t - at + 0.3 {
+                start = Instant::now().checked_sub(Duration::from_secs_f64((t - at).max(0.0))).unwrap_or_else(Instant::now);
+            }
             if let Some(h) = heard
                 && h.generation == generation
                 && h.round == loops
@@ -958,6 +986,7 @@ fn decode_picture(ui: &Weak<AppWindow>, path: &Src, info: Info, mut at: f64, mut
             if let Some(frame) = frame {
                 last_drawn = t;
                 shown += 1;
+                *PICTURE.lock().unwrap() = Some((generation, loops, t, Instant::now()));
                 {
                     let mut now = NOW.lock().unwrap();
                     match now.as_mut() {
@@ -1180,6 +1209,25 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
                     let _ = s.request_start();
                 }
                 (written, base) = (0, None);
+            }
+            // The picture stuck loading: wait for it here (written sound
+            // held, nothing heard), rather than play on without it.
+            if follows
+                && let Some(s) = &stream
+                && picture_stuck(generation, loops, pts as f64 / 1e6)
+            {
+                let _ = s.request_pause();
+                HEARD.lock().unwrap().take_if(|h| h.generation == generation);
+                let t = pts as f64 / 1e6;
+                while current(generation) && VIDEO_GONE.load(Ordering::Relaxed) != generation {
+                    held(generation);
+                    let p = *PICTURE.lock().unwrap();
+                    if p.is_none_or(|(g, r, media, _)| g != generation || r != loops || media >= t - 0.1) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let _ = s.request_start();
             }
             if let Some(s) = &stream {
                 if base.is_none() {

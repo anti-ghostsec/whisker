@@ -30,6 +30,9 @@ pub const STARTING: &[&str] = &[
     "https://anoncat.cc/.well-known/anoncat/addresses.json",
     "https://anoncat.gleeze.com/.well-known/anoncat/addresses.json",
     "https://raw.githubusercontent.com/anti-ghostsec/anoncat/anoncat/ops/addresses/addresses.signed.json",
+    // Only fetched with a proxy (see [`usable`]).
+    "http://4v43hgwscgo2sika6mgh27vyz7cyhv6jgl66uvu3frfaim37xj43coad.onion/.well-known/anoncat/addresses.json",
+    "http://jhkgfbdp662iilxddkwg2mk64lbwkuynaq6lypyt4nkx5lk2yh63pqqd.onion/.well-known/anoncat/addresses.json",
 ];
 
 /// Server names the list is about before any copy has been seen: only
@@ -306,6 +309,8 @@ mod tests {
         assert!(s.contains(&"https://mirror.example/a.json".to_owned()));
         assert!(s.contains(&"http://abc.onion/.well-known/anoncat/addresses.json".to_owned()));
         assert!(!sources(Some(&l), false).iter().any(|u| u.contains(".onion")));
+        assert_eq!(sources(None, true).len(), STARTING.len());
+        assert_eq!(sources(None, false).len(), STARTING.len() - 2);
     }
 
     #[test]

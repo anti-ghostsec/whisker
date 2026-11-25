@@ -278,7 +278,7 @@ pub fn publish(staged: &Path, mime: &str) -> Result<Saved, String> {
     let name = staged.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
     let r = (|| -> Result<Saved, String> {
         if sdk() >= 29
-            && let Some((uri, fd)) = media_store_new(&name, mime)
+            && let Some((uri, fd)) = media_store_new(&name, &store_mime(&name, mime))
         {
             use std::os::fd::FromRawFd;
             // SAFETY: the descriptor was just detached from Java for us to own.
@@ -315,6 +315,28 @@ fn download_path(name: &str) -> Option<PathBuf> {
         _ => (name.to_owned(), String::new()),
     };
     (1..1000).map(|n| if n == 1 { dir.join(name) } else { dir.join(format!("{stem} ({n}){ext}")) }).find(|p| !p.exists())
+}
+
+/// The type to give the media store for `name`. It adds the extension it
+/// knows for the type when the name has another one (a comic sent as
+/// `application/x-cbr` but named `.cbz` was saved as "a.cbz.cbr"), so the
+/// name's own extension decides: its type if Android knows one, else a
+/// plain binary type, which gets nothing added.
+fn store_mime(name: &str, mime: &str) -> String {
+    let Some(ext) = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).filter(|e| !e.is_empty()) else { return mime.to_owned() };
+    let lookup = |method: &str, arg: &str| -> Option<String> {
+        with_env(|env, _| {
+            let map = env.call_static_method("android/webkit/MimeTypeMap", "getSingleton", "()Landroid/webkit/MimeTypeMap;", &[])?.l()?;
+            let a = env.new_string(arg)?;
+            let r = env.call_method(&map, method, "(Ljava/lang/String;)Ljava/lang/String;", &[JValue::Object(&a)])?.l()?;
+            string(env, r)
+        })
+        .flatten()
+    };
+    if lookup("getExtensionFromMimeType", mime).is_some_and(|e| e.eq_ignore_ascii_case(&ext)) {
+        return mime.to_owned();
+    }
+    lookup("getMimeTypeFromExtension", &ext).unwrap_or_else(|| "application/octet-stream".to_owned())
 }
 
 /// A new, empty file in the media store's Download/Whisker: its address

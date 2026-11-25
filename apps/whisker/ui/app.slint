@@ -2358,6 +2358,8 @@ export component AppWindow inherits Window {
     callback unlock(string);
     callback unlock-more(string);
     callback lock-hidden();
+    // The open profile's picture: "view", "save" or "share".
+    callback profile-picture(string);
     callback create-hidden(string);
     callback lock();
     callback filter-tag(string);
@@ -3441,7 +3443,19 @@ export component AppWindow inherits Window {
                             if root.profile-open: VerticalLayout {
                                 alignment: start;
                                 spacing: 10px;
-                                HorizontalLayout { alignment: center; Avatar { initial: root.profile.initial; hue: root.profile.hue; image: root.profile.avatar; size: 112px; } }
+                                // Right-click, or hold on a phone: the picture full size, or saved.
+                                HorizontalLayout {
+                                    alignment: center;
+                                    ContextMenuArea {
+                                        enabled: root.profile.avatar.width > 0;
+                                        Menu {
+                                            MenuItem { title: "Open picture"; activated => { root.profile-picture("view"); } }
+                                            MenuItem { title: "Save picture…"; activated => { root.profile-picture("save"); } }
+                                            if Prefs.touch: MenuItem { title: "Share…"; activated => { root.profile-picture("share"); } }
+                                        }
+                                        Avatar { initial: root.profile.initial; hue: root.profile.hue; image: root.profile.avatar; size: 112px; }
+                                    }
+                                }
                                 Text { text: root.profile.name; font-size: 20px; font-weight: 800; color: Theme.text; horizontal-alignment: center; wrap: char-wrap; }
                                 ContextMenuArea {
                                     Menu {

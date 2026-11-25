@@ -193,6 +193,8 @@ struct State {
     vault_stickers: HashMap<VaultId, (Vec<Sticker>, Vec<Sticker>)>,
     /// The vault each signed-in account is kept in.
     account_vaults: HashMap<AccountId, VaultId>,
+    /// Whose profile card is open, and from which room.
+    profile_user: Option<(RoomKey, OwnedUserId)>,
     /// The vaults last listed in settings, in order, with their names.
     vault_names: Vec<(VaultId, String)>,
     /// The vault `stickers` and `emoji` are from now.
@@ -5052,6 +5054,76 @@ impl Ctl {
 
     /// Saves a message's file; with `share` (phones) it then goes to the
     /// Share menu, to send to another app.
+    /// The open profile card's picture: shown full size, saved or shared.
+    async fn profile_picture(&self, action: String) {
+        let Some((key, user)) = self.st.lock().unwrap().profile_user.clone() else { return };
+        let Some(client) = self.mgr.client(key.0).await else { return };
+        let Some(room) = client.get_room(&key.1) else { return };
+        let mxc = match timeline::member_profile(&room, &user).await.1 {
+            Some(m) => Some(m),
+            None => client.account().fetch_user_profile_of(&user).await.ok().and_then(|p| p.get_static::<matrix_sdk::ruma::profile::AvatarUrl>().ok().flatten()),
+        };
+        let Some(mxc) = mxc else { return self.status("They have no picture.") };
+        let name = format!("{}-{}", user.localpart(), user.server_name()).replace(['/', '\\', ':'], "_");
+        if action == "view" {
+            let mut media = timeline::linked_media(mxc);
+            media.kind = MediaKind::Image;
+            media.name = name;
+            media.linked = false;
+            let item = HistoryItem {
+                event_id: OwnedEventId::try_from(format!("$whisker-avatar-{}", &whisker_core::vault::random_secret()[..12])).unwrap_or_else(|_| OwnedEventId::try_from("$whisker-avatar").expect("valid")),
+                sender: user,
+                sender_name: None,
+                sender_avatar: None,
+                body: String::new(),
+                ts: MilliSecondsSinceUnixEpoch::now(),
+                reply_to: None,
+                media: Some(media),
+                edited: false,
+                notice: true,
+                member: None,
+                thread: None,
+                pills: Vec::new(),
+                shield: None,
+                details: Vec::new(),
+                dev_only: false,
+                poll: None,
+            };
+            return self.view_image(&key, item).await;
+        }
+        self.status("Downloading…");
+        let bytes = match timeline::download_in(&client, &key.1, &MediaSource::Plain(mxc), None).await {
+            Ok(b) => b,
+            Err(e) => return self.status(format!("Couldn't get the picture: {e:#}")),
+        };
+        // Its own kind decides the name's ending (the server doesn't say).
+        let format = image::guess_format(&bytes).ok();
+        let ext = format.and_then(|f| f.extensions_str().first().copied()).unwrap_or("png");
+        let mime = format.map_or("image/png", |f| f.to_mime_type()).to_owned();
+        let Some(path) = save_file_as("Save picture", format!("{name}.{ext}")).await else {
+            #[cfg(target_os = "android")]
+            self.status("Couldn't save: Whisker's own folder can't be written to.");
+            return;
+        };
+        if let Err(e) = tokio::fs::write(&path, bytes).await {
+            return self.status(format!("Couldn't save: {e}"));
+        }
+        #[cfg(target_os = "android")]
+        if action == "share" {
+            return match saved_android(&path, &mime).await {
+                Ok(f) => {
+                    let opened = droid::share(&f, &mime);
+                    self.status(if opened { format!("Saved to {}.", f.shown) } else { format!("Saved to {}, but the Share menu couldn't be opened.", f.shown) });
+                }
+                Err(e) => self.status(format!("Couldn't save: {e}")),
+            };
+        }
+        self.status(match finish_save(&path, &mime).await {
+            Ok(shown) => format!("Saved to {shown}"),
+            Err(e) => format!("Couldn't save: {e}"),
+        });
+    }
+
     async fn save_media(&self, key: &RoomKey, m: HistoryItem, share: bool) {
         let Some(media) = m.media else { return };
         let name = timeline::plain_name(&media.name).replace(['/', '\\'], "_");
@@ -5488,6 +5560,7 @@ impl Ctl {
     /// Shows a user's profile card: name, avatar, role in this room and
     /// what we can do about them.
     async fn open_profile(&self, key: &RoomKey, user: OwnedUserId) {
+        self.st.lock().unwrap().profile_user = Some((key.clone(), user.clone()));
         let Some(client) = self.mgr.client(key.0).await else { return };
         let Some(room) = client.get_room(&key.1) else { return };
         let me = client.user_id().map(ToOwned::to_owned);
@@ -8250,6 +8323,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     }
     on!(on_unlock_more, |p| unlock_more);
     on!(on_lock_hidden, lock_hidden);
+    on!(on_profile_picture, |a| profile_picture);
     on!(on_create_hidden, |p| create_hidden);
     on!(on_select_account, |id| select_account);
     on!(on_select_room, |id| select_room);

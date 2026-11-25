@@ -2007,6 +2007,29 @@ impl Ctl {
         }
     }
 
+    /// Fetches a room's newest history again after messages may have been
+    /// missed (see `ClientEvent::Gap`) and shows it if the room is open.
+    /// If that fails, it's fetched again when the room is next opened.
+    fn fill_gap(&self, key: RoomKey) {
+        let c = self.clone();
+        self.spawn(async move {
+            let Some(room) = c.mgr.client(key.0).await.and_then(|cl| cl.get_room(&key.1)) else { return };
+            let page = match timeline::history(&room, None, PAGE).await {
+                Ok(p) => p,
+                Err(e) => return tracing::info!("couldn't fetch {} again after a gap: {e:#}", key.1),
+            };
+            c.mgr.note_history(key.0, &key.1, &page.items);
+            c.merge(&key, page.items);
+            c.merge_reactions(&key, page.reactions);
+            c.forget_deleted(&key, &page.gone);
+            c.st.lock().unwrap().older.insert(key.clone(), page.older);
+            if c.current().as_ref() == Some(&key) {
+                c.show_messages().await;
+            }
+            c.refresh_rooms().await;
+        });
+    }
+
     /// Adds messages to a room's cache; returns how many were new.
     fn merge(&self, key: &RoomKey, items: Vec<HistoryItem>) -> usize {
         let mut st = self.st.lock().unwrap();
@@ -7351,6 +7374,17 @@ impl Ctl {
                     }
                     if selected(account) {
                         self.schedule_rooms();
+                    }
+                }
+                ClientEvent::Gap { account, room_id, joined } => {
+                    let key = (account, room_id);
+                    // What's cached may have a hole before the newest: the
+                    // history is fetched afresh (now if the room is open, or
+                    // just joined, for its place in the room list; otherwise
+                    // when it's next opened).
+                    self.st.lock().unwrap().older.remove(&key);
+                    if self.current().as_ref() == Some(&key) || joined {
+                        self.fill_gap(key);
                     }
                 }
                 ClientEvent::Notice { account, room_id, item } => {

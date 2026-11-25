@@ -35,6 +35,11 @@ pub enum ClientEvent {
         /// A warning about who really sent it (encrypted messages).
         shield: Option<crate::timeline::Shield>,
     },
+    /// Messages in a room may have been missed: we just joined it (what was
+    /// said while we were invited, or away, never comes by syncing), or a
+    /// sync skipped some (`limited`, after being offline a while). Its
+    /// history is to be fetched again rather than trusted as cached.
+    Gap { account: AccountId, room_id: OwnedRoomId, joined: bool },
     /// A room event (join, leave, rename, …) as a notice line.
     Notice { account: AccountId, item: Box<crate::timeline::HistoryItem>, room_id: OwnedRoomId },
     /// Someone's read receipt in a room moved.

@@ -1117,6 +1117,16 @@ impl AccountManager {
                             // room's full state) become notices: "Alice joined".
                             for (room_id, update) in &resp.rooms.joined {
                                 let Some(room) = c.get_room(room_id) else { continue };
+                                // Our own join (from an invite, or back after leaving).
+                                let me = room.own_user_id();
+                                let joined = update.timeline.events.iter().any(|ev| {
+                                    use matrix_sdk::ruma::events::room::member::{MembershipChange, SyncRoomMemberEvent};
+                                    matches!(ev.raw().deserialize_as_unchecked::<SyncRoomMemberEvent>(), Ok(SyncRoomMemberEvent::Original(m))
+                                        if m.state_key == me && matches!(m.membership_change(), MembershipChange::Joined | MembershipChange::InvitationAccepted | MembershipChange::KnockAccepted))
+                                });
+                                if joined || update.timeline.limited {
+                                    let _ = tx.send(ClientEvent::Gap { account, room_id: room_id.clone(), joined });
+                                }
                                 let mut profiles = HashMap::new();
                                 for ev in &update.timeline.events {
                                     let Some(st) = timeline::state_event(ev.raw()) else { continue };

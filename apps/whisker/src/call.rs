@@ -132,9 +132,8 @@ impl Ctl {
         let Some(call) = call else { return };
         call_audio::stop();
         self.call_show();
-        if let Some(note) = note {
-            self.status(note);
-        }
+        // With nothing to say, "… is calling." doesn't stay behind.
+        self.status(note.unwrap_or_default());
         if let Some(signal) = tell {
             self.call_say(&call.key, &call.id, &call.party, signal).await;
         }
@@ -349,11 +348,20 @@ impl Ctl {
                 if self.call_barred(account, &room).await.is_some() {
                     return;
                 }
-                let party = calls::new_id();
-                // Busy: the caller is told at once.
-                if NOW.lock().unwrap().is_some() {
-                    return self.call_say(&key, &said.call_id, &party, Signal::Reject).await;
+                // Already on a call here. Nothing is said back: a decline
+                // would stop this account's other devices ringing too, and
+                // the call going on may be this very one, placed from
+                // another account signed in on this device.
+                let busy = NOW.lock().unwrap().as_ref().map(|c| c.id == said.call_id);
+                match busy {
+                    Some(true) => return,
+                    Some(false) => {
+                        let who = room.cached_display_name().map(|n| n.to_string()).unwrap_or_else(|| sender.to_string());
+                        return self.status(format!("{who} tried to call during this call."));
+                    }
+                    None => {}
                 }
+                let party = calls::new_id();
                 let who = room.cached_display_name().map(|n| n.to_string()).unwrap_or_else(|| sender.to_string());
                 let serial = SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
                 *NOW.lock().unwrap() = Some(Call {
@@ -449,7 +457,7 @@ impl Ctl {
             Signal::Reject => {
                 let Some((serial, stage, _, _, who)) = about else { return };
                 match (own, stage) {
-                    (true, Stage::Ringing) => self.call_end(Some(serial), None, None).await,
+                    (true, Stage::Ringing) => self.call_end(Some(serial), None, Some("The call was declined on another device.".into())).await,
                     (false, Stage::Calling) => self.call_end(Some(serial), None, Some(format!("{who} declined the call."))).await,
                     _ => {}
                 }

@@ -380,7 +380,7 @@ fn frame_size(info: &VideoInfo, max: (u32, u32)) -> (u32, u32) {
 
 /// How to send the sound: the first of PulseAudio (PipeWire speaks it) or
 /// ALSA that takes a moment of silence, found once.
-fn sound_output() -> Option<&'static [&'static str]> {
+pub(crate) fn sound_output() -> Option<&'static [&'static str]> {
     static FOUND: std::sync::OnceLock<Option<&'static [&'static str]>> = std::sync::OnceLock::new();
     *FOUND.get_or_init(|| {
         let tries: [&'static [&'static str]; 2] = [&["-f", "pulse", "Whisker"], &["-f", "alsa", "default"]];

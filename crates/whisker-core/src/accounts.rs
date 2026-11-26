@@ -1216,6 +1216,11 @@ impl AccountManager {
         client.add_event_handler(move |raw: matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnySyncTimelineEvent>, room: Room, info: Option<matrix_sdk::deserialized_responses::EncryptionInfo>| {
             let (tx, latest) = (tx.clone(), latest.clone());
             async move {
+                // Calls: for whatever is ringing or talking, never shown.
+                if let Some((sender, said, ts)) = call_event(&raw) {
+                    let _ = tx.send(ClientEvent::Call { account, room_id: room.room_id().to_owned(), sender, said, ts });
+                    return;
+                }
                 // Polls: shown as one, votes and ends counted into it.
                 match timeline::poll_event(&room, &raw, &mut HashMap::new()).await {
                     Some(timeline::PollEvent::Start(item)) => {
@@ -1889,6 +1894,11 @@ impl AccountManager {
         self.inner.read().await.live.values().flat_map(|a| a.record.tags.iter().cloned()).collect()
     }
 
+    /// The proxy account `id` connects through, if it has one.
+    pub async fn proxy_of(&self, id: AccountId) -> Option<String> {
+        self.inner.read().await.vaults.values().flat_map(|v| v.profile.accounts.iter()).find(|r| r.id == id).and_then(|r| r.proxy.clone())
+    }
+
     pub async fn client(&self, id: AccountId) -> Option<Client> {
         self.inner.read().await.live.get(&id).map(|a| a.client.clone())
     }
@@ -2248,4 +2258,16 @@ mod vouch_tests {
         // Two people never, even in one vault.
         assert!(vouch_pairs(&[(Human, "main"), (Human, "main")]).is_empty());
     }
+}
+
+/// A call event's sender, what it says, and when (see [`crate::calls`]).
+fn call_event(raw: &matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnySyncTimelineEvent>) -> Option<(matrix_sdk::ruma::OwnedUserId, crate::calls::Said, matrix_sdk::ruma::MilliSecondsSinceUnixEpoch)> {
+    let kind = raw.get_field::<String>("type").ok().flatten()?;
+    if !crate::calls::is_call_event(&kind) {
+        return None;
+    }
+    let sender = raw.get_field("sender").ok().flatten()?;
+    let ts = raw.get_field("origin_server_ts").ok().flatten()?;
+    let content = raw.get_field::<serde_json::Value>("content").ok().flatten()?;
+    Some((sender, crate::calls::parse(&kind, &content)?, ts))
 }

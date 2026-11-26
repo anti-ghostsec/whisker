@@ -256,6 +256,8 @@ component GeneralPage inherits VerticalLayout {
     callback set-invidious(string);
     callback set-send-typing(bool);
     callback set-voice-messages(bool);
+    callback set-voice-calls(bool);
+    callback set-change-voice(bool);
     callback set-large-videos(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -416,6 +418,38 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.voice-messages;
                 toggled => { root.set-voice-messages(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Voice calls"; color: Theme.text; }
+                Text {
+                    text: "A Call button in chats between two people, and ringing when the other person calls (Whisker, or Element's older apps; not Element X). The sound only ever goes through your server's relay, so neither of you learns the other's address on the internet: with no relay, there's no call. Accounts behind a proxy don't call, since a call's sound can't go through it. Use headphones, or the other person may hear an echo.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.voice-calls;
+                toggled => { root.set-voice-calls(self.checked); }
+            }
+        }
+        if Prefs.voice-calls: HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Change my voice in calls"; color: Theme.text; }
+                Text {
+                    text: "Your voice is made deeper or higher before it leaves this device, by a different amount each call. It disguises you from the person listening; it isn't proof against someone comparing recordings closely.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.change-voice;
+                toggled => { root.set-change-voice(self.checked); }
             }
         }
         HorizontalLayout {
@@ -1542,6 +1576,8 @@ export component SettingsPage inherits Rectangle {
     callback set-invidious(string);
     callback set-send-typing(bool);
     callback set-voice-messages(bool);
+    callback set-voice-calls(bool);
+    callback set-change-voice(bool);
     callback set-large-videos(bool);
     callback set-clear-command(string);
     callback set-autocorrect(bool);
@@ -1658,6 +1694,8 @@ export component SettingsPage inherits Rectangle {
                             set-invidious(t) => { root.set-invidious(t); }
                             set-send-typing(b) => { root.set-send-typing(b); }
                             set-voice-messages(b) => { root.set-voice-messages(b); }
+                            set-voice-calls(b) => { root.set-voice-calls(b); }
+                            set-change-voice(b) => { root.set-change-voice(b); }
                             set-large-videos(b) => { root.set-large-videos(b); }
                             set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }

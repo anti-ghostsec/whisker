@@ -59,14 +59,7 @@ pub fn start() -> Result<(), String> {
     STOP.store(false, Ordering::SeqCst);
     *LIVE.lock().unwrap() = Some(Live { samples: Vec::new(), started: Instant::now() });
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let handle = std::thread::spawn(move || {
-        #[cfg(target_os = "android")]
-        crate::player::voice::record(&STOP, tx, push);
-        #[cfg(all(target_os = "linux", not(target_os = "android")))]
-        desktop::record(&STOP, tx, push);
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let _ = tx.send(Err("Recording isn't available here.".into()));
-    });
+    let handle = std::thread::spawn(move || capture(&STOP, tx, push, MAX_LENGTH));
     *THREAD.lock().unwrap() = Some(handle);
     // Whether the microphone opened.
     match rx.recv_timeout(Duration::from_secs(5)) {
@@ -79,6 +72,21 @@ pub fn start() -> Result<(), String> {
             cancel();
             Err("The microphone didn't start.".into())
         }
+    }
+}
+
+/// Listens to the microphone until `stop` (or for `max`), handing what it
+/// hears (one channel, [`RATE`]) to `push`, and says on `ready` whether the
+/// microphone opened. A call listens this way too.
+pub fn capture(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), String>>, push: fn(&[i16]), max: Duration) {
+    #[cfg(target_os = "android")]
+    crate::player::voice::record(stop, ready, push, max);
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    desktop::record(stop, ready, push, max);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = (stop, push, max);
+        let _ = ready.send(Err("The microphone isn't available here.".into()));
     }
 }
 
@@ -170,7 +178,7 @@ mod desktop {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), String>>, push: fn(&[i16])) {
+    pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), String>>, push: fn(&[i16]), max: std::time::Duration) {
         let rate = RATE.to_string();
         let mut child = None;
         for input in [["-f", "pulse", "-i", "default"], ["-f", "alsa", "-i", "default"]] {
@@ -200,7 +208,7 @@ mod desktop {
         let mut out = child.stdout.take().expect("piped");
         let mut buf = vec![0u8; (RATE / 20) as usize * 2];
         let started = std::time::Instant::now();
-        while !stop.load(Ordering::SeqCst) && started.elapsed() < super::MAX_LENGTH {
+        while !stop.load(Ordering::SeqCst) && started.elapsed() < max {
             let Ok(n) = out.read(&mut buf) else { break };
             if n == 0 {
                 break;

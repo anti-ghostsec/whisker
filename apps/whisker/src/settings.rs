@@ -102,6 +102,12 @@ pub struct AppSettings {
     /// Videos take a bigger space in the chat (twice as wide).
     #[serde(default)]
     pub large_videos: bool,
+    /// Voice calls: the Call button, and ringing when someone calls.
+    #[serde(default)]
+    pub voice_calls: bool,
+    /// In calls, the voice is changed before it leaves this device.
+    #[serde(default = "yes")]
+    pub change_voice: bool,
     /// Fix common typos in the composer as you type. Off unless turned on
     /// (saved under a new name: it used to be on for everyone).
     #[serde(default, rename = "autocorrect_on")]

@@ -2546,6 +2546,18 @@ export component AppWindow inherits Window {
     callback set-invidious(string);
     callback set-send-typing(bool);
     callback set-voice-messages(bool);
+    callback set-voice-calls(bool);
+    callback set-change-voice(bool);
+    // The call going on: 0 none, 1 calling them, 2 ringing here,
+    // 3 connecting, 4 talking; who with; and how long it's been.
+    in-out property <int> call-stage;
+    in-out property <string> call-name;
+    in-out property <bool> call-muted;
+    in-out property <int> call-seconds;
+    callback call-start();
+    callback call-answer();
+    callback call-hangup();
+    callback call-mute();
     callback set-large-videos(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -2890,6 +2902,10 @@ export component AppWindow inherits Window {
                                     topic-ta := TouchArea { mouse-cursor: pointer; clicked => { root.activity(); root.open-topic(); } }
                                 }
                                 TouchArea { mouse-cursor: pointer; clicked => { if root.current-room != "" && !root.current-preview { root.open-room-info(); } } }
+                            }
+                            if Prefs.voice-calls && root.call-stage == 0 && root.current-room != "" && !root.current-preview && !root.current-invite && !root.current-space: VerticalLayout {
+                                alignment: center;
+                                Btn { text: "Call"; clicked => { root.activity(); root.call-start(); } }
                             }
                             if root.current-room != "" && !root.current-preview: VerticalLayout {
                                 alignment: center;
@@ -3945,6 +3961,8 @@ export component AppWindow inherits Window {
             set-invidious(t) => { root.set-invidious(t); }
             set-send-typing(b) => { root.set-send-typing(b); }
             set-voice-messages(b) => { root.set-voice-messages(b); }
+            set-voice-calls(b) => { root.set-voice-calls(b); }
+            set-change-voice(b) => { root.set-change-voice(b); }
             set-large-videos(b) => { root.set-large-videos(b); }
             set-autocorrect(b) => { root.set-autocorrect(b); }
             set-spell-check(b) => { root.set-spell-check(b); }
@@ -4167,6 +4185,52 @@ export component AppWindow inherits Window {
             }
             copy(t) => { root.copy-text(t); }
             link(l) => { root.open-link(l); }
+        }
+
+        // The call going on, over whatever is open.
+        Timer {
+            interval: 1s;
+            running: root.call-stage == 4;
+            triggered => { root.call-seconds += 1; }
+        }
+        if root.call-stage != 0: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: Safe.top + 8px;
+            width: min(460px, parent.width - 16px);
+            height: 52px;
+            border-radius: 14px;
+            background: Theme.panel;
+            border-width: 1px;
+            border-color: root.call-stage == 2 ? Theme.accent : Theme.border;
+            drop-shadow-blur: 14px;
+            drop-shadow-color: #00000060;
+            TouchArea {}
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 8px;
+                spacing: 8px;
+                Text {
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    color: Theme.text;
+                    font-weight: 700;
+                    text: root.call-stage == 1 ? "Calling " + root.call-name + "…"
+                        : root.call-stage == 2 ? root.call-name + " is calling"
+                        : root.call-stage == 3 ? "Connecting to " + root.call-name + "…"
+                        : root.call-name + " · " + floor(root.call-seconds / 60) + ":" + (mod(root.call-seconds, 60) < 10 ? "0" : "") + mod(root.call-seconds, 60);
+                }
+                if root.call-stage == 2: VerticalLayout { alignment: center; Btn { text: "Answer"; primary: true; clicked => { root.activity(); root.call-answer(); } } }
+                if root.call-stage == 4: VerticalLayout { alignment: center; Btn { text: root.call-muted ? "Unmute" : "Mute"; clicked => { root.activity(); root.call-mute(); } } }
+                VerticalLayout {
+                    alignment: center;
+                    Btn {
+                        text: root.call-stage == 2 ? "Decline" : root.call-stage == 1 ? "Cancel" : "Hang up";
+                        danger: true;
+                        clicked => { root.activity(); root.call-hangup(); }
+                    }
+                }
+            }
         }
 
         if root.attach-open: Rectangle {

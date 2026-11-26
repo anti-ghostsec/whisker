@@ -4,11 +4,11 @@
 
 use super::*;
 use std::path::Path;
-use crate::voice::{MAX_LENGTH, RATE};
+use crate::voice::RATE;
 
 /// Records until `stop`, handing samples (mono, [`RATE`]) to `push`. Says on
 /// `ready` whether the microphone opened.
-pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), String>>, push: fn(&[i16])) {
+pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), String>>, push: fn(&[i16]), max: Duration) {
     let stream = AudioStreamBuilder::new().and_then(|b| {
         b.direction(AudioDirection::Input)
             .format(AudioFormat::PCM_I16)
@@ -32,7 +32,7 @@ pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), Strin
     let _ = ready.send(Ok(()));
     let mut buf = vec![0i16; 960];
     let started = Instant::now();
-    while !stop.load(Ordering::SeqCst) && started.elapsed() < MAX_LENGTH {
+    while !stop.load(Ordering::SeqCst) && started.elapsed() < max {
         // SAFETY: `buf` holds `buf.len()` samples, one channel.
         let n = frames_done(unsafe { stream.read(buf.as_mut_ptr().cast(), buf.len() as i32, 100_000_000) });
         match n {
@@ -46,6 +46,35 @@ pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), Strin
                 }
             }
             Err(_) => break,
+        }
+    }
+    let _ = stream.request_stop();
+}
+
+/// Plays a call's sound until `stop`: `take` fills each piece (one
+/// channel, [`RATE`]), and the phone's sound output sets the pace.
+pub fn play(stop: &AtomicBool, take: &dyn Fn(&mut [i16])) {
+    let stream = AudioStreamBuilder::new().and_then(|b| {
+        b.direction(AudioDirection::Output)
+            .format(AudioFormat::PCM_I16)
+            .channel_count(1)
+            .sample_rate(RATE as i32)
+            .open_stream()
+    });
+    let Ok(stream) = stream else { return };
+    if stream.request_start().is_err() {
+        return;
+    }
+    let mut piece = vec![0i16; 960];
+    while !stop.load(Ordering::SeqCst) {
+        take(&mut piece);
+        let mut done = 0usize;
+        while done < piece.len() && !stop.load(Ordering::SeqCst) {
+            // SAFETY: `piece[done..]` holds that many samples, one channel.
+            match frames_done(unsafe { stream.write(piece[done..].as_ptr().cast(), (piece.len() - done) as i32, 100_000_000) }) {
+                Ok(n) => done += n as usize,
+                Err(_) => return,
+            }
         }
     }
     let _ = stream.request_stop();

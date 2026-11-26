@@ -39,6 +39,10 @@ pub enum ClientEvent {
     },
     /// A vote in a poll, or its end.
     Vote { account: AccountId, room_id: OwnedRoomId, vote: crate::polls::Vote },
+    /// Something said about a call (an invite, an answer, a hang-up…) in a
+    /// room, by `sender` (who may be this account, from another device),
+    /// at `ts`: old ones come too, when catching up.
+    Call { account: AccountId, room_id: OwnedRoomId, sender: OwnedUserId, said: crate::calls::Said, ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch },
     /// Messages in a room may have been missed: we just joined it (what was
     /// said while we were invited, or away, never comes by syncing), or a
     /// sync skipped some (`limited`, after being offline a while). Its

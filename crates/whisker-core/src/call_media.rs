@@ -508,6 +508,24 @@ mod tests {
         assert_eq!(usable(&relay), ["turn:r.example:3478?transport=udp", "turn:r.example:3478"]);
     }
 
+    /// A relay that doesn't answer: there's no call, and above all no
+    /// offer naming this computer's own addresses instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_relay_nothing_is_offered() {
+        // A port nothing listens on.
+        let relay = calls::Relay { uris: vec!["turn:127.0.0.1:9?transport=udp".into()], username: "u".into(), password: "p".into() };
+        let (link, _says) = Link::new(Route::Relay(relay)).await.unwrap();
+        let offered = link.offer().await;
+        assert!(offered.is_err(), "offered without a relay: {offered:?}");
+        // What the library itself holds has no address of this computer either.
+        let own = link.pc.local_description().await.map(|d| d.sdp).unwrap_or_default();
+        assert!(!own.lines().any(|l| l.starts_with("a=candidate:") && !calls::is_relay(l)), "{own}");
+        link.close().await;
+        // And a relay that can only be reached over TCP isn't tried at all.
+        let tcp = calls::Relay { uris: vec!["turn:127.0.0.1:9?transport=tcp".into()], username: "u".into(), password: "p".into() };
+        assert!(Link::new(Route::Relay(tcp)).await.is_err());
+    }
+
     /// Two ends on this computer: one calls, the other picks up, and a
     /// tone said at one end is heard at the other.
     #[tokio::test(flavor = "multi_thread")]

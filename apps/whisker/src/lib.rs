@@ -26,6 +26,10 @@ mod spell_marks;
 mod typeset;
 mod ui;
 mod voice;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod call;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod call_audio;
 
 use anyhow::Result;
 use matrix_sdk::ruma::events::room::MediaSource;
@@ -506,6 +510,8 @@ fn stop_all_media(ui: &slint::Weak<AppWindow>) {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = ui;
     voice::cancel();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    call::drop_now();
     for mut c in EXTERNAL_PLAYERS.lock().unwrap().drain(..) {
         let _ = c.kill();
         let _ = c.wait();
@@ -1505,6 +1511,9 @@ impl Ctl {
     }
 
     async fn lock(&self) {
+        // A call going on is hung up first, while the account can still say so.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.call_hangup().await;
         self.locks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // First: sound and the microphone stop at once.
         let ui = self.ui.clone();
@@ -6269,6 +6278,32 @@ impl Ctl {
         });
     }
 
+    fn set_voice_calls(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.voice_calls = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_voice_calls(on);
+        }
+        // Turned off in the middle of a call: it's hung up.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if !on {
+            let c = self.clone();
+            self.spawn(async move { c.call_hangup().await });
+        }
+    }
+
+    fn set_change_voice(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.change_voice = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_change_voice(on);
+        }
+    }
+
     fn set_voice_messages(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.voice_messages = on;
@@ -7973,6 +8008,13 @@ impl Ctl {
                         self.update_message(&key, &target);
                     }
                 }
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                ClientEvent::Call { account, room_id, sender, said, ts } => {
+                    let c = self.clone();
+                    self.spawn(async move { c.call_said(account, room_id, sender, said, ts).await });
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                ClientEvent::Call { .. } => {}
                 ClientEvent::Vote { account, room_id, vote } => {
                     let key = (account, room_id);
                     if self.st.lock().unwrap().older.contains_key(&key) {
@@ -8358,6 +8400,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     mgr.set_media_in_vault(prefs.media_in_vault);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_voice_messages(prefs.voice_messages);
+    ui.global::<Prefs>().set_voice_calls(prefs.voice_calls && voice::available());
+    ui.global::<Prefs>().set_change_voice(prefs.change_voice);
     ui.global::<Prefs>().set_large_videos(prefs.large_videos);
     ui::LARGE_VIDEOS.store(prefs.large_videos, std::sync::atomic::Ordering::Relaxed);
     ui.set_voice_available(voice::available());
@@ -8719,6 +8763,30 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.on_set_send_typing(move |b| c.set_send_typing(b));
         let c = ctl.clone();
         ui.on_set_voice_messages(move |b| c.set_voice_messages(b));
+        let c = ctl.clone();
+        ui.on_set_voice_calls(move |b| c.set_voice_calls(b));
+        let c = ctl.clone();
+        ui.on_set_change_voice(move |b| c.set_change_voice(b));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let c = ctl.clone();
+            ui.on_call_start(move || {
+                let c = c.clone();
+                c.clone().spawn(async move { c.call_start().await });
+            });
+            let c = ctl.clone();
+            ui.on_call_answer(move || {
+                let c = c.clone();
+                c.clone().spawn(async move { c.call_answer().await });
+            });
+            let c = ctl.clone();
+            ui.on_call_hangup(move || {
+                let c = c.clone();
+                c.clone().spawn(async move { c.call_hangup().await });
+            });
+            let c = ctl.clone();
+            ui.on_call_mute(move || c.call_mute());
+        }
         let c = ctl.clone();
         ui.on_set_large_videos(move |b| c.set_large_videos(b));
         let c = ctl.clone();

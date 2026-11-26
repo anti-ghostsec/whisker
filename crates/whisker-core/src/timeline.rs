@@ -1698,6 +1698,46 @@ pub enum Subtitles {
     Bitmap,
 }
 
+/// One of a video's subtitle tracks that can be drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubtitleTrack {
+    /// Which of the file's subtitle tracks it is, as ffmpeg counts them
+    /// (0 is the first; ones that can't be drawn are counted too).
+    pub index: usize,
+    pub kind: Subtitles,
+    /// Its language and title as the file gives them, else "Track 2".
+    pub label: String,
+}
+
+/// The subtitle tracks in ffprobe's lines: each stream lists its codec,
+/// its type, then its tags.
+fn subtitle_tracks(text: &str) -> Vec<SubtitleTrack> {
+    let mut tracks = Vec::new();
+    let mut count = 0;
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(codec) = line.strip_prefix("codec_name=") else { continue };
+        if lines.get(i + 1) != Some(&"codec_type=subtitle") {
+            continue;
+        }
+        let index = count;
+        count += 1;
+        let Some(kind) = subtitle_kind(codec) else { continue };
+        // This stream's tags: up to the next stream.
+        let tags = lines[i + 1..].iter().take_while(|l| !l.starts_with("codec_name="));
+        let tag = |name: &str| tags.clone().find_map(|l| l.strip_prefix(name)?.strip_prefix('=')).map(str::trim).filter(|v| !v.is_empty() && *v != "und");
+        let label = match (tag("TAG:language"), tag("TAG:title")) {
+            (Some(language), Some(title)) if !title.eq_ignore_ascii_case(language) => format!("{language} · {title}"),
+            (Some(one), _) | (None, Some(one)) => one.to_owned(),
+            (None, None) => format!("Track {}", index + 1),
+        };
+        // No control characters, and not too long for the menu.
+        let label: String = label.chars().filter(|c| !c.is_control()).take(40).collect();
+        tracks.push(SubtitleTrack { index, kind, label });
+    }
+    tracks
+}
+
 fn subtitle_kind(codec: &str) -> Option<Subtitles> {
     match codec {
         "subrip" | "srt" | "ass" | "ssa" | "mov_text" | "webvtt" | "text" | "microdvd" => Some(Subtitles::Text),
@@ -1785,8 +1825,14 @@ pub fn probe_video(input: impl AsRef<std::ffi::OsStr>) -> Option<VideoInfo> {
 /// Like [`probe_video`], but sound alone (a voice message, a song) does too:
 /// then the width and height are 0.
 pub fn probe_media(input: impl AsRef<std::ffi::OsStr>) -> Option<VideoInfo> {
+    probe_media_tracks(input).map(|(info, _)| info)
+}
+
+/// [`probe_media`], and the subtitle tracks to choose from.
+pub fn probe_media_tracks(input: impl AsRef<std::ffi::OsStr>) -> Option<(VideoInfo, Vec<SubtitleTrack>)> {
     let text = probe_text(input.as_ref())?;
-    parse_probe(&text).or_else(|| parse_sound(&text))
+    let info = parse_probe(&text).or_else(|| parse_sound(&text))?;
+    Some((info, subtitle_tracks(&text)))
 }
 
 /// A file with only sound, from ffprobe's lines.
@@ -1806,7 +1852,7 @@ fn probe_text(input: &std::ffi::OsStr) -> Option<String> {
     use std::process::{Command, Stdio};
     let probe = Command::new("ffprobe")
         .args(ffmpeg_guard(input.as_ref()))
-        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:stream_side_data=rotation:stream_tags=rotate:format=duration", "-of", "default=nw=1"])
+        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:stream_side_data=rotation:stream_tags=rotate,language,title:format=duration", "-of", "default=nw=1"])
         .arg(input)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -1926,6 +1972,21 @@ pub async fn send_voice(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lists_subtitle_tracks_to_pick_from() {
+        // As ffprobe prints a video with sound, two text tracks, one that
+        // can't be drawn, and a picture track.
+        let text = "codec_name=h264\ncodec_type=video\nwidth=1280\nheight=720\ncodec_name=aac\ncodec_type=audio\n\
+            codec_name=subrip\ncodec_type=subtitle\nwidth=N/A\nheight=N/A\nTAG:language=eng\nTAG:title=English (full)\n\
+            codec_name=subrip\ncodec_type=subtitle\nwidth=N/A\nheight=N/A\nTAG:language=spa\n\
+            codec_name=eia_608\ncodec_type=subtitle\nTAG:language=eng\n\
+            codec_name=hdmv_pgs_subtitle\ncodec_type=subtitle\nwidth=1920\nheight=1080\nduration=6.189000\n";
+        let tracks = super::subtitle_tracks(text);
+        let seen: Vec<(usize, super::Subtitles, &str)> = tracks.iter().map(|t| (t.index, t.kind, t.label.as_str())).collect();
+        assert_eq!(seen, [(0, super::Subtitles::Text, "eng · English (full)"), (1, super::Subtitles::Text, "spa"), (3, super::Subtitles::Bitmap, "Track 4")]);
+        assert!(super::subtitle_tracks("codec_name=h264\ncodec_type=video\nwidth=2\nheight=2\n").is_empty());
+    }
+
     #[test]
     fn upright_phone_videos_swap_their_size() {
         let probe = |extra: &str| super::parse_probe(&format!("codec_name=h264\ncodec_type=video\nwidth=1920\nheight=1080\n{extra}duration=1.5\n")).unwrap();

@@ -292,6 +292,7 @@ pub fn set_volume(ui: &Weak<AppWindow>, level: i32) {
 
 /// No subtitles on phones yet.
 pub fn subtitles(_ui: &Weak<AppWindow>) {}
+pub fn pick_subtitles(_ui: &Weak<AppWindow>, _choice: i32) {}
 
 /// Shows the video big over the window, or back in its message.
 pub fn set_large(ui: &Weak<AppWindow>, large: bool) {

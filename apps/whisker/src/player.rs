@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use whisker_core::files::Relay;
-use whisker_core::timeline::{Subtitles, VideoInfo, probe_media};
+use whisker_core::timeline::{SubtitleTrack, Subtitles, VideoInfo, probe_media_tracks};
 
 /// Frames a second shown.
 const FPS: u32 = 30;
@@ -38,6 +38,9 @@ struct Playing {
     muted: bool,
     /// Subtitles drawn (when it has them).
     subtitles: bool,
+    /// The subtitle tracks it has, and which of them is drawn.
+    tracks: Vec<SubtitleTrack>,
+    track: usize,
     /// Shown big, over the whole window.
     large: bool,
     /// Meant to be playing (ffmpeg may still be starting).
@@ -108,19 +111,20 @@ fn start(ui: Weak<AppWindow>, id: String, input: OsString, relay: Option<Relay>)
         p.set_id(shown.into());
         p.set_loading(true);
     });
-    let Some(info) = probe_media(&input) else { return false };
+    let Some((info, tracks)) = probe_media_tracks(&input) else { return false };
     // Sound alone needs somewhere to go.
     let sound_only = info.width == 0;
     if sound_only && sound_output().is_none() {
         return false;
     }
     let duration = info.duration.map_or(0.0, |d| d.as_secs_f64());
-    let has_subtitles = info.subtitles.is_some();
+    let has_subtitles = !tracks.is_empty();
+    let labels: Vec<slint::SharedString> = tracks.iter().map(|t| t.label.as_str().into()).collect();
     // Text subtitles are read from the whole file before the first frame:
     // when streaming, they're there to turn on, not on at the start.
-    let shown = has_subtitles && !(relay.is_some() && info.subtitles == Some(Subtitles::Text));
+    let shown = has_subtitles && !(relay.is_some() && tracks.first().is_some_and(|t| t.kind == Subtitles::Text));
     // Everything starts muted (no sudden loud sound); the speaker turns it on.
-    let playing = Playing { id: id.clone(), input, _relay: relay, info, at: 0.0, muted: true, subtitles: shown, large: false, playing: false, child: None, frozen: false, sounding: false, lead: false, frozen_at: None, leads: 0, generation: 0 };
+    let playing = Playing { id: id.clone(), input, _relay: relay, info, at: 0.0, muted: true, subtitles: shown, tracks, track: 0, large: false, playing: false, child: None, frozen: false, sounding: false, lead: false, frozen_at: None, leads: 0, generation: 0 };
     *NOW.lock().unwrap() = Some(playing);
     let _ = ui.upgrade_in_event_loop(move |u| {
         let p = u.global::<Player>();
@@ -131,6 +135,8 @@ fn start(ui: Weak<AppWindow>, id: String, input: OsString, relay: Option<Relay>)
         p.set_muted(true);
         p.set_has_subtitles(has_subtitles);
         p.set_subtitles(shown);
+        p.set_subtitle_tracks(slint::ModelRc::new(slint::VecModel::from(labels)));
+        p.set_subtitle_track(0);
         p.set_large(false);
     });
     resume(&ui);
@@ -195,8 +201,31 @@ pub fn set_volume(ui: &Weak<AppWindow>, level: i32) {
 
 /// Shows or hides the subtitles.
 pub fn subtitles(ui: &Weak<AppWindow>) {
-    let Some((on, running)) = restart_with(|p| p.subtitles = !p.subtitles && p.info.subtitles.is_some()).map(|p| (p.subtitles, p.running)) else { return };
+    let Some((on, running)) = restart_with(|p| p.subtitles = !p.subtitles && !p.tracks.is_empty()).map(|p| (p.subtitles, p.running)) else { return };
     let _ = ui.upgrade_in_event_loop(move |u| u.global::<Player>().set_subtitles(on));
+    if running {
+        resume(ui);
+    }
+}
+
+/// Draws subtitle track `choice` (as listed), or none (-1).
+pub fn pick_subtitles(ui: &Weak<AppWindow>, choice: i32) {
+    let picked = restart_with(|p| match usize::try_from(choice).ok().filter(|n| *n < p.tracks.len()) {
+        Some(n) => {
+            p.track = n;
+            p.subtitles = true;
+        }
+        None => p.subtitles = false,
+    })
+    .map(|p| (p.subtitles, p.running));
+    let Some((on, running)) = picked else { return };
+    let _ = ui.upgrade_in_event_loop(move |u| {
+        let p = u.global::<Player>();
+        p.set_subtitles(on);
+        if on {
+            p.set_subtitle_track(choice);
+        }
+    });
     if running {
         resume(ui);
     }
@@ -437,7 +466,8 @@ fn size_filter(size: (u32, u32)) -> String {
     format!("fps={FPS},scale={}:{}", size.0, size.1)
 }
 
-fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtitles: Option<Subtitles>, lead: bool) -> std::io::Result<Child> {
+/// `subtitles`: the kind to draw, and which of the file's subtitle tracks.
+fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtitles: Option<(Subtitles, usize)>, lead: bool) -> std::io::Result<Child> {
     let mut cmd = Command::new("ffmpeg");
     // The picture's first frame held while the sound's silence plays.
     let hold = if lead { format!("tpad=start={LEAD_FRAMES}:start_mode=clone,") } else { String::new() };
@@ -446,14 +476,14 @@ fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subti
     let fit = format!("fps={FPS},scale={}:{},{hold}realtime=limit={PACE_LIMIT}", size.0, size.1);
     cmd.args(["-v", "error", "-ss", &format!("{at:.3}")]);
     // Text subtitles are drawn by time, so the times must stay the file's.
-    if subtitles == Some(Subtitles::Text) {
+    if subtitles.is_some_and(|s| s.0 == Subtitles::Text) {
         cmd.arg("-copyts");
     }
     cmd.args(whisker_core::timeline::ffmpeg_guard(path));
     cmd.arg("-i").arg(path);
     match subtitles {
-        Some(Subtitles::Text) => cmd.args(["-map", "0:v:0", "-vf", &format!("{},subtitles=filename={}:si=0,{hold}realtime=limit={PACE_LIMIT}", size_filter(size), filter_path(path))]),
-        Some(Subtitles::Bitmap) => cmd.args(["-filter_complex", &format!("[0:v:0][0:s:0]overlay,{fit}[v]"), "-map", "[v]"]),
+        Some((Subtitles::Text, n)) => cmd.args(["-map", "0:v:0", "-vf", &format!("{},subtitles=filename={}:si={n},{hold}realtime=limit={PACE_LIMIT}", size_filter(size), filter_path(path))]),
+        Some((Subtitles::Bitmap, n)) => cmd.args(["-filter_complex", &format!("[0:v:0][0:s:{n}]overlay,{fit}[v]"), "-map", "[v]"]),
         None => cmd.args(["-map", "0:v:0", "-vf", &fit]),
     };
     cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"]);
@@ -490,20 +520,20 @@ fn resume(ui: &Weak<AppWindow>) {
         if p.info.duration.is_some_and(|d| p.at >= d.as_secs_f64() - 0.2) {
             p.at = 0.0;
         }
-        (p.input.clone(), p.at, p.info, p.muted, p.subtitles, p.large, p.generation)
+        let subtitles = if p.subtitles { p.tracks.get(p.track).map(|t| (t.kind, t.index)) } else { None };
+        (p.input.clone(), p.at, p.info, p.muted, subtitles, p.large, p.generation)
     };
     crate::ui::video_starting(ui, move || {
         NOW.lock().unwrap().as_ref().is_some_and(|p| p.generation == generation) && SHOWN.load(std::sync::atomic::Ordering::Relaxed) != generation
     });
     let ui = ui.clone();
-    let subtitles = if subtitles { info.subtitles } else { None };
     let max = if large { MAX_LARGE_PX } else { MAX_PX };
     std::thread::spawn(move || run(ui, input, at, info, muted, subtitles, max, generation));
 }
 
 /// Starts ffmpeg and shows its frames until it ends or is replaced.
 #[allow(clippy::too_many_arguments)]
-fn run(ui: Weak<AppWindow>, input: OsString, at: f64, info: VideoInfo, muted: bool, subtitles: Option<Subtitles>, max: (u32, u32), generation: u64) {
+fn run(ui: Weak<AppWindow>, input: OsString, at: f64, info: VideoInfo, muted: bool, subtitles: Option<(Subtitles, usize)>, max: (u32, u32), generation: u64) {
     if info.width == 0 {
         let played = play_sound(&ui, &input, at, muted, generation);
         return ended(&ui, generation, played);

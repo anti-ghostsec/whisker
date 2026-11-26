@@ -8522,6 +8522,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         let c = ctl.clone();
         ui.global::<Player>().on_toggle_subtitles(move || player::subtitles(&c.ui));
         let c = ctl.clone();
+        ui.global::<Player>().on_pick_subtitles(move |n| player::pick_subtitles(&c.ui, n));
+        let c = ctl.clone();
         ui.global::<Player>().on_set_large(move |on| player::set_large(&c.ui, on));
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]

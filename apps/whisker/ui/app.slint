@@ -493,6 +493,9 @@ export global Player {
     // It has subtitles, and they're drawn.
     in-out property <bool> has-subtitles;
     in-out property <bool> subtitles;
+    // Its subtitle tracks (language, title), and the one drawn.
+    in-out property <[string]> subtitle-tracks;
+    in-out property <int> subtitle-track;
     // Shown big over the whole window.
     in-out property <bool> large;
     // Seconds.
@@ -514,6 +517,8 @@ export global Player {
     // being set (they'd hide with the hover, taking the level with them).
     in-out property <bool> bar-hold;
     callback toggle-subtitles();
+    // Draws that subtitle track (-1: none).
+    callback pick-subtitles(int);
     callback set-large(bool);
 }
 
@@ -656,7 +661,48 @@ component VideoBar inherits Rectangle {
                 border-color: Player.subtitles ? white : #ffffff70;
                 Text { text: "CC"; color: Player.subtitles ? white : #ffffff70; font-size: 8px; font-weight: 700; }
             }
-            TouchArea { mouse-cursor: pointer; clicked => { Player.toggle-subtitles(); } }
+            // One track: on and off. More: a list to pick from.
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    if Player.subtitle-tracks.length > 1 {
+                        root.idle = 0;
+                        Player.bar-hold = true;
+                        tracks-popup.show();
+                    } else {
+                        Player.toggle-subtitles();
+                    }
+                }
+            }
+            tracks-popup := PopupWindow {
+                property <length> tall: (Player.subtitle-tracks.length + 1) * 26px + 8px;
+                x: parent.width - 200px;
+                y: -self.tall - 6px;
+                width: 200px;
+                height: self.tall;
+                Rectangle {
+                    border-radius: 10px;
+                    background: #000000d8;
+                    VerticalLayout {
+                        padding: 4px;
+                        Rectangle {
+                            height: 26px;
+                            border-radius: 6px;
+                            background: off-ta.has-hover ? #ffffff28 : transparent;
+                            Text { x: 10px; width: parent.width - 20px; text: "Off"; color: !Player.subtitles ? Theme.accent : white; font-size: 12px; font-weight: !Player.subtitles ? 700 : 400; vertical-alignment: center; }
+                            off-ta := TouchArea { mouse-cursor: pointer; clicked => { Player.pick-subtitles(-1); } }
+                        }
+                        for name[i] in Player.subtitle-tracks: Rectangle {
+                            property <bool> on: Player.subtitles && Player.subtitle-track == i;
+                            height: 26px;
+                            border-radius: 6px;
+                            background: track-ta.has-hover ? #ffffff28 : transparent;
+                            Text { x: 10px; width: parent.width - 20px; text: name; color: parent.on ? Theme.accent : white; font-size: 12px; font-weight: parent.on ? 700 : 400; vertical-alignment: center; overflow: elide; }
+                            track-ta := TouchArea { mouse-cursor: pointer; clicked => { Player.pick-subtitles(i); } }
+                        }
+                    }
+                }
+            }
         }
         Rectangle {
             width: 18px;

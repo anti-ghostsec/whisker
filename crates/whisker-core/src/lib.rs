@@ -27,6 +27,7 @@ pub mod update;
 pub mod upload;
 pub mod vault;
 pub mod verify;
+pub mod voice_mask;
 
 pub use accounts::{AccountManager, AccountSummary, LoginRequest, SignupAnswer, SignupAsk, SignupStep, VaultId};
 pub use events::ClientEvent;

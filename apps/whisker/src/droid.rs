@@ -10,17 +10,25 @@
 use jni::JNIEnv;
 use jni::objects::{JObject, JObjectArray, JString, JValue};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 type R<T> = jni::errors::Result<T>;
 
-static APP: OnceLock<slint::android::AndroidApp> = OnceLock::new();
+/// The running activity. Replaced each time Android starts one (it may
+/// close the activity and open another in the same process): kept from the
+/// first one only, it went dead, so screenshots stayed blanked and
+/// Whisker's own folder couldn't be found until Whisker was restarted.
+static APP: RwLock<Option<slint::android::AndroidApp>> = RwLock::new(None);
+
+fn app() -> Option<slint::android::AndroidApp> {
+    APP.read().unwrap().clone()
+}
 
 /// Lets screenshots, screen recording and the recent-apps picture show
 /// Whisker, or blanks them (Android's secure window).
 pub fn allow_screenshots(allowed: bool) {
     use slint::android::android_activity::WindowManagerFlags;
-    if let Some(app) = APP.get() {
+    if let Some(app) = app() {
         let secure = WindowManagerFlags::SECURE;
         if allowed { app.set_window_flags(WindowManagerFlags::empty(), secure) } else { app.set_window_flags(secure, WindowManagerFlags::empty()) }
     }
@@ -28,11 +36,11 @@ pub fn allow_screenshots(allowed: bool) {
 
 /// Remembers the running app, for the calls below.
 pub fn set_app(app: &slint::android::AndroidApp) {
-    let _ = APP.set(app.clone());
+    *APP.write().unwrap() = Some(app.clone());
 }
 
 fn with_env<T>(f: impl FnOnce(&mut JNIEnv, &JObject) -> R<T>) -> Option<T> {
-    let app = APP.get()?;
+    let app = app()?;
     // SAFETY: both pointers come from the running activity and stay valid
     // while it runs; the activity is a global ref we don't own, and a plain
     // JObject never deletes it.
@@ -478,7 +486,7 @@ pub fn install(file: &Saved) -> bool {
 
 /// Where files being saved are written first (Whisker's own folder).
 pub fn staging_dir() -> Option<PathBuf> {
-    let dir = APP.get()?.internal_data_path()?.join("saving");
+    let dir = app()?.internal_data_path()?.join("saving");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }

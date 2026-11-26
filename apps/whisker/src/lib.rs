@@ -8834,7 +8834,6 @@ fn no_backup_dir(files: &std::path::Path) -> PathBuf {
 #[unsafe(no_mangle)]
 fn android_main(app: slint::android::AndroidApp) {
     use std::sync::atomic::{AtomicI32, Ordering};
-    droid::set_app(&app);
     // The task Whisker's window is in (0 until it's running).
     static TASK: AtomicI32 = AtomicI32::new(0);
     let shares = share::android::intent_shares(&app);
@@ -8848,6 +8847,9 @@ fn android_main(app: slint::android::AndroidApp) {
         return;
     }
     TASK.store(share::android::task_id(&app).unwrap_or(-1), Ordering::SeqCst);
+    // This activity is the one the rest of Whisker talks to (not the
+    // passing one a share starts, above).
+    droid::set_app(&app);
     if !shares.is_empty() {
         share::deliver(shares);
     }

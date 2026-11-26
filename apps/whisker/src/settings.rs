@@ -99,6 +99,9 @@ pub struct AppSettings {
     /// The microphone button for recording voice messages.
     #[serde(default = "yes")]
     pub voice_messages: bool,
+    /// Videos take a bigger space in the chat (twice as wide).
+    #[serde(default)]
+    pub large_videos: bool,
     /// Fix common typos in the composer as you type. Off unless turned on
     /// (saved under a new name: it used to be on for everyone).
     #[serde(default, rename = "autocorrect_on")]

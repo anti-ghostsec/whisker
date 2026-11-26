@@ -382,14 +382,19 @@ pub fn human_size(n: u64) -> String {
     }
 }
 
-/// Size an image preview to fit 360×300, keeping its shape.
-pub fn picture_size(w: Option<u64>, h: Option<u64>, px: Option<&Pixels>) -> (f32, f32) {
+/// Settings → Larger videos: videos get twice the space (see [`picture_size`]).
+pub static LARGE_VIDEOS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Size an image preview to fit 360×300, keeping its shape (a video's,
+/// with larger videos on, 720×600).
+pub fn picture_size(w: Option<u64>, h: Option<u64>, px: Option<&Pixels>, video: bool) -> (f32, f32) {
     let (w, h) = match (w, h, px) {
         (Some(w), Some(h), _) if w > 0 && h > 0 => (w as f32, h as f32),
         (_, _, Some(p)) => (p.width() as f32, p.height() as f32),
         _ => (320.0, 200.0),
     };
-    let scale = (360.0 / w).min(300.0 / h).min(1.0);
+    let grow = if video && LARGE_VIDEOS.load(std::sync::atomic::Ordering::Relaxed) { 2.0 } else { 1.0 };
+    let scale = (360.0 * grow / w).min(300.0 * grow / h).min(1.0);
     ((w * scale).max(60.0), (h * scale).max(40.0))
 }
 
@@ -405,6 +410,8 @@ pub fn row_sig(r: &MsgRow, pixels: &PixelCache) -> u64 {
     format!("{:?}", r.item).hash(&mut h);
     (r.mine, r.first, r.picture_failed, &r.day, &r.reply, &r.readers, &r.reactions, &r.thread, r.trust, &r.poll).hash(&mut h);
     r.picture.as_ref().map(|p| (p.width(), p.height())).hash(&mut h);
+    // Videos are sized by this setting.
+    (r.item.media.as_ref().is_some_and(|m| m.kind == MediaKind::Video) && LARGE_VIDEOS.load(std::sync::atomic::Ordering::Relaxed)).hash(&mut h);
     r.frames.as_ref().map(|f| (f.0.len(), f.1)).hash(&mut h);
     loaded(&r.item.sender_avatar).hash(&mut h);
     r.link_card.as_ref().map(|c| (c.state, &c.title, &c.description, c.picture.as_ref().map(|p| (p.width(), p.height())))).hash(&mut h);
@@ -458,7 +465,7 @@ impl Models {
                 },
                 m.name.clone(),
                 [m.mime.clone(), m.size.map(human_size)].into_iter().flatten().collect::<Vec<_>>().join(" · "),
-                picture_size(m.width, m.height, r.picture.as_ref()),
+                picture_size(m.width, m.height, r.picture.as_ref(), m.kind == MediaKind::Video),
             ),
             None => (0, String::new(), String::new(), (0.0, 0.0)),
         };
@@ -621,8 +628,8 @@ mod tests {
     fn sizes() {
         assert_eq!(human_size(10), "10 B");
         assert_eq!(human_size(2048), "2 KB");
-        assert_eq!(picture_size(Some(1920), Some(1080), None), (360.0, 202.5));
-        assert_eq!(picture_size(Some(100), Some(50), None), (100.0, 50.0));
+        assert_eq!(picture_size(Some(1920), Some(1080), None, false), (360.0, 202.5));
+        assert_eq!(picture_size(Some(100), Some(50), None, true), (100.0, 50.0));
     }
 
     /// Rows added in front or after keep the ones already there; anything

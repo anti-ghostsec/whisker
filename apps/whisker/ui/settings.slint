@@ -256,6 +256,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-invidious(string);
     callback set-send-typing(bool);
     callback set-voice-messages(bool);
+    callback set-large-videos(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
     callback set-link-posters(bool);
@@ -415,6 +416,22 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.voice-messages;
                 toggled => { root.set-voice-messages(self.checked); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text { text: "Larger videos"; color: Theme.text; }
+                Text {
+                    text: "Videos get up to twice the space in the chat (as wide as the chat allows), before and while they play.";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
+                }
+            }
+            Switch {
+                checked: Prefs.large-videos;
+                toggled => { root.set-large-videos(self.checked); }
             }
         }
         HorizontalLayout {
@@ -1525,6 +1542,7 @@ export component SettingsPage inherits Rectangle {
     callback set-invidious(string);
     callback set-send-typing(bool);
     callback set-voice-messages(bool);
+    callback set-large-videos(bool);
     callback set-clear-command(string);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -1640,6 +1658,7 @@ export component SettingsPage inherits Rectangle {
                             set-invidious(t) => { root.set-invidious(t); }
                             set-send-typing(b) => { root.set-send-typing(b); }
                             set-voice-messages(b) => { root.set-voice-messages(b); }
+                            set-large-videos(b) => { root.set-large-videos(b); }
                             set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }
                             set-spell-check(b) => { root.set-spell-check(b); }

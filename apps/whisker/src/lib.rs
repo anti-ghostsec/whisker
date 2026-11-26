@@ -6252,6 +6252,23 @@ impl Ctl {
         Some(format!("{}{fixed}{c}", &prev[..prev.len() - word.len()]))
     }
 
+    fn set_large_videos(&self, on: bool) {
+        let mut st = self.settings.lock().unwrap();
+        st.large_videos = on;
+        let _ = st.save(self.mgr.data_dir());
+        drop(st);
+        ui::LARGE_VIDEOS.store(on, std::sync::atomic::Ordering::Relaxed);
+        if let Some(u) = self.ui.upgrade() {
+            u.global::<Prefs>().set_large_videos(on);
+        }
+        // The videos in the open chat take their new size now.
+        let c = self.clone();
+        self.spawn(async move {
+            c.show_messages().await;
+            c.show_thread().await;
+        });
+    }
+
     fn set_voice_messages(&self, on: bool) {
         let mut st = self.settings.lock().unwrap();
         st.voice_messages = on;
@@ -8341,6 +8358,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
     mgr.set_media_in_vault(prefs.media_in_vault);
     ui.global::<Prefs>().set_send_typing(prefs.send_typing);
     ui.global::<Prefs>().set_voice_messages(prefs.voice_messages);
+    ui.global::<Prefs>().set_large_videos(prefs.large_videos);
+    ui::LARGE_VIDEOS.store(prefs.large_videos, std::sync::atomic::Ordering::Relaxed);
     ui.set_voice_available(voice::available());
     ui.global::<Prefs>().set_autocorrect(prefs.autocorrect);
     ui.global::<Prefs>().set_spell_check(prefs.spell_check);
@@ -8698,6 +8717,8 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         ui.on_set_send_typing(move |b| c.set_send_typing(b));
         let c = ctl.clone();
         ui.on_set_voice_messages(move |b| c.set_voice_messages(b));
+        let c = ctl.clone();
+        ui.on_set_large_videos(move |b| c.set_large_videos(b));
         let c = ctl.clone();
         ui.on_voice_start(move || c.voice_start());
         let c = ctl.clone();

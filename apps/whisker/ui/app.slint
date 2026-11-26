@@ -941,9 +941,12 @@ component MessageRow inherits Rectangle {
                         // Narrow chat (side panel open): shrink, keeping the shape.
                         // Pictures, and videos that came with a preview frame.
                         if root.item.media == 1 || (root.item.media == 2 && (root.item.picture.width > 0 || (Player.id == root.item.id && Player.frame.width > 0))): pic := Rectangle {
-                            // A video sent without a preview takes the size of its frames.
-                            property <length> pw: root.item.media == 1 || root.item.picture.width > 0 ? root.item.picture-width : Player.frame.width * 1px;
-                            property <length> ph: root.item.media == 1 || root.item.picture.width > 0 ? root.item.picture-height : Player.frame.height * 1px;
+                            // A video sent without a preview takes the shape of its frames,
+                            // fitted in the space a preview gets (it took the frames' own
+                            // size, far bigger, until a preview was made, then shrank).
+                            property <float> frame-fit: min(1, min((Prefs.large-videos ? 720 : 360) / max(1, Player.frame.width), (Prefs.large-videos ? 600 : 300) / max(1, Player.frame.height)));
+                            property <length> pw: root.item.media == 1 || root.item.picture.width > 0 ? root.item.picture-width : Player.frame.width * 1px * self.frame-fit;
+                            property <length> ph: root.item.media == 1 || root.item.picture.width > 0 ? root.item.picture-height : Player.frame.height * 1px * self.frame-fit;
                             property <float> fit: min(1, max(60px, root.width - 100px) / max(1px, self.pw));
                             // Animated pictures step through their frames, looping.
                             property <int> frame: 0;
@@ -2497,6 +2500,7 @@ export component AppWindow inherits Window {
     callback set-invidious(string);
     callback set-send-typing(bool);
     callback set-voice-messages(bool);
+    callback set-large-videos(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
     // Spell check: red lines under misspelled words in the composer, and
@@ -3895,6 +3899,7 @@ export component AppWindow inherits Window {
             set-invidious(t) => { root.set-invidious(t); }
             set-send-typing(b) => { root.set-send-typing(b); }
             set-voice-messages(b) => { root.set-voice-messages(b); }
+            set-large-videos(b) => { root.set-large-videos(b); }
             set-autocorrect(b) => { root.set-autocorrect(b); }
             set-spell-check(b) => { root.set-spell-check(b); }
             set-link-posters(b) => { root.set-link-posters(b); }

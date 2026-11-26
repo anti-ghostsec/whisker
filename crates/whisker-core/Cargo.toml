@@ -38,6 +38,14 @@ tokio = { workspace = true, features = ["net", "io-util"] }
 tracing.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+# Calls: the connection (through the server's relay), with the encryption
+# library the rest of Whisker uses, and the Opus sound codec in plain Rust
+# (nothing to build with a C compiler).
+webrtc = { version = "0.21.1", default-features = false, features = ["runtime-tokio", "crypto-aws-lc-rs"] }
+rtc = { version = "0.21.1", default-features = false, features = ["crypto-aws-lc-rs"] }
+async-trait = "0.1"
+bytes = "1"
+unsafe-libopus = "=0.2.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

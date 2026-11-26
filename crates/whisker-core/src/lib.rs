@@ -5,6 +5,7 @@
 pub mod accounts;
 pub mod addresses;
 pub mod anoncat;
+pub mod call_media;
 pub mod calls;
 pub mod devices;
 pub mod events;

@@ -75,7 +75,11 @@ impl Playing {
     /// Ends the decoders that are running (their threads see the new
     /// number and stop).
     fn end_decoders(&mut self) {
-        self.generation += 1;
+        // A number no start of any video has had: what's kept by number
+        // ([`CLOCK`], [`PICTURE`], [`VIDEO_GONE`]…) outlives a video, and
+        // the next one, counting from 1 again, took the last one's "the
+        // picture is up" for its own and started its sound at once.
+        self.generation = STARTS.fetch_add(1, Ordering::Relaxed) + 1;
         self.live = false;
         self.paused = false;
         self.sounding = false;
@@ -102,6 +106,8 @@ enum Src {
 }
 
 static NOW: Mutex<Option<Playing>> = Mutex::new(None);
+/// How many starts there have been, of every video (see `end_decoders`).
+static STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The last start (`Playing::generation`) that showed a picture or played sound.
 static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Videos start over when they end.
@@ -123,10 +129,9 @@ static HEARD: Mutex<Option<Heard>> = Mutex::new(None);
 /// yet, from a server) stops moving this, and the sound waits for it rather
 /// than playing on and dragging the picture after it, skipping what it missed.
 static PICTURE: Mutex<Option<(u64, u32, f64, Instant)>> = Mutex::new(None);
-/// How far the sound may get ahead of a picture that's stopped moving, and
-/// for how long it may have stopped, before the sound waits for it.
-const PICTURE_STUCK_AHEAD: f64 = 0.4;
-const PICTURE_STUCK_FOR: Duration = Duration::from_millis(300);
+/// How far what's heard may get ahead of the picture before the sound
+/// waits for it. (A slow phone draws a late picture every half second.)
+const PICTURE_STUCK_AHEAD: f64 = 0.75;
 
 #[derive(Clone, Copy)]
 struct Heard {
@@ -703,10 +708,15 @@ fn wait_turn(follows: bool, start: Instant, generation: u64, round: u32) -> bool
             return false;
         }
         held(generation);
+        // The first picture drawn, not only decoded: a decoder whose
+        // pictures can't be read (the software one is tried next) set the
+        // clock, and the sound played for seconds before any picture.
         let clock = *CLOCK.lock().unwrap();
+        let drawn = PICTURE.lock().unwrap().is_some_and(|(g, r, ..)| g == generation && r == round);
         if let Some((g, r, at)) = clock
             && g == generation
             && r == round
+            && drawn
         {
             return wait_until(at, 0.0, generation);
         }
@@ -721,16 +731,21 @@ fn wait_turn(follows: bool, start: Instant, generation: u64, round: u32) -> bool
     }
 }
 
-/// Whether start `generation`'s picture has stopped moving (stuck loading)
-/// well behind `sound_at`, the moment the sound is about to play.
-fn picture_stuck(generation: u64, round: u32, sound_at: f64) -> bool {
+/// The moment the sound should wait for start `generation`'s picture to
+/// reach, when the picture has fallen well behind what's heard (it's still
+/// loading); `None` when it's keeping up. `written` is the moment the sound
+/// is about to write, used when the speaker hasn't said where it is.
+fn picture_behind(generation: u64, round: u32, written: f64) -> Option<f64> {
     if VIDEO_GONE.load(Ordering::Relaxed) == generation {
-        return false;
+        return None;
     }
-    PICTURE
+    let heard = HEARD
         .lock()
         .unwrap()
-        .is_some_and(|(g, r, media, when)| g == generation && r == round && sound_at > media + PICTURE_STUCK_AHEAD && when.elapsed() > PICTURE_STUCK_FOR)
+        .filter(|h| h.generation == generation && h.round == round && h.told.elapsed() < HEARD_FRESH)
+        .map_or(written, |h| (h.media + Instant::now().saturating_duration_since(h.at).as_secs_f64()).min(written));
+    let (g, r, media, _) = (*PICTURE.lock().unwrap())?;
+    (g == generation && r == round && heard > media + PICTURE_STUCK_AHEAD).then_some(heard)
 }
 
 /// How long a decoder drawing to the image reader may go without a
@@ -1214,11 +1229,10 @@ fn play_sound(path: &Src, info: Info, at: f64, start: Instant, generation: u64, 
             // held, nothing heard), rather than play on without it.
             if follows
                 && let Some(s) = &stream
-                && picture_stuck(generation, loops, pts as f64 / 1e6)
+                && let Some(t) = picture_behind(generation, loops, pts as f64 / 1e6)
             {
                 let _ = s.request_pause();
                 HEARD.lock().unwrap().take_if(|h| h.generation == generation);
-                let t = pts as f64 / 1e6;
                 while current(generation) && VIDEO_GONE.load(Ordering::Relaxed) != generation {
                     held(generation);
                     let p = *PICTURE.lock().unwrap();

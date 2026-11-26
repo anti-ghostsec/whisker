@@ -372,6 +372,10 @@ impl Ctl {
                 });
                 self.call_show();
                 self.status(format!("{who} is calling."));
+                // A notification too (no name in it), unless they're off.
+                if crate::notify::Detail::from_index(self.settings.lock().unwrap().notify_level) != crate::notify::Detail::Off {
+                    let _ = tokio::task::spawn_blocking(|| crate::notify::show("Whisker", "Incoming call", 0, false)).await;
+                }
                 // It stops ringing when the caller would have given up.
                 let c = self.clone();
                 self.spawn(async move {

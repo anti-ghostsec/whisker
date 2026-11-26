@@ -47,11 +47,20 @@ struct Playing {
     frozen: bool,
     /// `child` sends sound to the system, so it can be told a new level.
     sounding: bool,
+    /// `child`'s sound has a head start (see [`LEAD_FRAMES`]).
+    lead: bool,
+    /// When `child` was held still, and how many times its sound has been
+    /// given its head start again after that.
+    frozen_at: Option<std::time::Instant>,
+    leads: u32,
     /// Bumped on every (re)start, so an old reader stops showing frames.
     generation: u64,
 }
 
 static NOW: Mutex<Option<Playing>> = Mutex::new(None);
+/// How many starts there have been, of every video: each gets a number of
+/// its own (what's kept by number outlives a video).
+static STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The last start (`Playing::generation`) that showed a picture.
 static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Videos start over when they end.
@@ -111,7 +120,7 @@ fn start(ui: Weak<AppWindow>, id: String, input: OsString, relay: Option<Relay>)
     // when streaming, they're there to turn on, not on at the start.
     let shown = has_subtitles && !(relay.is_some() && info.subtitles == Some(Subtitles::Text));
     // Everything starts muted (no sudden loud sound); the speaker turns it on.
-    let playing = Playing { id: id.clone(), input, _relay: relay, info, at: 0.0, muted: true, subtitles: shown, large: false, playing: false, child: None, frozen: false, sounding: false, generation: 0 };
+    let playing = Playing { id: id.clone(), input, _relay: relay, info, at: 0.0, muted: true, subtitles: shown, large: false, playing: false, child: None, frozen: false, sounding: false, lead: false, frozen_at: None, leads: 0, generation: 0 };
     *NOW.lock().unwrap() = Some(playing);
     let _ = ui.upgrade_in_event_loop(move |u| {
         let p = u.global::<Player>();
@@ -276,6 +285,7 @@ fn freeze(p: &mut Playing, on: bool) -> bool {
     let done = unsafe { libc::kill(pid, if on { libc::SIGSTOP } else { libc::SIGCONT }) } == 0;
     if done {
         p.frozen = on;
+        p.frozen_at = on.then(std::time::Instant::now);
     }
     done
 }
@@ -319,9 +329,12 @@ fn pause(ui: &Weak<AppWindow>) {
 }
 
 fn kill(p: &mut Playing) {
-    p.generation += 1;
+    p.generation = STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     p.frozen = false;
+    p.frozen_at = None;
     p.sounding = false;
+    p.lead = false;
+    p.leads = 0;
     if let Some(mut c) = p.child.take() {
         let _ = c.kill();
         let _ = c.wait();
@@ -371,16 +384,66 @@ fn filter_path(path: &OsStr) -> String {
 /// The longest wait the pacing makes up for by hurrying, in seconds:
 /// after anything longer (a pause) it carries on at the normal speed.
 const PACE_LIMIT: &str = "0.5";
+const PACE_LIMIT_FOR: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The sound's head start on the picture, in frames (a seventh of a
+/// second): that much silence goes to the speakers first, so there's
+/// always some sound waiting there, and the picture holds its first frame
+/// as long so the two still match. Sent exactly when it was due, with
+/// nothing waiting, the sound ran dry every time it came a moment late or
+/// the sound card took a little more than it was given: a stutter every
+/// second or so.
+const LEAD_FRAMES: u32 = 4;
+const LEAD_MS: u32 = LEAD_FRAMES * 1000 / FPS;
+
+/// Whether this ffmpeg can be told to put silence in as it plays (its
+/// `adelay` takes commands, from ffmpeg 6): needed to give the sound its
+/// head start again after a pause, so without it there's no head start.
+fn lead_supported() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-h", "filter=adelay"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout).lines().any(|l| {
+                    let mut words = l.split_whitespace();
+                    words.next() == Some("delays") && words.nth(1).is_some_and(|flags| flags.contains('T'))
+                })
+            })
+    })
+}
+
+/// After a pause long enough for the sound waiting at the speakers to have
+/// played out (and the pacing to start afresh): the same silence again, so
+/// the sound has its head start back and the picture catches up with what
+/// was heard after it stopped. Written before ffmpeg is let go, so it's
+/// the first thing it reads.
+fn lead_again(p: &mut Playing) {
+    use std::io::Write;
+    if !p.lead || p.frozen_at.is_none_or(|t| t.elapsed() < PACE_LIMIT_FOR) {
+        return;
+    }
+    let Some(stdin) = p.child.as_mut().and_then(|c| c.stdin.as_mut()) else { return };
+    // The filter counts from what it was last told (nothing, at first).
+    p.leads += 1;
+    let command = format!("cadelay -1 delays all:{}\n", p.leads * LEAD_MS);
+    let _ = stdin.write_all(command.as_bytes()).and_then(|()| stdin.flush());
+}
 
 fn size_filter(size: (u32, u32)) -> String {
     format!("fps={FPS},scale={}:{}", size.0, size.1)
 }
 
-fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtitles: Option<Subtitles>) -> std::io::Result<Child> {
+fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtitles: Option<Subtitles>, lead: bool) -> std::io::Result<Child> {
     let mut cmd = Command::new("ffmpeg");
+    // The picture's first frame held while the sound's silence plays.
+    let hold = if lead { format!("tpad=start={LEAD_FRAMES}:start_mode=clone,") } else { String::new() };
     // Paced by the `realtime` filters, not `-re`: after a pause they carry
     // on at the normal speed, where `-re` raced to make up the time.
-    let fit = format!("fps={FPS},scale={}:{},realtime=limit={PACE_LIMIT}", size.0, size.1);
+    let fit = format!("fps={FPS},scale={}:{},{hold}realtime=limit={PACE_LIMIT}", size.0, size.1);
     cmd.args(["-v", "error", "-ss", &format!("{at:.3}")]);
     // Text subtitles are drawn by time, so the times must stay the file's.
     if subtitles == Some(Subtitles::Text) {
@@ -389,7 +452,7 @@ fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subti
     cmd.args(whisker_core::timeline::ffmpeg_guard(path));
     cmd.arg("-i").arg(path);
     match subtitles {
-        Some(Subtitles::Text) => cmd.args(["-map", "0:v:0", "-vf", &format!("{},subtitles=filename={}:si=0,realtime=limit={PACE_LIMIT}", size_filter(size), filter_path(path))]),
+        Some(Subtitles::Text) => cmd.args(["-map", "0:v:0", "-vf", &format!("{},subtitles=filename={}:si=0,{hold}realtime=limit={PACE_LIMIT}", size_filter(size), filter_path(path))]),
         Some(Subtitles::Bitmap) => cmd.args(["-filter_complex", &format!("[0:v:0][0:s:0]overlay,{fit}[v]"), "-map", "[v]"]),
         None => cmd.args(["-map", "0:v:0", "-vf", &fit]),
     };
@@ -397,7 +460,8 @@ fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subti
     if let Some(out) = sound {
         cmd.args(["-map", "0:a:0"]);
         // The volume filter is always there, to be told a new level.
-        cmd.args(["-filter:a", &format!("volume={:.5},arealtime=limit={PACE_LIMIT}", crate::ui::gain(crate::ui::volume()))]);
+        let ahead = if lead { format!(",adelay={LEAD_MS}:all=1") } else { String::new() };
+        cmd.args(["-filter:a", &format!("volume={:.5},arealtime=limit={PACE_LIMIT}{ahead}", crate::ui::gain(crate::ui::volume()))]);
         cmd.args(out);
     }
     tie_to_whisker(&mut cmd);
@@ -411,6 +475,9 @@ fn resume(ui: &Weak<AppWindow>) {
         let mut now = NOW.lock().unwrap();
         let Some(p) = now.as_mut() else { return };
         // Paused: it carries on from where it was held.
+        if p.frozen {
+            lead_again(p);
+        }
         if p.frozen && freeze(p, false) {
             p.playing = true;
             drop(now);
@@ -447,13 +514,15 @@ fn run(ui: Weak<AppWindow>, input: OsString, at: f64, info: VideoInfo, muted: bo
     if !current() {
         return;
     }
-    let started = ffmpeg(&input, at, size, sound, subtitles).ok().and_then(|mut child| {
+    let lead = sound.is_some() && lead_supported();
+    let started = ffmpeg(&input, at, size, sound, subtitles, lead).ok().and_then(|mut child| {
         let out = child.stdout.take()?;
         let mut now = NOW.lock().unwrap();
         match now.as_mut() {
             Some(p) if p.generation == generation => {
                 p.child = Some(child);
                 p.sounding = sound.is_some();
+                p.lead = lead;
                 Some(out)
             }
             _ => {
@@ -464,7 +533,7 @@ fn run(ui: Weak<AppWindow>, input: OsString, at: f64, info: VideoInfo, muted: bo
         }
     });
     let shown = match started {
-        Some(mut out) => show_frames(&ui, &mut out, size, at, generation),
+        Some(mut out) => show_frames(&ui, &mut out, size, at, if lead { u64::from(LEAD_FRAMES) } else { 0 }, generation),
         None => 0,
     };
     ended(&ui, generation, shown);
@@ -513,7 +582,10 @@ fn play_sound(ui: &Weak<AppWindow>, input: &OsStr, at: f64, muted: bool, generat
     cmd.args(whisker_core::timeline::ffmpeg_guard(input));
     cmd.args(["-re", "-i"]).arg(input).args(["-map", "0:a:0"]);
     let level = if muted { 0 } else { crate::ui::volume() };
-    cmd.args(["-filter:a", &format!("volume={:.5}", crate::ui::gain(level))]);
+    // The same head start as a video's sound (see [`LEAD_FRAMES`]).
+    let lead = if lead_supported() { f64::from(LEAD_MS) / 1000.0 } else { 0.0 };
+    let ahead = if lead > 0.0 { format!(",adelay={LEAD_MS}:all=1") } else { String::new() };
+    cmd.args(["-filter:a", &format!("volume={:.5}{ahead}", crate::ui::gain(level))]);
     cmd.args(out);
     tie_to_whisker(&mut cmd);
     let Ok(child) = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return 0 };
@@ -536,7 +608,7 @@ fn play_sound(ui: &Weak<AppWindow>, input: &OsStr, at: f64, muted: bool, generat
     let mut ticks = 0u64;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let position = at + began.elapsed().as_secs_f64();
+        let position = at + (began.elapsed().as_secs_f64() - lead).max(0.0);
         {
             let mut now = NOW.lock().unwrap();
             match now.as_mut() {
@@ -565,7 +637,9 @@ fn play_sound(ui: &Weak<AppWindow>, input: &OsStr, at: f64, muted: bool, generat
 }
 
 /// Reads frames from ffmpeg into the window. Returns how many it showed.
-fn show_frames(ui: &Weak<AppWindow>, out: &mut impl Read, size: (u32, u32), at: f64, generation: u64) -> u64 {
+/// `held`: how many times the first frame comes before the video moves on
+/// (see [`LEAD_FRAMES`]).
+fn show_frames(ui: &Weak<AppWindow>, out: &mut impl Read, size: (u32, u32), at: f64, held: u64, generation: u64) -> u64 {
     let bytes = (size.0 * size.1 * 4) as usize;
     let mut shown = 0u64;
     loop {
@@ -573,7 +647,7 @@ fn show_frames(ui: &Weak<AppWindow>, out: &mut impl Read, size: (u32, u32), at: 
         if out.read_exact(buf.make_mut_bytes()).is_err() || buf.as_bytes().len() != bytes {
             return shown;
         }
-        let position = at + shown as f64 / f64::from(FPS);
+        let position = at + shown.saturating_sub(held) as f64 / f64::from(FPS);
         {
             let mut now = NOW.lock().unwrap();
             match now.as_mut() {

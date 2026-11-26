@@ -1705,9 +1705,13 @@ global Safe {
 component AttachBtn inherits Rectangle {
     callback file();
     callback poll();
+    // Phones: the choices come up as a sheet in the window instead. (The
+    // popup didn't open while the keyboard was up, so nothing could be
+    // sent until the keyboard was put away.)
+    callback sheet();
     width: 38px;
     height: 38px;
-    IconBtn { icon: "+"; size: 38px; clicked => { menu.show(); } }
+    IconBtn { icon: "+"; size: 38px; clicked => { if Prefs.touch { root.sheet(); } else { menu.show(); } } }
     menu := PopupWindow {
         x: 0;
         y: -96px;
@@ -2274,6 +2278,8 @@ export component AppWindow inherits Window {
     in-out property <bool> room-info-open;
     // Phones: the big menu of the message held down (see MessageSheet).
     property <bool> sheet-open;
+    // Phones: what the + by the message box offers (a file, a poll).
+    property <bool> attach-open;
     property <MessageItem> sheet-item;
     // Which list it's from: "m" the room, "t" a thread.
     property <string> sheet-list;
@@ -2431,6 +2437,7 @@ export component AppWindow inherits Window {
     // Closes what's on top (Back on Android); false when nothing is.
     function go-back() -> bool {
         if root.sheet-open { root.sheet-open = false; return true; }
+        if root.attach-open { root.attach-open = false; return true; }
         if root.recording { root.voice-cancel(); return true; }
         if Player.large && Player.id != "" { Player.set-large(false); return true; }
         if root.viewer-menu { root.viewer-menu = false; return true; }
@@ -3194,7 +3201,7 @@ export component AppWindow inherits Window {
                         alignment: stretch;
                         if !root.narrow: VerticalLayout {
                             alignment: end;
-                            AttachBtn { file => { root.activity(); root.attach(); } poll => { root.activity(); root.open-poll(); } }
+                            AttachBtn { file => { root.activity(); root.attach(); } poll => { root.activity(); root.open-poll(); } sheet => { root.activity(); root.attach-open = true; } }
                         }
                         Rectangle {
                             horizontal-stretch: 1;
@@ -3368,7 +3375,7 @@ export component AppWindow inherits Window {
                         padding-right: 12px;
                         padding-bottom: 10px;
                         spacing: 6px;
-                        AttachBtn { file => { root.activity(); root.attach(); } poll => { root.activity(); root.open-poll(); } }
+                        AttachBtn { file => { root.activity(); root.attach(); } poll => { root.activity(); root.open-poll(); } sheet => { root.activity(); root.attach-open = true; } }
                         IconBtn { icon: "🖼"; size: 38px; active: root.stickers-open; clicked => { root.activity(); root.open-stickers(); } }
                         if !Prefs.touch: IconBtn {
                             icon: "☺";
@@ -4109,6 +4116,29 @@ export component AppWindow inherits Window {
             }
             copy(t) => { root.copy-text(t); }
             link(l) => { root.open-link(l); }
+        }
+
+        if root.attach-open: Rectangle {
+            background: #00000099;
+            TouchArea { clicked => { root.attach-open = false; } }
+            Rectangle {
+                y: parent.height - self.height;
+                height: 130px + Safe.bottom;
+                background: Theme.panel;
+                border-top-left-radius: 16px;
+                border-top-right-radius: 16px;
+                TouchArea {}
+                VerticalLayout {
+                    padding-top: 8px;
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-bottom: Safe.bottom + 8px;
+                    spacing: 2px;
+                    HorizontalLayout { alignment: center; padding-bottom: 6px; Rectangle { width: 40px; height: 4px; border-radius: 2px; background: Theme.border; } }
+                    SheetRow { text: "Send a file…"; clicked => { root.attach-open = false; root.attach(); } }
+                    SheetRow { text: "Create a poll…"; clicked => { root.attach-open = false; root.open-poll(); } }
+                }
+            }
         }
 
         if root.readers-open: Overlay {

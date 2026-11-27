@@ -534,7 +534,7 @@ const PREVIEW_TRIES: u8 = 6;
 /// can't be played while it streams.
 #[cfg(target_os = "android")]
 const WHOLE_MAX: u64 = 200 * 1024 * 1024;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const WHOLE_MAX: u64 = 600 * 1024 * 1024;
 
 static PREVIEW_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(6);

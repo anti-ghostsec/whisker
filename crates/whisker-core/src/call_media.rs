@@ -452,6 +452,61 @@ impl Link {
     }
 }
 
+/// Tries `relay` the way a call uses it, both ends on this device: each
+/// gets its own place on the relay, they find each other through it, and
+/// a moment of sound is sent across. `Err` says how far it got.
+pub async fn check_relay(relay: calls::Relay) -> Result<()> {
+    let (caller, mut caller_says) = Link::new(Route::Relay(relay.clone())).await?;
+    let (called, mut called_says) = Link::new(Route::Relay(relay)).await?;
+    let offer = caller.offer().await?;
+    let answer = called.accept(&offer).await?;
+    caller.answered(&answer).await?;
+    let mut up = (false, false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let outcome = loop {
+        if up.0 && up.1 {
+            break Ok(());
+        }
+        tokio::select! {
+            Some(e) = caller_says.recv() => match e {
+                LinkEvent::Candidate(c) => { let _ = called.reach(&c).await; }
+                LinkEvent::Connected => up.0 = true,
+                LinkEvent::Ended => break Err(anyhow!("the relay gave both ends a place, but they couldn't reach each other through it")),
+                _ => {}
+            },
+            Some(e) = called_says.recv() => match e {
+                LinkEvent::Candidate(c) => { let _ = caller.reach(&c).await; }
+                LinkEvent::Connected => up.1 = true,
+                LinkEvent::Ended => break Err(anyhow!("the relay gave both ends a place, but they couldn't reach each other through it")),
+                _ => {}
+            },
+            _ = tokio::time::sleep_until(deadline) => break Err(anyhow!("the relay gave both ends a place, but they couldn't reach each other through it (no answer in 20 seconds)")),
+        }
+    };
+    if outcome.is_ok() {
+        let playout = called.playout();
+        let mut heard = 0;
+        let mut every = tokio::time::interval(Duration::from_millis(20));
+        let piece: [i16; FRAME] = std::array::from_fn(|n| ((n as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin() * 8_000.0) as i16);
+        for _ in 0..75 {
+            every.tick().await;
+            caller.say(&piece).await?;
+            let mut out = [0i16; FRAME];
+            playout.take(&mut out);
+            heard += out.iter().filter(|&&s| s != 0).count();
+        }
+        caller.close().await;
+        called.close().await;
+        if heard == 0 {
+            bail!("the two ends connected through the relay, but no sound came across");
+        }
+        return Ok(());
+    }
+    caller.close().await;
+    called.close().await;
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,4 +621,15 @@ mod tests {
         caller.close().await;
         called.close().await;
     }
+    /// The real way: both ends through a relay, as a call goes. Needs a
+    /// TURN server: WHISKER_TEST_TURN="turn:host:port user password".
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_tone_goes_through_a_relay() {
+        let spec = std::env::var("WHISKER_TEST_TURN").expect("WHISKER_TEST_TURN");
+        let mut parts = spec.split_whitespace();
+        let relay = calls::Relay { uris: vec![parts.next().unwrap().into()], username: parts.next().unwrap().into(), password: parts.next().unwrap().into() };
+        check_relay(relay).await.unwrap();
+    }
+
 }

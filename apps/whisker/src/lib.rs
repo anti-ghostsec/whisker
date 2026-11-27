@@ -2078,7 +2078,6 @@ impl Ctl {
     async fn jump_to(&self, key: &RoomKey, room: &matrix_sdk::Room, target: OwnedEventId) {
         let loaded = |c: &Self| c.st.lock().unwrap().messages.get(key).is_some_and(|l| l.iter().any(|m| m.event_id == target));
         if !loaded(self) && self.current().as_ref() == Some(key) {
-            self.status("Looking for the message…");
             for _ in 0..JUMP_LOOKS {
                 let more = self.st.lock().unwrap().older.get(key).cloned().flatten().is_some();
                 if !more || self.current().as_ref() != Some(key) {
@@ -2089,7 +2088,6 @@ impl Ctl {
                     break;
                 }
             }
-            self.status("");
         }
         if loaded(self) && self.current().as_ref() == Some(key) {
             // All of it drawn (a room that's still opening draws a few at a
@@ -2140,13 +2138,39 @@ impl Ctl {
         let Some(last) = rows.last().cloned() else { return };
         self.fetch_avatars(key.0, last.item.sender_avatar.clone());
         self.fetch_pictures(key, std::slice::from_ref(&last.item));
+        // The newest few, in the server's order: a message that came in
+        // just after one sent here, but was said before it, goes above it.
+        let tail: Vec<MsgRow> = rows[rows.len().saturating_sub(ORDER_TAIL)..].to_vec();
         let px = self.avatars.clone();
         self.ui(move |_| {
             ui::with(|m| {
-                let item = m.message(&last, &px);
-                match ui::index_of(&m.messages, &item.id) {
-                    Some(i) => m.messages.set_row_data(i, item),
-                    None => m.messages.push(item),
+                let items: Vec<MessageItem> = tail.iter().map(|r| m.message(r, &px)).collect();
+                let at: Vec<Option<usize>> = items.iter().map(|it| ui::index_of(&m.messages, &it.id)).collect();
+                let n = m.messages.row_count();
+                // From the first of them already shown, to the end.
+                let first = at.iter().position(Option::is_some);
+                let start = at.iter().flatten().min().copied();
+                let fits = start.is_some_and(|s| (s..n).all(|i| m.messages.row_data(i).is_some_and(|r| items.iter().any(|it| it.id == r.id))));
+                match (first, start) {
+                    (Some(first), Some(start)) if fits => {
+                        for (k, item) in items.into_iter().skip(first).enumerate() {
+                            let i = start + k;
+                            if i < m.messages.row_count() {
+                                if m.messages.row_data(i).as_ref() != Some(&item) {
+                                    m.messages.set_row_data(i, item);
+                                }
+                            } else {
+                                m.messages.push(item);
+                            }
+                        }
+                    }
+                    _ => {
+                        let Some(item) = items.into_iter().last() else { return };
+                        match ui::index_of(&m.messages, &item.id) {
+                            Some(i) => m.messages.set_row_data(i, item),
+                            None => m.messages.push(item),
+                        }
+                    }
                 }
             });
         });
@@ -2236,6 +2260,14 @@ impl Ctl {
         let keep = if open { KEEP_OPEN_ROOM } else { KEEP_PER_ROOM };
         let list = st.messages.entry(key.clone()).or_default();
         let known: HashSet<_> = list.iter().map(|m| m.event_id.clone()).collect();
+        // A message already here (one this device sent, shown at once with
+        // this device's time) takes the server's time when its copy comes:
+        // the order is the server's, not who saw what first.
+        for new in items.iter().filter(|m| known.contains(&m.event_id)) {
+            if let Some(m) = list.iter_mut().find(|m| m.event_id == new.event_id) {
+                m.ts = new.ts;
+            }
+        }
         let before = list.len();
         list.extend(items.into_iter().filter(|m| !known.contains(&m.event_id)));
         let added = list.len() - before;
@@ -4298,7 +4330,11 @@ impl Ctl {
     ) {
         let opts = self.settings.lock().unwrap().upload.clone();
         let ticket = self.uploads_start();
+        // Uploads at once are limited by size as well as number: each file
+        // is held in memory a few times over while it's prepared, encrypted
+        // and sent, so several big videos at once can run out of memory.
         let slots = Arc::new(tokio::sync::Semaphore::new(UPLOADS_AT_ONCE));
+        let room_for = Arc::new(tokio::sync::Semaphore::new(UPLOAD_MB_AT_ONCE as usize));
         let shown = Arc::new(Mutex::new(Uploads {
             total: paths.len(),
             ..Default::default()
@@ -4310,16 +4346,20 @@ impl Ctl {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let (me, room, opts, slots, shown) = (
+            let (me, room, opts, slots, shown, room_for) = (
                 self.clone(),
                 room.clone(),
                 opts.clone(),
                 slots.clone(),
                 shown.clone(),
+                room_for.clone(),
             );
             jobs.push((
                 name.clone(),
                 tokio::spawn(async move {
+                    // Its size in MB (a file bigger than the whole allowance goes alone).
+                    let mb = std::fs::metadata(&path).map_or(1, |m| (m.len() / 1_048_576).max(1)).min(UPLOAD_MB_AT_ONCE) as u32;
+                    let _room = room_for.acquire_many_owned(mb).await;
                     let _slot = slots.acquire_owned().await;
                     let progress = {
                         let (me, shown) = (me.clone(), shown.clone());
@@ -5237,7 +5277,6 @@ impl Ctl {
 
     async fn play_media_here(&self, key: &RoomKey, event_id: OwnedEventId, media: timeline::Media) {
         let Some(client) = self.mgr.client(key.0).await else { return };
-        self.status("Loading…");
         // Played in the window: videos, and sound (voice messages) too.
         let in_window = matches!(media.kind, MediaKind::Video | MediaKind::Audio);
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -5281,7 +5320,9 @@ impl Ctl {
                         self.show_downloading(file.clone(), event_id.to_string());
                     }
                     if self.play_streaming(file, event_id.to_string()).await {
-                        self.status(if media.kind == MediaKind::Audio { "Playing, muted: tap the speaker to turn the sound on." } else { "" });
+                        if media.kind == MediaKind::Audio {
+                            self.status("Playing, muted: tap the speaker to turn the sound on.");
+                        }
                         return;
                     }
                 }
@@ -5309,7 +5350,6 @@ impl Ctl {
         let mut path = dir.join(&name);
         let progress = Arc::new(whisker_core::media_fetch::Progress::default());
         let watching = self.watch_progress(progress.clone(), |c, pct| {
-            c.status(format!("Loading… {pct}%"));
             c.ui(move |u| u.global::<Player>().set_progress(pct));
         });
         let r = self.cancellable(async {
@@ -5328,7 +5368,6 @@ impl Ctl {
         self.ui(|u| u.global::<Player>().set_progress(0));
         match r {
             Ok(()) => {
-                self.status("");
                 // Videos play in the message itself where Whisker can show them.
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 if in_window && player::available() {
@@ -5375,9 +5414,9 @@ impl Ctl {
                     return;
                 }
                 match file.downloading() {
-                    Some((at, true)) => c.status(format!("Downloading while it plays: {}%", at * 100 / size)),
+                    Some((_, true)) => {}
                     Some((at, false)) if at < size => return c.status("The download stopped: the rest of it can't be played."),
-                    _ => return c.status(""),
+                    _ => return,
                 }
             }
         });
@@ -5941,7 +5980,6 @@ impl Ctl {
                 p.set_loading(true);
             });
         }
-        self.status(format!("Loading the video through {}…", base.host_str().unwrap_or("Invidious")));
         let shown = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let c = self.clone();
         let progress = move |got: u64, total: u64| {
@@ -5950,7 +5988,6 @@ impl Ctl {
             }
             let pct = (got.min(total) * 100 / total) as u8;
             if shown.swap(pct, std::sync::atomic::Ordering::Relaxed) != pct {
-                c.status(format!("Loading the video… {pct}%"));
                 c.ui(move |u| u.global::<Player>().set_progress(i32::from(pct)));
             }
         };
@@ -5970,7 +6007,6 @@ impl Ctl {
         self.ui(|u| u.global::<Player>().set_progress(0));
         match r {
             Ok(()) => {
-                self.status("");
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 if here {
                     let (ui, p) = (self.ui.clone(), path.clone());
@@ -8258,6 +8294,10 @@ fn show_upload_prefs(p: &Prefs, u: &whisker_core::upload::UploadOptions) {
 
 /// Files uploading at the same time.
 const UPLOADS_AT_ONCE: usize = 3;
+/// How many of a chat's newest messages are put back in order as new ones come.
+const ORDER_TAIL: usize = 20;
+/// The most MB of files uploading at once (see `send_files`).
+const UPLOAD_MB_AT_ONCE: u64 = 150;
 
 /// Picked files on their way, for the status line.
 #[derive(Default)]
@@ -8786,6 +8826,11 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
             });
             let c = ctl.clone();
             ui.on_call_mute(move || c.call_mute());
+            let c = ctl.clone();
+            ui.on_check_relay(move || {
+                let c = c.clone();
+                c.clone().spawn(async move { c.call_check_relay().await });
+            });
         }
         let c = ctl.clone();
         ui.on_set_large_videos(move |b| c.set_large_videos(b));

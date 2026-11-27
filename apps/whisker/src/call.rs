@@ -318,6 +318,44 @@ impl Ctl {
         self.call_end(None, Some(tell), None).await;
     }
 
+    /// Settings → Test the relay: a short call on this device through each
+    /// account's server relay (one test per server), and what it found.
+    pub(crate) async fn call_check_relay(&self) {
+        let shown = |busy: bool, text: String| {
+            move |u: &crate::AppWindow| {
+                use slint::ComponentHandle;
+                u.global::<crate::Prefs>().set_relay_checking(busy);
+                u.global::<crate::Prefs>().set_relay_check(text.into());
+            }
+        };
+        self.ui(shown(true, String::new()));
+        let mut found = Vec::new();
+        let mut servers = std::collections::HashSet::new();
+        for a in self.mgr.accounts().await {
+            if a.kind != whisker_core::AccountKind::Human || !servers.insert(a.homeserver.clone()) {
+                continue;
+            }
+            let server = a.homeserver.trim_start_matches("https://").trim_end_matches('/').to_owned();
+            if self.mgr.proxy_of(a.id).await.is_some() {
+                found.push(format!("{server}: not tested (the account uses a proxy, so it doesn't call)."));
+                continue;
+            }
+            let Some(client) = self.mgr.client(a.id).await else { continue };
+            let result = match calls::relay(&client).await {
+                Ok(relay) => whisker_core::call_media::check_relay(relay).await.map_err(|e| format!("{e:#}")),
+                Err(e) => Err(format!("no relay ({e:#})")),
+            };
+            found.push(match result {
+                Ok(()) => format!("{server}: works, sound got through the relay."),
+                Err(e) => format!("{server}: {e}."),
+            });
+        }
+        if found.is_empty() {
+            found.push("No account to test.".into());
+        }
+        self.ui(shown(false, found.join("\n")));
+    }
+
     /// Turns the microphone off or on for the other side.
     pub(crate) fn call_mute(&self) {
         if let Some(c) = NOW.lock().unwrap().as_ref() {
@@ -336,17 +374,24 @@ impl Ctl {
         let about = NOW.lock().unwrap().as_ref().filter(|c| c.key == key && c.id == said.call_id).map(|c| (c.serial, c.stage, c.their_party.clone(), c.party.clone(), c.who.clone()));
         match said.signal {
             Signal::Invite { sdp, lifetime } => {
-                if own || !self.calls_on() || about.is_some() {
+                if own || about.is_some() {
                     return;
                 }
                 // Catching up on what was said while away: it rang long ago.
                 let age = u64::from(MilliSecondsSinceUnixEpoch::now().0).saturating_sub(u64::from(ts.0));
                 if age >= lifetime {
+                    tracing::info!("call: an invite {age} ms old came in, too late to ring");
                     return;
                 }
                 let Some(room) = client.get_room(&key.1) else { return };
-                if self.call_barred(account, &room).await.is_some() {
-                    return;
+                // A call that can't ring here still says so, rather than
+                // nothing happening at all.
+                let caller = || room.cached_display_name().map(|n| n.to_string()).unwrap_or_else(|| sender.to_string());
+                if !self.calls_on() {
+                    return self.status(format!("{} tried to call. Voice calls are off (Settings → Voice calls).", caller()));
+                }
+                if let Some(why) = self.call_barred(account, &room).await {
+                    return self.status(format!("{} tried to call. {why}", caller()));
                 }
                 // Already on a call here. Nothing is said back: a decline
                 // would stop this account's other devices ringing too, and
@@ -355,10 +400,7 @@ impl Ctl {
                 let busy = NOW.lock().unwrap().as_ref().map(|c| c.id == said.call_id);
                 match busy {
                     Some(true) => return,
-                    Some(false) => {
-                        let who = room.cached_display_name().map(|n| n.to_string()).unwrap_or_else(|| sender.to_string());
-                        return self.status(format!("{who} tried to call during this call."));
-                    }
+                    Some(false) => return self.status(format!("{} tried to call during this call.", caller())),
                     None => {}
                 }
                 let party = calls::new_id();

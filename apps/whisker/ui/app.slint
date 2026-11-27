@@ -728,6 +728,10 @@ component VideoBar inherits Rectangle {
                     volume-popup.show();
                 }
             }
+            // A popup stays where it opened: if the video moves (the chat
+            // scrolls, or something above it loads), it closes rather than
+            // being left floating away from it.
+            changed absolute-position => { volume-popup.close(); }
             // The level, with the speaker below it to turn the sound off and on.
             volume-popup := PopupWindow {
                 x: (parent.width - 44px) / 2;
@@ -1111,6 +1115,7 @@ component MessageRow inherits Rectangle {
                                                 clicked => { if !root.held { sound-popup.show(); } }
                                                 pointer-event(e) => { root.press(e); }
                                             }
+                                            changed absolute-position => { sound-popup.close(); }
                                             sound-popup := PopupWindow {
                                                 x: (parent.width - 44px) / 2;
                                                 y: -186px;
@@ -2548,6 +2553,7 @@ export component AppWindow inherits Window {
     callback set-voice-messages(bool);
     callback set-voice-calls(bool);
     callback set-change-voice(bool);
+    callback check-relay();
     // The call going on: 0 none, 1 calling them, 2 ringing here,
     // 3 connecting, 4 talking; who with; and how long it's been.
     in-out property <int> call-stage;
@@ -3963,6 +3969,7 @@ export component AppWindow inherits Window {
             set-voice-messages(b) => { root.set-voice-messages(b); }
             set-voice-calls(b) => { root.set-voice-calls(b); }
             set-change-voice(b) => { root.set-change-voice(b); }
+            check-relay => { root.check-relay(); }
             set-large-videos(b) => { root.set-large-videos(b); }
             set-autocorrect(b) => { root.set-autocorrect(b); }
             set-spell-check(b) => { root.set-spell-check(b); }

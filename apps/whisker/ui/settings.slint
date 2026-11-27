@@ -258,6 +258,7 @@ component GeneralPage inherits VerticalLayout {
     callback set-voice-messages(bool);
     callback set-voice-calls(bool);
     callback set-change-voice(bool);
+    callback check-relay();
     callback set-large-videos(bool);
     callback set-autocorrect(bool);
     callback set-spell-check(bool);
@@ -450,6 +451,17 @@ component GeneralPage inherits VerticalLayout {
             Switch {
                 checked: Prefs.change-voice;
                 toggled => { root.set-change-voice(self.checked); }
+            }
+        }
+        if Prefs.voice-calls: VerticalLayout {
+            spacing: 6px;
+            HorizontalLayout {
+                alignment: start;
+                Btn { text: Prefs.relay-checking ? "Testing the relay…" : "Test the relay"; enabled: !Prefs.relay-checking; clicked => { root.check-relay(); } }
+            }
+            Text {
+                text: Prefs.relay-check != "" ? Prefs.relay-check : "Makes a short test call on this device, through each account's server relay, and says whether sound gets through.";
+                font-size: 11px; color: Theme.muted; wrap: word-wrap;
             }
         }
         HorizontalLayout {
@@ -1578,6 +1590,7 @@ export component SettingsPage inherits Rectangle {
     callback set-voice-messages(bool);
     callback set-voice-calls(bool);
     callback set-change-voice(bool);
+    callback check-relay();
     callback set-large-videos(bool);
     callback set-clear-command(string);
     callback set-autocorrect(bool);
@@ -1696,6 +1709,7 @@ export component SettingsPage inherits Rectangle {
                             set-voice-messages(b) => { root.set-voice-messages(b); }
                             set-voice-calls(b) => { root.set-voice-calls(b); }
                             set-change-voice(b) => { root.set-change-voice(b); }
+                            check-relay => { root.check-relay(); }
                             set-large-videos(b) => { root.set-large-videos(b); }
                             set-clear-command(t) => { root.set-clear-command(t); }
                             set-autocorrect(b) => { root.set-autocorrect(b); }

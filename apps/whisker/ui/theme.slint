@@ -99,6 +99,9 @@ export global Prefs {
     // Voice calls, and the voice changed in them.
     in-out property <bool> voice-calls: false;
     in-out property <bool> change-voice: true;
+    // What the last relay test found ("" before one), and whether one is running.
+    in-out property <string> relay-check: "";
+    in-out property <bool> relay-checking: false;
     // Videos take a bigger space in the chat.
     in-out property <bool> large-videos: false;
     in-out property <bool> autocorrect: false;

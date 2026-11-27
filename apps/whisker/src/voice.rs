@@ -181,27 +181,42 @@ mod desktop {
     pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), String>>, push: fn(&[i16]), max: std::time::Duration) {
         let rate = RATE.to_string();
         let mut child = None;
-        for input in [["-f", "pulse", "-i", "default"], ["-f", "alsa", "-i", "default"]] {
+        let mut why = String::new();
+        // The sound server, then ALSA's default, then each sound card that
+        // can record, straight (a custom ALSA default can fail to open).
+        let mut inputs = vec![("pulse".to_owned(), "default".to_owned()), ("alsa".to_owned(), "default".to_owned())];
+        inputs.extend(capture_cards().into_iter().map(|d| ("alsa".to_owned(), d)));
+        for (format, device) in inputs {
             let Ok(mut c) = Command::new("ffmpeg")
-                .args(["-v", "error", "-nostdin"])
-                .args(input)
+                .args(["-v", "error", "-nostdin", "-f", &format, "-i", &device])
                 .args(["-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
             else {
+                why = "ffmpeg couldn't be started".into();
                 continue;
             };
             // One that can't open the microphone stops at once.
             std::thread::sleep(std::time::Duration::from_millis(300));
             if matches!(c.try_wait(), Ok(None)) {
+                // Its complaints from here on aren't read: don't let them fill a pipe.
+                drop(c.stderr.take());
                 child = Some(c);
                 break;
             }
+            let mut err = String::new();
+            if let Some(mut e) = c.stderr.take() {
+                let _ = e.read_to_string(&mut err);
+            }
+            let _ = c.wait();
+            if let Some(line) = err.lines().rev().find(|l| !l.trim().is_empty()) {
+                why = format!("{format} {device}: {}", line.trim());
+            }
         }
         let Some(mut child) = child else {
-            let _ = ready.send(Err("Couldn't open the microphone (through PulseAudio or ALSA).".into()));
+            let _ = ready.send(Err(format!("Couldn't open the microphone (through PulseAudio or ALSA). {why}")));
             return;
         };
         let _ = ready.send(Ok(()));
@@ -218,6 +233,18 @@ mod desktop {
         }
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// ALSA names for each sound card part that can record ("plughw:2,0").
+    fn capture_cards() -> Vec<String> {
+        let list = std::fs::read_to_string("/proc/asound/pcm").unwrap_or_default();
+        list.lines()
+            .filter(|l| l.contains("capture"))
+            .filter_map(|l| {
+                let (card, dev) = l.split(':').next()?.split_once('-')?;
+                Some(format!("plughw:{},{}", card.trim().parse::<u32>().ok()?, dev.trim().parse::<u32>().ok()?))
+            })
+            .collect()
     }
 
     pub fn encode(samples: &[i16]) -> Option<(Vec<u8>, &'static str, &'static str)> {

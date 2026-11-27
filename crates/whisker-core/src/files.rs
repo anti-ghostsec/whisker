@@ -1147,7 +1147,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("whisker-relay-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("clip.mkv");
-        let made = std::process::Command::new("ffmpeg")
+        let made = crate::tool("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=10:duration=3", "-pix_fmt", "yuv420p"])
             .arg(&video)
             .status();

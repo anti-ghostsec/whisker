@@ -175,7 +175,7 @@ pub fn waveform(samples: &[i16]) -> Vec<u16> {
 mod desktop {
     use super::RATE;
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     pub fn record(stop: &AtomicBool, ready: std::sync::mpsc::Sender<Result<(), String>>, push: fn(&[i16]), max: std::time::Duration) {
@@ -187,7 +187,7 @@ mod desktop {
         let mut inputs = vec![("pulse".to_owned(), "default".to_owned()), ("alsa".to_owned(), "default".to_owned())];
         inputs.extend(capture_cards().into_iter().map(|d| ("alsa".to_owned(), d)));
         for (format, device) in inputs {
-            let Ok(mut c) = Command::new("ffmpeg")
+            let Ok(mut c) = whisker_core::tool("ffmpeg")
                 .args(["-v", "error", "-nostdin", "-f", &format, "-i", &device])
                 .args(["-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1"])
                 .stdin(Stdio::null())
@@ -249,7 +249,7 @@ mod desktop {
 
     pub fn encode(samples: &[i16]) -> Option<(Vec<u8>, &'static str, &'static str)> {
         let rate = RATE.to_string();
-        let mut child = Command::new("ffmpeg")
+        let mut child = whisker_core::tool("ffmpeg")
             .args(["-v", "error", "-nostdin", "-f", "s16le", "-ac", "1", "-ar", &rate, "-i", "pipe:0"])
             .args(["-c:a", "libopus", "-b:a", "32k", "-application", "voip", "-map_metadata", "-1", "-fflags", "+bitexact", "-f", "ogg", "pipe:1"])
             .stdin(Stdio::piped())

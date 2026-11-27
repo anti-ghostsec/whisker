@@ -57,3 +57,18 @@ pub fn harden_process() {
         }
     }
 }
+
+/// A command for one of the tools Whisker runs (ffmpeg, ffprobe). On
+/// Windows no console window flashes up for it; there, the ones installed
+/// with Whisker (next to it) are found first.
+pub fn tool(name: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(name);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}

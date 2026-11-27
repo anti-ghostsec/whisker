@@ -116,12 +116,30 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p whisker -p whisker-agentd
 
+      # ffmpeg and ffprobe go in the installer, so videos play inside
+      # Whisker. A fixed release, checked against its known SHA-256.
+      - name: Fetch ffmpeg
+        shell: pwsh
+        run: |
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip"
+          $want = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\ffmpeg.zip"
+          $got = (Get-FileHash "$env:RUNNER_TEMP\ffmpeg.zip" -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $want) { Write-Error "ffmpeg's download is $got, not $want"; exit 1 }
+          Expand-Archive "$env:RUNNER_TEMP\ffmpeg.zip" -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
+
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist/whisker-windows-x86_64 | Out-Null
-          Copy-Item target/release/whisker.exe, target/release/whisker-agentd.exe, README.md dist/whisker-windows-x86_64/
-          Compress-Archive -Path dist/whisker-windows-x86_64 -DestinationPath dist/whisker-windows-x86_64.zip
+          $out = "dist/whisker-windows-x86_64"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item target/release/whisker.exe, target/release/whisker-agentd.exe, README.md $out/
+          $ff = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1
+          Copy-Item "$($ff.FullName)\bin\ffmpeg.exe", "$($ff.FullName)\bin\ffprobe.exe" $out/
+          Copy-Item "$($ff.FullName)\LICENSE" "$out/ffmpeg-LICENSE.txt"
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\iscc.exe" /Q "/DVersion=$version" "/DSource=$((Resolve-Path $out).Path)" packaging/windows/whisker.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           # The program on its own too: what Whisker's updater downloads.
           Copy-Item target/release/whisker.exe dist/whisker-windows-x86_64.exe
 
@@ -129,7 +147,7 @@ jobs:
         with:
           name: whisker-windows-x86_64
           path: |
-            dist/whisker-windows-x86_64.zip
+            dist/whisker-windows-x86_64-setup.exe
             dist/whisker-windows-x86_64.exe
           if-no-files-found: error
 

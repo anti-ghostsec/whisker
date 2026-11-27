@@ -79,7 +79,7 @@ pub fn toggle_loop(ui: &Weak<AppWindow>) {
 pub fn available() -> bool {
     static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FOUND.get_or_init(|| {
-        Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+        whisker_core::tool("ffmpeg").arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
     })
 }
 
@@ -381,11 +381,16 @@ fn frame_size(info: &VideoInfo, max: (u32, u32)) -> (u32, u32) {
 /// How to send the sound: the first of PulseAudio (PipeWire speaks it) or
 /// ALSA that takes a moment of silence, found once.
 pub(crate) fn sound_output() -> Option<&'static [&'static str]> {
+    // Windows: ffmpeg has no way to the speakers; Whisker plays it.
+    #[cfg(windows)]
+    return crate::win_sound::output_args();
+    #[cfg(not(windows))]
     static FOUND: std::sync::OnceLock<Option<&'static [&'static str]>> = std::sync::OnceLock::new();
+    #[cfg(not(windows))]
     *FOUND.get_or_init(|| {
         let tries: [&'static [&'static str]; 2] = [&["-f", "pulse", "Whisker"], &["-f", "alsa", "default"]];
         tries.into_iter().find(|out| {
-            Command::new("ffmpeg")
+            whisker_core::tool("ffmpeg")
                 .args(["-v", "error", "-nostdin", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.05"])
                 .args(*out)
                 .stdin(Stdio::null())
@@ -431,7 +436,7 @@ const LEAD_MS: u32 = LEAD_FRAMES * 1000 / FPS;
 fn lead_supported() -> bool {
     static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FOUND.get_or_init(|| {
-        Command::new("ffmpeg")
+        whisker_core::tool("ffmpeg")
             .args(["-hide_banner", "-h", "filter=adelay"])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -468,7 +473,7 @@ fn size_filter(size: (u32, u32)) -> String {
 
 /// `subtitles`: the kind to draw, and which of the file's subtitle tracks.
 fn ffmpeg(path: &OsStr, at: f64, size: (u32, u32), sound: Option<&[&str]>, subtitles: Option<(Subtitles, usize)>, lead: bool) -> std::io::Result<Child> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = whisker_core::tool("ffmpeg");
     // The picture's first frame held while the sound's silence plays.
     let hold = if lead { format!("tpad=start={LEAD_FRAMES}:start_mode=clone,") } else { String::new() };
     // Paced by the `realtime` filters, not `-re`: after a pause they carry
@@ -607,7 +612,7 @@ fn ended(ui: &Weak<AppWindow>, generation: u64, shown: u64) {
 /// second it played.
 fn play_sound(ui: &Weak<AppWindow>, input: &OsStr, at: f64, muted: bool, generation: u64) -> u64 {
     let Some(out) = sound_output() else { return 0 };
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = whisker_core::tool("ffmpeg");
     cmd.args(["-v", "error", "-ss", &format!("{at:.3}")]);
     cmd.args(whisker_core::timeline::ffmpeg_guard(input));
     cmd.args(["-re", "-i"]).arg(input).args(["-map", "0:a:0"]);

@@ -52,6 +52,11 @@ zbus = "5"
 # the tree.
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# A video's sound on Windows (ffmpeg can't play to the speakers there):
+# win_sound.rs plays it through Windows' own audio.
+cpal = "0.15"
+
 [target.'cfg(target_os = "android")'.dependencies]
 slint = { version = "1.19.0", features = ["backend-android-activity-06"] }
 # Reading share intents (already in the tree through Slint's Android backend).

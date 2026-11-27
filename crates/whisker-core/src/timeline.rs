@@ -1759,7 +1759,7 @@ pub const SAFE_FORMATS: &str = "mov,mp4,m4a,3gp,matroska,webm,avi,mpegts,ogg,mp3
 pub fn ffmpeg_available() -> bool {
     static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FOUND.get_or_init(|| {
-        std::process::Command::new("ffmpeg")
+        crate::tool("ffmpeg")
             .arg("-version")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -1849,8 +1849,8 @@ fn parse_sound(text: &str) -> Option<VideoInfo> {
 }
 
 fn probe_text(input: &std::ffi::OsStr) -> Option<String> {
-    use std::process::{Command, Stdio};
-    let probe = Command::new("ffprobe")
+    use std::process::Stdio;
+    let probe = crate::tool("ffprobe")
         .args(ffmpeg_guard(input.as_ref()))
         .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:stream_side_data=rotation:stream_tags=rotate,language,title:format=duration", "-of", "default=nw=1"])
         .arg(input)
@@ -1887,7 +1887,7 @@ fn parse_probe(text: &str) -> Option<VideoInfo> {
 /// A frame from early in the video at `path` (a file, or an address
 /// ffmpeg can read), as a JPEG.
 pub fn video_poster(path: impl AsRef<std::ffi::OsStr>) -> Option<Poster> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     let path = path.as_ref();
     // Phones: their own decoder makes it.
     if let Some(tools) = crate::upload::media_tools() {
@@ -1898,7 +1898,7 @@ pub fn video_poster(path: impl AsRef<std::ffi::OsStr>) -> Option<Poster> {
     let ph = ((u64::from(h) * u64::from(pw) / u64::from(w)) as u32).max(2) & !1;
     // A second in skips black fade-ins; short clips use their first frame.
     for seek in ["1", "0"] {
-        let out = Command::new("ffmpeg")
+        let out = crate::tool("ffmpeg")
             .args(["-v", "error", "-nostdin"])
             .args(ffmpeg_guard(path))
             .args(["-ss", seek, "-i"])
@@ -2019,7 +2019,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("whisker-poster-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("clip.mp4");
-        let made = std::process::Command::new("ffmpeg")
+        let made = crate::tool("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=10:duration=2", "-pix_fmt", "yuv420p"])
             .arg(&video)
             .status();

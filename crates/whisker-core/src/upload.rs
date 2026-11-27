@@ -591,7 +591,7 @@ pub(crate) fn media_tools() -> Option<&'static MediaTools> {
 /// without re-encoding (or the phone's own tools, see [`MediaTools`]).
 /// `None` without either, or when it can't.
 fn strip_av(data: &[u8], name: &str, video: bool) -> Option<Vec<u8>> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     if let Some(tools) = media_tools() {
         return (tools.strip)(data, name, video).filter(|d| !d.is_empty());
     }
@@ -616,7 +616,7 @@ fn strip_av(data: &[u8], name: &str, video: bool) -> Option<Vec<u8>> {
         } else {
             &["-map", "0:a"]
         };
-        let ok = Command::new("ffmpeg")
+        let ok = crate::tool("ffmpeg")
             // Only the file itself: a playlist can't make ffmpeg fetch anything.
             .args(["-v", "error", "-nostdin", "-y", "-protocol_whitelist", "file", "-i"])
             .arg(&src)
@@ -1174,7 +1174,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         crate::stores::set_scratch_root(&dir);
         let video = dir.join("clip.mp4");
-        let made = Command::new("ffmpeg")
+        let made = crate::tool("ffmpeg")
             .args([
                 "-v",
                 "error",

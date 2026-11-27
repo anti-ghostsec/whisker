@@ -95,10 +95,10 @@ pub fn stop() {
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
 fn speaker(stop: &AtomicBool, playout: &Playout) {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::Instant;
     let Some(out) = crate::player::sound_output() else { return };
-    let child = Command::new("ffmpeg")
+    let child = whisker_core::tool("ffmpeg")
         .args(["-v", "error", "-probesize", "32", "-analyzeduration", "0", "-fflags", "nobuffer", "-f", "s16le", "-ar", "48000", "-ac", "1", "-i", "pipe:0"])
         .args(out)
         .stdin(Stdio::piped())

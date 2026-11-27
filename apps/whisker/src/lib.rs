@@ -10,9 +10,11 @@ mod notify;
 mod droid;
 #[cfg(target_os = "android")]
 mod picker;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
 #[cfg_attr(target_os = "android", path = "android_player.rs")]
 mod player;
+#[cfg(windows)]
+mod win_sound;
 #[cfg(not(target_os = "android"))]
 #[doc(hidden)]
 pub mod select;
@@ -505,9 +507,9 @@ static EXTERNAL_PLAYERS: std::sync::Mutex<Vec<std::process::Child>> = std::sync:
 /// Stops everything that plays or records: locking mustn't leave a hidden
 /// vault's video playing out loud, or the microphone open.
 fn stop_all_media(ui: &slint::Weak<AppWindow>) {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     player::stop(ui);
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
     let _ = ui;
     voice::cancel();
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2401,7 +2403,7 @@ impl Ctl {
         self.end_preview();
         self.st.lock().unwrap().row_limit = None;
         // A video playing in the room being left stops.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", windows))]
         player::stop(&self.ui);
         let Some(account) = self.st.lock().unwrap().account else { return };
         let Some(client) = self.mgr.client(account).await else { return };
@@ -2826,7 +2828,7 @@ impl Ctl {
         if joined(&p.room_id) {
             return show_room(p.room_id).await;
         }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", windows))]
         player::stop(&self.ui);
         self.end_preview();
         let key = (account, p.room_id.clone());
@@ -5268,7 +5270,7 @@ impl Ctl {
     async fn play_media(&self, key: &RoomKey, m: HistoryItem) {
         let Some(media) = m.media else { return };
         // Already loaded (a sound playing, say): pause or carry on.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", windows))]
         if player::is_loaded(m.event_id.as_str()) {
             return player::toggle(&self.ui);
         }
@@ -5279,9 +5281,9 @@ impl Ctl {
         let Some(client) = self.mgr.client(key.0).await else { return };
         // Played in the window: videos, and sound (voice messages) too.
         let in_window = matches!(media.kind, MediaKind::Video | MediaKind::Audio);
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
         let _ = in_window;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", windows))]
         if in_window && player::available() {
             player::stop(&self.ui);
             let id = event_id.to_string();
@@ -5369,7 +5371,7 @@ impl Ctl {
         match r {
             Ok(()) => {
                 // Videos play in the message itself where Whisker can show them.
-                #[cfg(any(target_os = "linux", target_os = "android"))]
+                #[cfg(any(target_os = "linux", target_os = "android", windows))]
                 if in_window && player::available() {
                     let (ui, id, path) = (self.ui.clone(), event_id.to_string(), path.clone());
                     let played = tokio::task::spawn_blocking(move || player::play(ui, id, path)).await.unwrap_or(false);
@@ -5387,7 +5389,7 @@ impl Ctl {
                 self.status("This phone can't play that file's format. Hold it and choose Save to open it in another app.");
             }
             Err(e) => {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
+                #[cfg(any(target_os = "linux", target_os = "android", windows))]
                 self.ui(|u| u.global::<Player>().set_loading(false));
                 self.status(if e.to_string() == "cancelled" { "Download cancelled.".to_owned() } else { format!("Couldn't open it: {e:#}") });
             }
@@ -5396,7 +5398,7 @@ impl Ctl {
 
     /// Says how far the download of `file` (message `id`) has got while it
     /// plays, until it's all here or something else is played.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     fn show_downloading(&self, file: Arc<files::RemoteFile>, id: String) {
         let c = self.clone();
         self.rt.spawn(async move {
@@ -5424,7 +5426,7 @@ impl Ctl {
 
     /// Starts playing `file` (message `id`) in the window while it streams.
     /// False when the player can't read it that way.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     async fn play_streaming(&self, file: Arc<files::RemoteFile>, id: String) -> bool {
         let (ui, shown) = (self.ui.clone(), id.clone());
         #[cfg(target_os = "android")]
@@ -5966,11 +5968,11 @@ impl Ctl {
         };
         let proxy = self.mgr.details(key.0).await.and_then(|d| d.1);
         let event = m.event_id.to_string();
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", windows))]
         let here = player::available();
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
         let here = false;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", windows))]
         if here {
             player::stop(&self.ui);
             let id = event.clone();
@@ -6007,7 +6009,7 @@ impl Ctl {
         self.ui(|u| u.global::<Player>().set_progress(0));
         match r {
             Ok(()) => {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
+                #[cfg(any(target_os = "linux", target_os = "android", windows))]
                 if here {
                     let (ui, p) = (self.ui.clone(), path.clone());
                     if tokio::task::spawn_blocking(move || player::play(ui, event, p)).await.unwrap_or(false) {
@@ -6022,7 +6024,7 @@ impl Ctl {
                 self.status("This phone can't play that video's format.");
             }
             Err(e) => {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
+                #[cfg(any(target_os = "linux", target_os = "android", windows))]
                 self.ui(|u| u.global::<Player>().set_loading(false));
                 self.status(if e.to_string() == "cancelled" { "Download cancelled.".to_owned() } else { format!("Couldn't play it: {e:#}") });
             }
@@ -8579,7 +8581,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         let c = ctl.clone();
         ui.on_cancel_uploads(move || c.cancel_uploads());
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     {
         let c = ctl.clone();
         ui.global::<Player>().on_toggle(move |id| {
@@ -8610,7 +8612,7 @@ pub fn run(data_dir: PathBuf) -> Result<()> {
         let c = ctl.clone();
         ui.global::<Player>().on_set_large(move |on| player::set_large(&c.ui, on));
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
     {
         let c = ctl.clone();
         ui.global::<Player>().on_toggle(move |id| {

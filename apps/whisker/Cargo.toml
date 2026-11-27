@@ -68,5 +68,9 @@ ndk-sys = { version = "0.6", features = ["media"] }
 
 [build-dependencies]
 slint-build = "1.19.0"
+# Windows: the program's icon (Explorer, the Start menu), made from
+# assets/icon.png.
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+winresource = "0.1"
 
 # Android permissions, name and Share menu entry are in manifest.yaml.

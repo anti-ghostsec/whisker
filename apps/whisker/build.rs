@@ -8,6 +8,27 @@ fn main() {
     slint_build::compile_with_config("ui/app.slint", config).expect("Slint UI failed to compile");
     emoji_table();
     android_libcxx();
+    windows_icon();
+}
+
+/// Windows: assets/icon.png, as the icon inside whisker.exe.
+fn windows_icon() {
+    println!("cargo:rerun-if-changed=assets/icon.png");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("whisker.ico");
+    let png = image::open("assets/icon.png").expect("assets/icon.png");
+    let frames: Vec<_> = [256u32, 64, 48, 32, 16]
+        .into_iter()
+        .map(|n| {
+            let small = png.resize_exact(n, n, image::imageops::FilterType::Lanczos3).into_rgba8();
+            image::codecs::ico::IcoFrame::as_png(small.as_raw(), n, n, image::ExtendedColorType::Rgba8).expect("icon frame")
+        })
+        .collect();
+    let file = std::fs::File::create(&out).expect("icon file");
+    image::codecs::ico::IcoEncoder::new(file).encode_images(&frames).expect("icon");
+    winresource::WindowsResource::new().set_icon(out.to_str().unwrap()).compile().expect("Windows resources");
 }
 
 /// Android: links the C++ library of the NDK the build uses (ANDROID_NDK_HOME).

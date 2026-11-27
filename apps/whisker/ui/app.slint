@@ -516,6 +516,14 @@ export global Player {
     // Keeps the controls up over a playing video while the sound level is
     // being set (they'd hide with the hover, taking the level with them).
     in-out property <bool> bar-hold;
+    // The sound level opens from the window itself, at the speaker that
+    // asked (where it is on the window when clicked): a popup inside a
+    // message could come up somewhere else when the list had reused it.
+    in-out property <length> volume-x;
+    in-out property <length> volume-y;
+    in-out property <int> volume-ask;
+    // Counts touches of the level, to keep the controls up.
+    in-out property <int> volume-touch;
     callback toggle-subtitles();
     // Draws that subtitle track (-1: none).
     callback pick-subtitles(int);
@@ -614,6 +622,8 @@ component VideoBar inherits Rectangle {
     TouchArea {}
     // Lets the controls hide again a few seconds after the level was last touched.
     property <int> idle;
+    property <int> touches: Player.volume-touch;
+    changed touches => { root.idle = 0; }
     Timer {
         interval: 1s;
         running: Player.bar-hold;
@@ -725,42 +735,9 @@ component VideoBar inherits Rectangle {
                 clicked => {
                     root.idle = 0;
                     Player.bar-hold = true;
-                    volume-popup.show();
-                }
-            }
-            // A popup stays where it opened: if the video moves (the chat
-            // scrolls, or something above it loads), it closes rather than
-            // being left floating away from it.
-            changed absolute-position => { volume-popup.close(); }
-            // The level, with the speaker below it to turn the sound off and on.
-            volume-popup := PopupWindow {
-                x: (parent.width - 44px) / 2;
-                y: -186px;
-                width: 44px;
-                height: 180px;
-                close-policy: close-on-click-outside;
-                Rectangle {
-                    border-radius: 10px;
-                    background: #000000d0;
-                    VerticalLayout {
-                        padding-top: 6px;
-                        padding-bottom: 6px;
-                        alignment: center;
-                        Text { text: Player.muted ? "off" : Player.volume + "%"; color: white; font-size: 10px; horizontal-alignment: center; }
-                        HorizontalLayout {
-                            alignment: center;
-                            VolumeSlider {
-                                value: Player.muted ? 0 : Player.volume;
-                                committed(v) => { Player.set-volume(v); }
-                                touched => { root.idle = 0; }
-                            }
-                        }
-                        Rectangle {
-                            height: 22px;
-                            Text { text: Player.muted ? "Unmute" : "Mute"; color: Player.muted ? Theme.accent : white; font-size: 10px; font-weight: 600; }
-                            TouchArea { mouse-cursor: pointer; clicked => { root.idle = 0; Player.mute(); } }
-                        }
-                    }
+                    Player.volume-x = parent.absolute-position.x + parent.width / 2;
+                    Player.volume-y = parent.absolute-position.y;
+                    Player.volume-ask += 1;
                 }
             }
         }
@@ -1112,38 +1089,14 @@ component MessageRow inherits Rectangle {
                                             Text { text: Player.muted ? "🔇" : "🔊"; font-size: 13px; }
                                             TouchArea {
                                                 mouse-cursor: pointer;
-                                                clicked => { if !root.held { sound-popup.show(); } }
-                                                pointer-event(e) => { root.press(e); }
-                                            }
-                                            changed absolute-position => { sound-popup.close(); }
-                                            sound-popup := PopupWindow {
-                                                x: (parent.width - 44px) / 2;
-                                                y: -186px;
-                                                width: 44px;
-                                                height: 180px;
-                                                close-policy: close-on-click-outside;
-                                                Rectangle {
-                                                    border-radius: 10px;
-                                                    background: #000000d0;
-                                                    VerticalLayout {
-                                                        padding-top: 6px;
-                                                        padding-bottom: 6px;
-                                                        alignment: center;
-                                                        Text { text: Player.muted ? "off" : Player.volume + "%"; color: white; font-size: 10px; horizontal-alignment: center; }
-                                                        HorizontalLayout {
-                                                            alignment: center;
-                                                            VolumeSlider {
-                                                                value: Player.muted ? 0 : Player.volume;
-                                                                committed(v) => { Player.set-volume(v); }
-                                                            }
-                                                        }
-                                                        Rectangle {
-                                                            height: 22px;
-                                                            Text { text: Player.muted ? "Unmute" : "Mute"; color: Player.muted ? Theme.accent : white; font-size: 10px; font-weight: 600; }
-                                                            TouchArea { mouse-cursor: pointer; clicked => { Player.mute(); } }
-                                                        }
+                                                clicked => {
+                                                    if !root.held {
+                                                        Player.volume-x = parent.absolute-position.x + parent.width / 2;
+                                                        Player.volume-y = parent.absolute-position.y;
+                                                        Player.volume-ask += 1;
                                                     }
                                                 }
+                                                pointer-event(e) => { root.press(e); }
                                             }
                                         }
                                     }
@@ -2090,6 +2043,8 @@ component MessageSheet inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Whisker";
+    // The taskbar's (and the window list's) picture of Whisker.
+    icon: @image-url("../assets/icon.png");
     // Emoji first: otherwise a text font with plain black-and-white emoji
     // shapes (DejaVu Sans has some) wins over the colour emoji font.
     default-font-family: "Whisker Emoji";
@@ -5029,6 +4984,41 @@ export component AppWindow inherits Window {
                 spacing: 10px;
                 Text { text: "Verification stopped" + (root.verify-message == "" ? "." : ": " + root.verify-message); wrap: word-wrap; color: Theme.danger; }
                 HorizontalLayout { alignment: end; Btn { text: "Close"; clicked => { root.verify-action("close"); } } }
+            }
+        }
+    }
+
+    // The sound level of whatever's playing (see Player.volume-x): above
+    // the speaker that opened it, with Mute below the slider.
+    property <int> volume-asked: Player.volume-ask;
+    changed volume-asked => { volume-popup.show(); }
+    volume-popup := PopupWindow {
+        x: Player.volume-x - 22px;
+        y: Player.volume-y - 186px;
+        width: 44px;
+        height: 180px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            border-radius: 10px;
+            background: #000000d0;
+            VerticalLayout {
+                padding-top: 6px;
+                padding-bottom: 6px;
+                alignment: center;
+                Text { text: Player.muted ? "off" : Player.volume + "%"; color: white; font-size: 10px; horizontal-alignment: center; }
+                HorizontalLayout {
+                    alignment: center;
+                    VolumeSlider {
+                        value: Player.muted ? 0 : Player.volume;
+                        committed(v) => { Player.set-volume(v); }
+                        touched => { Player.volume-touch += 1; }
+                    }
+                }
+                Rectangle {
+                    height: 22px;
+                    Text { text: Player.muted ? "Unmute" : "Mute"; color: Player.muted ? Theme.accent : white; font-size: 10px; font-weight: 600; }
+                    TouchArea { mouse-cursor: pointer; clicked => { Player.volume-touch += 1; Player.mute(); } }
+                }
             }
         }
     }

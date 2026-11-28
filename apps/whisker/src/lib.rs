@@ -486,6 +486,7 @@ fn media_dir(data_dir: &std::path::Path) -> PathBuf {
 
 /// Plays a video (looping, sound off to start, like videos in chat apps)
 /// or audio in mpv when it's installed, else in the system's player.
+#[cfg(not(windows))]
 fn play_file(path: &std::path::Path, video: bool) {
     let mut cmd = std::process::Command::new("mpv");
     cmd.arg("--force-window=yes").arg("--title=Whisker").arg("--no-terminal");
@@ -5345,54 +5346,89 @@ impl Ctl {
                 return;
             }
         }
-        let dir = media_dir(self.mgr.data_dir());
-        // The name is the sender's (`holiday.exe`): the file is named
-        // after what its bytes really are, and only audio and video play.
-        let name = whisker_core::vault::random_secret()[..16].to_owned();
-        let mut path = dir.join(&name);
         let progress = Arc::new(whisker_core::media_fetch::Progress::default());
         let watching = self.watch_progress(progress.clone(), |c, pct| {
             c.ui(move |u| u.global::<Player>().set_progress(pct));
         });
         let r = self.cancellable(async {
             let bytes = whisker_core::media_fetch::with_progress(progress, timeline::download_in(&client, &key.1, &media.source, None)).await?;
+            // The name is the sender's (`holiday.exe`): the file is named
+            // after what its bytes really are, and only audio and video play.
             let Some(ext) = timeline::sniff_media(&bytes) else {
                 anyhow::bail!("it isn't a video or audio file Whisker knows (use Save to keep it)");
             };
-            path.set_extension(ext);
-            whisker_core::stores::make_private_dir(&dir)?;
-            tokio::fs::write(&path, bytes).await?;
-            whisker_core::vault::owner_only(&path, false);
-            anyhow::Ok(())
+            anyhow::Ok((bytes, ext))
         })
         .await;
         watching.abort();
         self.ui(|u| u.global::<Player>().set_progress(0));
         match r {
-            Ok(()) => {
-                // Videos play in the message itself where Whisker can show them.
-                #[cfg(any(target_os = "linux", target_os = "android", windows))]
-                if in_window && player::available() {
-                    let (ui, id, path) = (self.ui.clone(), event_id.to_string(), path.clone());
-                    let played = tokio::task::spawn_blocking(move || player::play(ui, id, path)).await.unwrap_or(false);
-                    if played {
-                        if media.kind == MediaKind::Audio {
-                            self.status("Playing, muted: tap the speaker to turn the sound on.");
-                        }
-                        return;
-                    }
-                    self.ui(|u| u.global::<Player>().set_loading(false));
-                }
-                #[cfg(not(target_os = "android"))]
-                play_file(&path, media.kind == MediaKind::Video);
-                #[cfg(target_os = "android")]
-                self.status("This phone can't play that file's format. Hold it and choose Save to open it in another app.");
-            }
+            Ok((bytes, ext)) => self.play_downloaded(event_id.to_string(), bytes, ext, in_window, media.kind).await,
             Err(e) => {
                 #[cfg(any(target_os = "linux", target_os = "android", windows))]
                 self.ui(|u| u.global::<Player>().set_loading(false));
                 self.status(if e.to_string() == "cancelled" { "Download cancelled.".to_owned() } else { format!("Couldn't open it: {e:#}") });
             }
+        }
+    }
+
+    /// Plays a video or sound downloaded whole: in the message itself where
+    /// Whisker can show it, else in another player. On Linux and Android
+    /// it's kept in Whisker's private folder (in RAM, on Linux) to play. On
+    /// Windows, where that folder is on the disk, it's never written out:
+    /// ffmpeg reads it from memory, over a private address on this computer.
+    async fn play_downloaded(&self, id: String, bytes: Vec<u8>, ext: &'static str, here: bool, kind: MediaKind) {
+        #[cfg(windows)]
+        {
+            let _ = ext;
+            if here && player::available()
+                && let Ok(relay) = files::Relay::serve(files::RemoteFile::in_memory(bytes)).await
+            {
+                let ui = self.ui.clone();
+                if tokio::task::spawn_blocking(move || player::play_stream(ui, id, relay)).await.unwrap_or(false) {
+                    if kind == MediaKind::Audio {
+                        self.status("Playing, muted: tap the speaker to turn the sound on.");
+                    }
+                    return;
+                }
+            }
+            self.ui(|u| u.global::<Player>().set_loading(false));
+            self.status("Whisker can't play that file's format. Hold it and choose Save to open it in another app.");
+        }
+        #[cfg(not(windows))]
+        {
+            let dir = media_dir(self.mgr.data_dir());
+            let mut path = dir.join(&whisker_core::vault::random_secret()[..16]);
+            path.set_extension(ext);
+            let kept = async {
+                whisker_core::stores::make_private_dir(&dir)?;
+                tokio::fs::write(&path, bytes).await?;
+                whisker_core::vault::owner_only(&path, false);
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(e) = kept {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                self.ui(|u| u.global::<Player>().set_loading(false));
+                return self.status(format!("Couldn't open it: {e:#}"));
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if here && player::available() {
+                let (ui, p) = (self.ui.clone(), path.clone());
+                if tokio::task::spawn_blocking(move || player::play(ui, id, p)).await.unwrap_or(false) {
+                    if kind == MediaKind::Audio {
+                        self.status("Playing, muted: tap the speaker to turn the sound on.");
+                    }
+                    return;
+                }
+                self.ui(|u| u.global::<Player>().set_loading(false));
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let _ = (here, id);
+            #[cfg(not(target_os = "android"))]
+            play_file(&path, kind == MediaKind::Video);
+            #[cfg(target_os = "android")]
+            self.status("This phone can't play that file's format. Hold it and choose Save to open it in another app.");
         }
     }
 
@@ -5993,36 +6029,16 @@ impl Ctl {
                 c.ui(move |u| u.global::<Player>().set_progress(i32::from(pct)));
             }
         };
-        let dir = media_dir(self.mgr.data_dir());
-        let mut path = dir.join(&whisker_core::vault::random_secret()[..16]);
         let r = self
             .cancellable(async {
                 let bytes = whisker_core::link_preview::youtube_video(&base, &id, proxy.as_deref(), &progress).await?;
                 let Some(ext) = timeline::sniff_media(&bytes) else { anyhow::bail!("the server didn't send a video") };
-                path.set_extension(ext);
-                whisker_core::stores::make_private_dir(&dir)?;
-                tokio::fs::write(&path, bytes).await?;
-                whisker_core::vault::owner_only(&path, false);
-                anyhow::Ok(())
+                anyhow::Ok((bytes, ext))
             })
             .await;
         self.ui(|u| u.global::<Player>().set_progress(0));
         match r {
-            Ok(()) => {
-                #[cfg(any(target_os = "linux", target_os = "android", windows))]
-                if here {
-                    let (ui, p) = (self.ui.clone(), path.clone());
-                    if tokio::task::spawn_blocking(move || player::play(ui, event, p)).await.unwrap_or(false) {
-                        return;
-                    }
-                    self.ui(|u| u.global::<Player>().set_loading(false));
-                }
-                let _ = here;
-                #[cfg(not(target_os = "android"))]
-                play_file(&path, true);
-                #[cfg(target_os = "android")]
-                self.status("This phone can't play that video's format.");
-            }
+            Ok((bytes, ext)) => self.play_downloaded(event, bytes, ext, here, MediaKind::Video).await,
             Err(e) => {
                 #[cfg(any(target_os = "linux", target_os = "android", windows))]
                 self.ui(|u| u.global::<Player>().set_loading(false));

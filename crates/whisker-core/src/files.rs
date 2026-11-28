@@ -218,9 +218,11 @@ impl Drop for Key {
 /// What's on disk is never readable: an encrypted file is kept as the
 /// server sent it, a plain one is encrypted with a key made up for this one
 /// playing, and either key is only in memory. The file has no name (it's
-/// taken out of its folder as soon as it's made), so it's gone when playing
-/// stops or Whisker closes, however that happens.
-#[cfg(unix)]
+/// taken out of its folder as soon as it's made; on Windows, which can't do
+/// that, it's opened to be deleted when closed and shared with no other
+/// program), so it's gone when playing stops or Whisker closes, however
+/// that happens.
+#[cfg(any(unix, windows))]
 struct Spool {
     file: Arc<std::fs::File>,
     key: Key,
@@ -229,7 +231,7 @@ struct Spool {
     task: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Copy, PartialEq)]
 enum Coming {
     Yes,
@@ -237,22 +239,41 @@ enum Coming {
     Stopped,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for Spool {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Spool {
     /// Starts keeping `res` (the whole file, `size` bytes) in `dir`.
     fn start(res: reqwest::Response, media_key: Option<Key>, size: u64, dir: &std::path::Path) -> Result<Spool> {
-        use std::os::unix::fs::OpenOptionsExt;
         crate::stores::make_private_dir(dir)?;
         let path = dir.join(&crate::vault::random_secret()[..16]);
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
-        std::fs::remove_file(&path).context("couldn't keep the download private")?;
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
+            std::fs::remove_file(&path).context("couldn't keep the download private")?;
+            file
+        };
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+            const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+            const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x2000;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                .attributes(FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED)
+                .open(&path)?
+        };
         let (key, scramble) = match media_key {
             Some(k) => (k, false),
             None => {
@@ -271,7 +292,6 @@ impl Spool {
     /// Writes the download to disk as it comes, saying how far it has got.
     async fn fill(mut res: reqwest::Response, file: Arc<std::fs::File>, scramble: Option<Key>, size: u64, tx: tokio::sync::watch::Sender<(u64, Coming)>) {
         use aes::cipher::StreamCipher;
-        use std::os::unix::fs::FileExt;
         /// Written (and readable) this much at a time.
         const STEP: usize = 256 * 1024;
         let mut cipher = scramble.as_ref().map(|k| k.cipher_at(0));
@@ -300,7 +320,7 @@ impl Spool {
             if buf.len() >= STEP || (last && !buf.is_empty()) {
                 let (f, data) = (file.clone(), std::mem::replace(&mut buf, Vec::with_capacity(STEP * 2)));
                 let n = data.len() as u64;
-                match tokio::task::spawn_blocking(move || f.write_all_at(&data, at)).await {
+                match tokio::task::spawn_blocking(move || write_all_at(&f, &data, at)).await {
                     Ok(Ok(())) => at += n,
                     Ok(Err(e)) => {
                         tracing::warn!("couldn't keep a file being played (is the disk full?): {e}");
@@ -326,7 +346,6 @@ impl Spool {
     /// Bytes `offset..end` of the file, once they've come.
     async fn read(&self, offset: u64, end: u64) -> Result<Vec<u8>> {
         use aes::cipher::StreamCipher;
-        use std::os::unix::fs::FileExt;
         let mut have = self.have.clone();
         loop {
             let (got, coming) = *have.borrow_and_update();
@@ -340,12 +359,54 @@ impl Spool {
         let (file, key) = (self.file.clone(), self.key.clone());
         tokio::task::spawn_blocking(move || {
             let mut data = vec![0u8; (end - offset) as usize];
-            file.read_exact_at(&mut data, offset)?;
+            read_exact_at(&file, &mut data, offset)?;
             key.cipher_at(offset).apply_keystream(&mut data);
             Ok(data)
         })
         .await?
     }
+}
+
+/// Writes all of `data` at byte `at` of `file`.
+#[cfg(unix)]
+fn write_all_at(file: &std::fs::File, data: &[u8], at: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, data, at)
+}
+
+/// Reads `buf.len()` bytes from byte `at` of `file`.
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, at)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &std::fs::File, mut data: &[u8], mut at: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !data.is_empty() {
+        match file.seek_write(data, at)? {
+            0 => return Err(std::io::ErrorKind::WriteZero.into()),
+            n => {
+                data = &data[n..];
+                at += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut at: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, at)? {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => {
+                buf = &mut buf[n..];
+                at += n as u64;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The file's address, and its key if it's encrypted.
@@ -484,7 +545,8 @@ struct Blocks {
 /// change the bytes, which then decrypt to noise). Only the formats in
 /// [`crate::timeline::SAFE_FORMATS`] are read from it.
 pub struct RemoteFile {
-    client: Client,
+    /// None for a file only in memory.
+    client: Option<Client>,
     at: Address,
     key: Option<Key>,
     size: Option<u64>,
@@ -497,8 +559,10 @@ pub struct RemoteFile {
     blocks: std::sync::Mutex<Blocks>,
     /// The whole file, coming once and kept on disk: for a server that
     /// doesn't send parts.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     spool: Option<Spool>,
+    /// The whole file, already downloaded and held in memory only.
+    memory: Option<Arc<[u8]>>,
 }
 
 impl RemoteFile {
@@ -523,11 +587,11 @@ impl RemoteFile {
         let allowed = AtomicU64::new(budget(size));
         // The whole file is on its way (the server doesn't send parts):
         // it's kept as it comes, and read from there.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let (false, Some(size), Some(dir)) = (ranges, size, keep_in) {
             let spool = Spool::start(res, key.clone(), size, dir)?;
             let head = spool.read(0, size.min(4096)).await?;
-            return Ok(Arc::new(RemoteFile { client: client.clone(), at, key, size: Some(size), ranges, head, budget: allowed, blocks: Default::default(), spool: Some(spool) }));
+            return Ok(Arc::new(RemoteFile { client: Some(client.clone()), at, key, size: Some(size), ranges, head, budget: allowed, blocks: Default::default(), spool: Some(spool), memory: None }));
         }
         let _ = keep_in;
         let mut piece = Piece::new(res, 0, Some(4095), key.clone())?;
@@ -536,7 +600,7 @@ impl RemoteFile {
             head.extend_from_slice(&data);
         }
         Ok(Arc::new(RemoteFile {
-            client: client.clone(),
+            client: Some(client.clone()),
             at,
             key,
             size,
@@ -544,9 +608,29 @@ impl RemoteFile {
             head,
             budget: allowed,
             blocks: Default::default(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             spool: None,
+            memory: None,
         }))
+    }
+
+    /// A file already downloaded whole, served from memory: it never has
+    /// to be written out for ffmpeg to play it.
+    pub fn in_memory(bytes: Vec<u8>) -> Arc<RemoteFile> {
+        let bytes: Arc<[u8]> = Arc::from(bytes);
+        Arc::new(RemoteFile {
+            client: None,
+            at: Address { url: reqwest::Url::parse("http://127.0.0.1/").expect("a fixed address"), auth: false },
+            key: None,
+            size: Some(bytes.len() as u64),
+            ranges: true,
+            head: bytes[..bytes.len().min(4096)].to_vec(),
+            budget: AtomicU64::new(u64::MAX),
+            blocks: Default::default(),
+            #[cfg(any(unix, windows))]
+            spool: None,
+            memory: Some(bytes),
+        })
     }
 
     /// The file's size, when the server says it.
@@ -568,7 +652,7 @@ impl RemoteFile {
     /// Any part can be asked for: the server sends parts, or the whole
     /// file is being kept as it comes.
     fn parts(&self) -> bool {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if self.spool.is_some() {
             return true;
         }
@@ -578,11 +662,11 @@ impl RemoteFile {
     /// For a file played while the whole of it downloads: how many bytes
     /// have come, and whether more are coming. `None` for one read in parts.
     pub fn downloading(&self) -> Option<(u64, bool)> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.spool.as_ref().map(Spool::progress)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             None
         }
@@ -590,7 +674,7 @@ impl RemoteFile {
 
     /// Starts downloading the file from byte `from`, to `to` when given.
     async fn fetch(&self, from: u64, to: Option<u64>) -> Result<Piece> {
-        let mut req = self.at.get(&self.client);
+        let mut req = self.at.get(self.client.as_ref().context("the file is only in memory")?);
         if from > 0 || to.is_some() {
             let to = to.map(|t| t.to_string()).unwrap_or_default();
             req = req.header(reqwest::header::RANGE, format!("bytes={from}-{to}"));
@@ -611,7 +695,10 @@ impl RemoteFile {
         if offset >= end {
             return Ok(Vec::new());
         }
-        #[cfg(unix)]
+        if let Some(bytes) = &self.memory {
+            return Ok(bytes[offset as usize..end as usize].to_vec());
+        }
+        #[cfg(any(unix, windows))]
         if let Some(spool) = &self.spool {
             return spool.read(offset, end).await;
         }
@@ -1212,6 +1299,20 @@ mod tests {
         let got = reqwest::Client::new().get(&relay.url).header("range", "bytes=100000-").send().await.unwrap();
         assert_eq!(got.status().as_u16(), 206);
         assert_eq!(&got.bytes().await.unwrap()[..], &plain[100_000..]);
+    }
+
+    /// A file downloaded whole is served from memory, any part of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serves_files_from_memory() {
+        let plain: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let relay = Relay::serve(RemoteFile::in_memory(plain.clone())).await.unwrap();
+        let got = reqwest::Client::new().get(&relay.url).header("range", "bytes=100000-").send().await.unwrap();
+        assert_eq!(got.status(), 206);
+        assert_eq!(&got.bytes().await.unwrap()[..], &plain[100_000..]);
+        let all = reqwest::Client::new().get(&relay.url).send().await.unwrap().bytes().await.unwrap();
+        assert_eq!(&all[..], &plain[..]);
+        let wrong = reqwest::Client::new().get(format!("{}x", relay.url)).send().await.unwrap();
+        assert_eq!(wrong.status(), 404);
     }
 
     /// A server that only sends whole files: the file is played as it

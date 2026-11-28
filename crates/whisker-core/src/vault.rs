@@ -441,8 +441,82 @@ pub fn owner_only(path: &Path, dir: bool) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(if dir { 0o700 } else { 0o600 }));
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    windows_owner_only(path, dir);
+    #[cfg(not(any(unix, windows)))]
     let _ = (path, dir);
+}
+
+/// On Windows: an access list giving this user alone full control, not
+/// taken from the folder above (which lets in administrators, SYSTEM and,
+/// for some folders, everyone). A folder's list goes on to what's made in
+/// it, so its files are this user's alone too. Windows' own search index
+/// and other services can't read it either.
+#[cfg(windows)]
+fn windows_owner_only(path: &Path, dir: bool) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    let Some(sid) = windows_user_sid() else { return };
+    // Full control for the user; a folder's goes on to what's in it.
+    let sddl = if dir { format!("D:P(A;OICI;FA;;;{sid})") } else { format!("D:P(A;;FA;;;{sid})") };
+    let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let (sddl, name) = (wide(std::ffi::OsStr::new(&sddl)), wide(path.as_os_str()));
+    // SAFETY: the strings are NUL-terminated and outlive the calls; the
+    // descriptor Windows allocates is freed once, after its list is used.
+    unsafe {
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) == 0 {
+            return tracing::warn!("couldn't make an owner-only access list");
+        }
+        let (mut present, mut defaulted, mut acl): (i32, i32, *mut ACL) = (0, 0, std::ptr::null_mut());
+        if GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted) != 0 && present != 0 {
+            let r = SetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), acl, std::ptr::null());
+            if r != 0 {
+                tracing::debug!("couldn't make {} owner-only (error {r})", path.display());
+            }
+        }
+        LocalFree(sd);
+    }
+}
+
+/// This user's SID, as text (`S-1-5-21-…`).
+#[cfg(windows)]
+fn windows_user_sid() -> Option<&'static str> {
+    static SID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SID.get_or_init(|| {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        // SAFETY: the buffer is sized by Windows' first answer and aligned
+        // for TOKEN_USER (u64s); the handle and string are freed once.
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return None;
+            }
+            let mut len = 0u32;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+            let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+            let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len) != 0;
+            CloseHandle(token);
+            if !ok {
+                return None;
+            }
+            let user = &*(buf.as_ptr() as *const TOKEN_USER);
+            let mut text: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
+                return None;
+            }
+            let n = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+            LocalFree(text.cast());
+            Some(sid)
+        }
+    })
+    .as_deref()
 }
 
 fn derive(

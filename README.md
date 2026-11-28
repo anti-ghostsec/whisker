@@ -188,7 +188,9 @@ operating system and the **Wisp** browser.
   are drawn on it; the CC button hides them. The corners button (or a double-click) shows it
   **large**, over the whole window; Esc, ✕ or the button again brings it back. One plays at a
   time, and it stops when you switch rooms. Without ffmpeg, and on other systems, it opens in mpv or your
-  system's player. The copy goes to the RAM folder and is deleted when you lock or quit.
+  system's player. The copy goes to the RAM folder and is deleted when you lock or quit. On
+  Windows (whose installer includes ffmpeg) a downloaded video is never written out: it plays
+  from memory.
 - **Spaces** show as folders in the room list, holding their rooms and sub-spaces (a folded
   space shows the unread count of everything inside). Clicking a space opens its page: every
   room it lists, with **Join** for the ones you aren't in yet and **Open** for the rest, plus
@@ -410,8 +412,18 @@ or `/dev/shm` on Linux), which is wiped when you lock. If Whisker crashes, what 
 time Whisker starts, before any passphrase is asked for: a folder per account would
 otherwise count the accounts of every vault that was open. Each account's folder there
 gets a random name for that run, and is zero-filled before it's deleted. What's lost is what changed
-since the last save into the vault (a few minutes at most). On Windows the running copy is on disk while unlocked (wiped on lock); on Android
-it is in the app's private storage.
+since the last save into the vault (a few minutes at most). On Android it is in the app's
+private storage.
+
+On Windows there's no RAM folder to use without an administrator, so the running copy is on
+disk while unlocked (its databases encrypted with a key kept in the vault, and wiped on
+lock). Whisker's folders there are locked to your user alone: their access list lets in no
+one else, not administrators' accounts, SYSTEM, or Windows' search index (an administrator
+can still take them over). Videos you open are played from memory, and one played while it
+downloads is kept in a file encrypted with a key only in memory, which Windows deletes when
+it's closed. What does reach the disk unencrypted while unlocked: videos you send while
+they're being shrunk or cleaned of metadata, for a moment. Windows can also write memory to
+its page file or hibernation file, as with any program.
 
 What this doesn't hide:
 
@@ -464,7 +476,7 @@ apps/whisker-agentd    headless CLI: manage accounts/agents, run agents on a ser
 ## Build
 
 ```sh
-cargo build --release            # Linux / Windows
+cargo build --release            # Linux / Windows (packaging/windows has the installer)
 ./target/release/whisker
 ```
 
@@ -528,6 +540,6 @@ every message everywhere). A room with just it and one other person counts as a 
 This is an early version. It already does: vaults and hidden vaults, many accounts at once
 with tags, spaces, rooms, history, threads, replies, edits, reactions, forwarding, media,
 mentions, notifications, typing, read receipts, session verification, moderation, AI accounts
-with character cards, and plugin discovery. Still to do: video and audio playback inside the app, notifications on Windows and macOS,
+with character cards, and plugin discovery. Still to do: notifications on Windows and macOS,
 UI for plugin features, and an
 Android package that has been tested on a device.

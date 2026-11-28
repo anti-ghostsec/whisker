@@ -14,7 +14,6 @@ use crate::{AppWindow, Player};
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, Weak};
 use std::io::Read;
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use whisker_core::files::Relay;
@@ -88,8 +87,10 @@ pub fn is_loaded(id: &str) -> bool {
     NOW.lock().unwrap().as_ref().is_some_and(|p| p.id == id)
 }
 
-/// Starts playing the downloaded video `path` from message `id`.
-pub fn play(ui: Weak<AppWindow>, id: String, path: PathBuf) -> bool {
+/// Starts playing the downloaded video `path` from message `id`. (Not on
+/// Windows, where downloads play from memory: see `play_stream`.)
+#[cfg(not(windows))]
+pub fn play(ui: Weak<AppWindow>, id: String, path: std::path::PathBuf) -> bool {
     start(ui, id, path.into_os_string(), None)
 }
 

@@ -660,6 +660,7 @@ fn poster_of(video: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Opens a downloaded file in the app the system picks for it.
+#[cfg(not(windows))]
 fn open_file(path: &std::path::Path) {
     #[cfg(target_os = "linux")]
     let r = std::process::Command::new("xdg-open").arg(path).spawn();
